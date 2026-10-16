@@ -1,0 +1,92 @@
+name: 发布
+
+# 触发：打 tag（例如 v0.1.0）。发布流程见 docs/dev/build-and-release.md。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建不发布"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: 冒烟测试（发布物必须能跑）
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/pinbridge${{ matrix.ext }}"
+          test -x "$bin" || test -f "$bin"
+          "$bin" version
+          "$bin" tools | head -n 5
+
+      - name: 打包
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="pinbridge-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp -f "target/${{ matrix.target }}/release/pinbridge${{ matrix.ext }}" "dist/$name/" 2>/dev/null || true
+          cp -f "target/${{ matrix.target }}/release/pinbridge-mcp${{ matrix.ext }}" "dist/$name/" 2>/dev/null || true
+          cp -f README.md LICENSE CHANGELOG.md "dist/$name/"
+          (cd dist && zip -qr "$name.zip" "$name")
+          echo "ARTIFACT=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: 创建 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 从 CHANGELOG 抽取本版说明
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\["v"\\]" {flag=1; next}
+            /^## \[/ {flag=0}
+            flag {print}
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then echo "CHANGELOG 里没有 ${version} 的条目" >&2; exit 1; fi
+          cat release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: dist/*.zip
+          draft: false
+          prerelease: false

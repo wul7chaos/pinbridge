@@ -1,0 +1,63 @@
+{
+  "// PinBridge 工作区设置": "让 VS Code 与仓库的规范保持一致：保存即格式化、用仓库钉住的工具链、打开关键检查。",
+  "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": ["--workspace", "--all-targets", "--", "-D", "warnings"],
+  "rust-analyzer.rustfmt.extraArgs": ["--edition", "2021"],
+  "editor.formatOnSave": true,
+  "editor.rulers": [100],
+  "files.eol": "\n",
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.exclude": {
+    "**/target": true,
+    "**/node_modules": true,
+    "**/__pycache__": true,
+    "**/.venv": true,
+    "**/*.pbt": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/node_modules": true,
+    "docs/research/kanxue-293115-raw.html": true
+  },
+  "python.defaultInterpreterPath": "${workspaceFolder}/python/.venv/Scripts/python.exe",
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["python/tests"],
+  "python.analysis.extraPaths": ["python/src"],
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "explicit",
+      "source.organizeImports.ruff": "explicit"
+    }
+  },
+  "[markdown]": {
+    "editor.wordWrap": "on",
+    "editor.formatOnSave": false
+  },
+  "cSpell.words": [
+    "pinbridge",
+    "instrumentation",
+    "pbt",
+    "varint",
+    "zigzag",
+    "LEB128",
+    "epoch",
+    "DynamoRIO",
+    "kanxue",
+    "BitWarden",
+    "KCTF",
+    "VMP",
+    "syscall",
+    "OEP"
+  ],
+  "files.associations": {
+    "*.pbt": "binary",
+    "Justfile": "makefile",
+    "*.h": "cpp"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "pinbridge-sys"
+description = "PinBridge 的 C ABI 类型层与 pinbridge.dll 运行时加载器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+pinbridge-core.workspace = true
+pinbridge-trace.workspace = true
+
+[lints]
+workspace = true

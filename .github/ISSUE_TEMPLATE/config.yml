@@ -1,0 +1,14 @@
+# Issue 模板选择器的配置。
+# 强制走模板：没有模板的 issue 往往缺少"最小复现"或"影响判断"，
+# 结果就是一轮又一轮的追问。
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（走私密渠道）
+    url: https://github.com/wul7chaos/pinbridge/security/advisories/new
+    about: 能让 AI 越权、能让解析器崩溃、会让目标进程被意外破坏的问题，请在这里报。
+  - name: 先读架构与控制权文档
+    url: https://github.com/wul7chaos/pinbridge/blob/main/docs/architecture/control-ownership.md
+    about: 涉及权限/epoch/能力集的问题，八成答案在这篇里。
+  - name: 讨论想法（不做限制）
+    url: https://github.com/wul7chaos/pinbridge/discussions
+    about: 还没有具体到能写验收标准的想法，放这里。

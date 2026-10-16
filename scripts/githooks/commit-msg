@@ -1,0 +1,55 @@
+#!/bin/sh
+# PinBridge commit-msg 钩子：本地拦截不合规的提交信息。
+#
+# 为什么要在本地拦：CI 里的 commit-lint 会失败，但那时候 PR 已经提出来了，
+# 改提交信息要 force-push，容易把别人正在看的 review 搞乱。
+# 本地 5 毫秒能拦下来的事，不要在 CI 上处理。
+#
+# 安装：pwsh scripts/bootstrap.ps1 -InstallHooks
+#     或  git config core.hooksPath scripts/githooks
+#
+# 规则来自 docs/dev/commit-convention.md。
+
+msg_file="$1"
+
+# 跳过 merge / revert / fixup 等自动生成的提交
+first_line=$(head -n 1 "$msg_file")
+case "$first_line" in
+  Merge*|Revert*|fixup!*|squash!*|amend!*)
+    exit 0
+    ;;
+esac
+
+pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(\([a-z0-9_.-]+\))?!?: .+'
+if ! printf '%s' "$first_line" | grep -Eq "$pattern"; then
+  cat >&2 <<EOF
+✗ 提交信息不符合 Conventional Commits 规范：
+
+    $first_line
+
+  正确形式：<type>(<scope>): <subject>
+    type  : feat fix perf refactor docs test build ci chore revert
+    scope : core proto hub client mcp cli trace agent sys abi python desktop scripts docs ci repo deps pin
+
+  示例：feat(trace): 折叠连续重复事件为 EVENT_REPEAT 记录
+  完整规则见 docs/dev/commit-convention.md（git commit 时会带出模板）
+EOF
+  exit 1
+fi
+
+length=$(printf '%s' "$first_line" | wc -c | tr -d ' ')
+if [ "$length" -gt 73 ]; then
+  printf '✗ 首行过长（%s 字符，上限 72）：%s\n' "$length" "$first_line" >&2
+  exit 1
+fi
+
+case "$first_line" in
+  *.) printf '✗ 首行不要以句号结尾：%s\n' "$first_line" >&2; exit 1 ;;
+esac
+
+# 非 ASCII 首行也允许（本项目文档是中文），但提示一下：提交信息要能被 grep。
+if printf '%s' "$first_line" | grep -qP '[^\x00-\x7F]' 2>/dev/null; then
+  : # 允许中文提交信息：项目文档语言就是中文
+fi
+
+exit 0

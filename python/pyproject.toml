@@ -1,0 +1,59 @@
+[project]
+name = "pinbridge"
+version = "0.1.0"
+description = "PinBridge 的 Python 侧：.pbt 轨迹解码、重放与离线分析"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "PinBridge Authors" }]
+keywords = ["reverse-engineering", "dynamic-analysis", "trace", "instrumentation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+# 运行期零依赖：轨迹解析是"要能在任何一台机器上打开样本就能跑"的代码，
+# 每多一个依赖，就多一个"分析现场装不上环境"的风险。
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mypy>=1.11", "ruff>=0.6"]
+
+[project.scripts]
+pb-replay = "pb.trace.cli:main"
+
+[project.urls]
+Repository = "https://github.com/wul7chaos/pinbridge"
+Documentation = "https://github.com/wul7chaos/pinbridge/tree/main/docs"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "C4", "RET", "ARG", "PTH"]
+ignore = [
+    # 轨迹解析里大量出现按位/按字节的整数运算，命名与格式贴近规范更有价值
+    "N802",
+    "N803",
+    "N806",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["pb"]
+mypy_path = "src"

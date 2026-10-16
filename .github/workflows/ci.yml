@@ -1,0 +1,150 @@
+name: CI
+
+# 触发策略：
+#  * push 到 main：全量跑
+#  * PR：全量跑（这是唯一的合并门禁）
+#  * 手动：随时可跑（排查"是不是 CI 环境问题"时用）
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新提交会取消上一次未完成的运行，省 runner 也省等待
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # CI 上不允许任何隐式网络行为（依赖已在 Cargo.lock 钉死）
+  CARGO_NET_OFFLINE: "false"
+
+jobs:
+  fmt:
+    name: 格式（rustfmt）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Lint（clippy -D warnings）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 读取仓库钉住的工具链
+        run: rustup show && rustc --version
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: 测试（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      - name: 文档测试（保证文档里的示例至少能编译）
+        run: cargo test --workspace --doc
+
+  e2e:
+    name: 端到端自检（pinbridge demo）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 跑自检（失败即失败，不允许"环境问题"放过）
+        run: cargo run --quiet -p pinbridge-cli -- demo --trace-dir "${{ runner.temp }}/pinbridge-traces"
+      - name: 用 CLI 回读刚生成的轨迹
+        shell: bash
+        run: |
+          set -euo pipefail
+          trace=$(find "${{ runner.temp }}/pinbridge-traces" -name '*.pbt' | head -n 1)
+          test -n "$trace" || { echo "demo 没有产出轨迹"; exit 1; }
+          cargo run --quiet -p pinbridge-cli -- replay "$trace" --head 5
+
+  python:
+    name: Python 侧（跨语言一致性）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 先构建 Rust CLI：跨语言用例需要它生成真实轨迹
+      - run: cargo build -p pinbridge-cli
+      - name: 安装并运行
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pytest -q
+      - name: ruff（静态检查）
+        working-directory: python
+        run: ruff check . && ruff format --check .
+      - name: mypy（严格模式）
+        working-directory: python
+        run: mypy
+
+  changelog:
+    name: 变更日志守卫
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 代码改动必须伴随 CHANGELOG 条目
+        run: |
+          set -euo pipefail
+          base="origin/${{ github.base_ref }}"
+          changed=$(git diff --name-only "$base"...HEAD)
+          echo "改动文件："; echo "$changed"
+          if echo "$changed" | grep -qE '^(crates/|native/|python/src/|apps/)'; then
+            if ! echo "$changed" | grep -q '^CHANGELOG.md$'; then
+              echo "::error::改动了代码但没有更新 CHANGELOG.md（见 docs/dev/workflow.md）"
+              exit 1
+            fi
+          fi
+          echo "OK"
+
+  commit-lint:
+    name: 提交信息规范
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 校验 Conventional Commits
+        run: |
+          set -euo pipefail
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|revert)(\([a-z0-9_-]+\))?!?: .{1,72}$'
+          failed=0
+          for subject in $(git log --format=%s "origin/${{ github.base_ref }}..HEAD"); do
+            if ! echo "$subject" | grep -qE "$pattern"; then
+              echo "::error::提交信息不符合规范: $subject"
+              failed=1
+            fi
+          done
+          exit $failed

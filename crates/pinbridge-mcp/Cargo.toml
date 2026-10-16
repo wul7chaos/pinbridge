@@ -1,0 +1,30 @@
+[package]
+name = "pinbridge-mcp"
+description = "MCP stdio 服务：把 HubService 的能力暴露给 AI 客户端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pinbridge_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pinbridge-mcp"
+path = "src/main.rs"
+
+[dependencies]
+pinbridge-core.workspace = true
+pinbridge-hub.workspace = true
+pinbridge-proto.workspace = true
+pinbridge-trace.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

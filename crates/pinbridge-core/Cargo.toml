@@ -1,0 +1,21 @@
+[package]
+name = "pinbridge-core"
+description = "PinBridge 领域模型：会话、主体、控制权租约、能力集与有界事件通道"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

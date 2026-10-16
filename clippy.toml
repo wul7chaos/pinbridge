@@ -1,0 +1,23 @@
+# Clippy 项目级阈值与禁用清单。
+# 目标：在"插装内核"这种指针/整数密集的代码里，禁止会把语义改错的重写建议。
+
+msrv = "1.98.1"
+too-many-arguments-threshold = 8      # Event 构造器天然多参（address + arg0..arg7）
+type-complexity-threshold = 300
+cognitive-complexity-threshold = 25   # 解码器里的状态机确实长，但已按分支切分
+single-char-binding-names-threshold = 4
+enum-variant-name-threshold = 3
+literal-representation-threshold = 1024
+disallowed-methods = [
+    # 在 Pin 管理的进程里，任何"可能在信号/异常上下文中重入"的分配都要显式评审
+    { path = "std::mem::forget", reason = "句柄泄漏会直接表现为 Pin 侧无法 re-attach" },
+]
+# 注：clippy 的 disallowed-methods 只作用于方法，无法约束自由函数，
+# 因此"禁止直接使用 std::sync::mpsc::channel"这条规则由
+# pinbridge-core 只导出有界通道 + code review 保证（见 docs/dev/coding-standards-rust.md）。
+disallowed-types = [
+    # 有界事件通道的唯一入口是 pinbridge_core::channel，
+    # 直接用无界的 mpsc 会让"背压与丢弃计数"这条设计要求被绕过
+    { path = "std::sync::mpsc::Sender", reason = "改用 pinbridge_core::channel::bounded，保证背压与丢弃计数被统计" },
+    { path = "std::sync::mpsc::SyncSender", reason = "同上；本项目的通道语义统一由 pinbridge-core 定义" },
+]

@@ -1,0 +1,40 @@
+#!/bin/sh
+# PinBridge pre-commit 钩子：只做"几秒内能出结果"的检查。
+#
+# 刻意**不**在这里跑 cargo test：一个提交要等两分钟，所有人都会开始用
+# `--no-verify`，那这个钩子就彻底废了。测试交给 CI 与 `scripts/verify.ps1`。
+#
+# 安装：pwsh scripts/bootstrap.ps1 -InstallHooks
+
+set -e
+
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+staged_py=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' || true)
+
+if [ -n "$staged_rs" ]; then
+  echo "→ rustfmt 检查已暂存的 Rust 文件"
+  if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "✗ 格式不符合 rustfmt（运行 \`cargo fmt --all\` 后重新提交）" >&2
+    exit 1
+  fi
+fi
+
+if [ -n "$staged_py" ]; then
+  # 有 ruff 就跑，没有就提示而不是失败（不强制每个贡献者装 Python 工具链）
+  if command -v ruff >/dev/null 2>&1; then
+    if ! (cd python && ruff check . >/dev/null 2>&1); then
+      echo "✗ Python 侧 ruff 检查未通过（在 python/ 下运行 \`ruff check .\` 查看）" >&2
+      exit 1
+    fi
+  else
+    echo "· 未安装 ruff，跳过 Python 静态检查（CI 会跑）"
+  fi
+fi
+
+# 禁止把明显的敏感物提交进来：密钥、样本目录
+if git diff --cached --name-only | grep -Eq '^(samples/|\.env$|.*\.pbt$|.*\.pem$)'; then
+  echo "✗ 暂存区里出现了不该入库的文件（samples/、.env、*.pbt、*.pem 见 .gitignore）" >&2
+  exit 1
+fi
+
+exit 0

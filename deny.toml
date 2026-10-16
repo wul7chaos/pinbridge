@@ -1,0 +1,66 @@
+# cargo-deny 策略。CI 中的 `cargo deny check` 以本文件为准。
+# 设计取向：PinBridge 是一个要注入到"可能有对抗"的目标进程里的工具，
+# 供应链风险会被放大 —— 依赖面越小越好，许可证必须完全兼容。
+
+[graph]
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "i686-pc-windows-msvc" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # 示例：如确有必要放行，必须写清理由与跟踪 issue
+    # { id = "RUSTSEC-0000-0000", reason = "仅在 Windows 侧不可达的代码路径，见 #123" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+# 私有/内部 crate 不参与许可证检查
+private = { ignore = true }
+exceptions = [
+    # Pin 的 SDK 头文件随 Intel 许可分发，不作为 crate 依赖；此处仅记录：
+    # { name = "pin-sdk", allow = ["Intel-SDK"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# 明确禁止的依赖：与"可审计、可复现"目标冲突的东西
+deny = [
+    # 不要在进程内引入第二个运行时来做 IPC
+    { name = "tokio", wrappers = [] },
+    # 禁止任何形式的代码下传/自更新
+    { name = "reqwest", wrappers = [] },
+    { name = "ureq", wrappers = [] },
+    { name = "openssl-sys", wrappers = [] },
+]
+skip = [
+    # 生成宏与运行时允许并存的不同大版本（示例占位，实际按 cargo deny 输出补）
+    { name = "syn", version = "=2" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

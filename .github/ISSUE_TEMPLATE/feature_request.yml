@@ -1,0 +1,58 @@
+name: 功能请求
+description: 提出一个新能力或改进（含"AI 用起来不顺手"这类问题）
+title: "[feat] "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的具体困境
+      description: |
+        请描述**困境**而不是**方案**。"AI 在脱壳场景里要来回调用 6 次接口才能确认 OEP"
+        比"加一个 get_oep 接口"有用得多——后者会把我们重新推回"固定函数接口"的老路。
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: 现在只能怎么做
+      description: 你目前的绕法、代价（时间/ token / 返工次数）。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 你希望改动落在哪一层
+      options:
+        - 领域模型（core）：会话/能力/控制权
+        - 协议（proto）：线路协议 / MCP 工具描述
+        - 轨迹（trace）：事件类型 / 压缩 / 格式
+        - 控制面（hub）：会话与脚本编排
+        - agent（目标进程内）
+        - 离线分析（python）
+        - 工作台（apps/desktop）
+        - 不确定，交给你判断
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: 与本项目设计规矩的关系
+      options:
+        - label: 这个需求不需要"静默降级"（未实现时返回显式错误即可）
+          required: false
+        - label: 这个需求不会引入远程控制或代码下传
+          required: true
+        - label: 这个需求可以被离线验证（有一份可复现的轨迹或夹具）
+          required: false
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 怎么算做完了？最好是可执行的判断（一条命令、一个断言）。
+    validations:
+      required: true

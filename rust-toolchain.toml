@@ -1,0 +1,9 @@
+# PinBridge 工具链钉死策略：
+# - 仓库钉住 stable 的精确版本，保证所有人的 rustc/clippy 行为一致；
+# - CI 与本文件保持一致（.github/workflows/ci.yml 读同一条链）；
+# - 升级必须单独开 PR，并且提交里附上 `cargo +<new> clippy --workspace -- -D warnings` 的本地结果。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "default"

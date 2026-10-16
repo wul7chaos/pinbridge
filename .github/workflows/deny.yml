@@ -1,0 +1,38 @@
+name: 供应链审计
+
+# 为什么单独一条 workflow：cargo-deny 的失败往往是"上游发了个 advisory"，
+# 与本次改动的对错无关。单独跑可以一眼区分"我的代码坏了"和"依赖有公告"。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/deny.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "crates/**/Cargo.toml"
+  schedule:
+    # 每周一 03:00 UTC：即使没人改动，也要让新公告能被发现
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny（许可证 / 公告 / 依赖来源）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny --all-features check
+      - name: 依赖树快照（便于复盘"什么时候引进了什么"）
+        run: cargo tree --workspace > dependency-tree.txt && cat dependency-tree.txt

@@ -1,0 +1,30 @@
+[package]
+name = "pinbridge-agent"
+description = "注入目标进程的 agent（cdylib）：事件采集、脚本宿主与 ABI 导出面"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pinbridge_agent"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pinbridge-core.workspace = true
+pinbridge-sys.workspace = true
+pinbridge-trace.workspace = true
+sha2.workspace = true
+
+[features]
+default = []
+# 打开后启用真正与 Pin 交互的路径（需要本地 Pin SDK，见 third_party/pin/README.md）。
+# 默认关闭：这样在没有 Pin 的开发机上 `cargo test --workspace` 依然可以通过。
+pin = []
+
+[lints]
+workspace = true

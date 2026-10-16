@@ -1,0 +1,58 @@
+name: 对抗场景记录
+description: 记录目标程序某种检测/对抗手段的表现（用于迭代插装层强度）
+title: "[adv] "
+labels: ["adversarial", "research"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **声明**：请只提交你**拥有或已获授权**分析的目标的对抗观察。
+        不要附带样本本体、不要提供获取样本的方式。
+
+        这类记录不是"bug 报告"：目标的检测行为是它的正当功能。
+        我们要的是"它在哪一层检测、用什么手段、我们暴露了什么"，用于改进插装策略。
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 观察到的对抗行为
+      description: 例如"检测到代码缓存地址不在预期模块范围内"、"用 TF 陷阱触发单步异常"。
+    validations:
+      required: true
+
+  - type: textarea
+    id: layer
+    attributes:
+      label: 检测发生在哪一层
+      description: 系统调用层 / 指令层 / 时序 / 异常机制 / 内存属性 / 其他。
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据
+      description: |
+        轨迹片段（可以用 `pinbridge replay --head 50` 的输出）、
+        事件序列、或"哪个事件类型在什么条件下异常"。
+        把地址/模块名替换成占位符完全没问题。
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响
+      description: 分析被完全阻断？结论不可信？只是噪音变多？
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: 确认
+      options:
+        - label: 该目标我有权分析
+          required: true
+        - label: 我没有附带样本本体或授权材料
+          required: true

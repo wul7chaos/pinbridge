@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# PinBridge .gitignore
+# 约定：仓库只提交"可重建"的源码、文档、配置；一切产物、样本、轨迹、密钥都不进版本库。
+# ---------------------------------------------------------------------------
+
+# --- Rust -----------------------------------------------------------------
+/target/
+**/target/
+*.rs.bk
+*.pdb
+*.exp
+*.lib
+*.obj
+*.ilk
+*.rlib
+*.rmeta
+# 编译产物类型的 dll/exe 只在 out/ 下出现（见下）
+[cC]argo.lock.bak
+
+# --- C/C++ (Pin tool 与 C ABI 层) ----------------------------------------
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exp
+/out/
+/build/
+cmake-build-*/
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+dist/
+wheels/
+
+# --- Node / Tauri / React -------------------------------------------------
+node_modules/
+pnpm-lock.yaml.bak
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+.DS_Store
+
+# --- IDE / 编辑器 ---------------------------------------------------------
+.vs/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# --- PinBridge 运行期产物 -------------------------------------------------
+# 轨迹文件可能包含目标程序内存快照/字符串，绝不入库
+*.pbt
+*.pbt.zst
+.traces/
+traces/
+logs/
+*.log
+# 会话与活动记录
+.hub/
+.pinbridge/
+# 内嵌 Python 脚本缓存
+*.pyc.script
+
+# --- 样本与授权材料（法律边界：永不入库）---------------------------------
+samples/
+!samples/README.md
+fixtures/private/
+*.vmp
+*.vmprotect
+# 加密狗 / 授权文件
+*.lic
+*.key
+
+# --- 密钥与本地配置 -------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+credentials.json
+secrets.toml
+
+# --- 第三方 (Pin 本体与 SDK 不入库，见 third_party/pin/README.md) ---------
+third_party/pin/*
+!third_party/pin/README.md
+!third_party/pin/.gitkeep

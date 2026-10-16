@@ -1,0 +1,74 @@
+name: 缺陷报告
+description: 报告一个可复现的问题（不是安全问题——安全问题请走私密渠道）
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先确认一件事：**如果你认为这是安全漏洞**（能让 AI 越权、能让解析器崩溃、
+        或能让目标进程被意外破坏），请不要在这里发，见 SECURITY.md。
+
+        另外：请不要附上真实样本或授权材料。用合成夹具、地址/长度描述足够定位问题。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 一句话说清现象，再加细节。
+    validations:
+      required: true
+
+  - type: textarea
+    id: expect
+    attributes:
+      label: 你期望发生什么
+      description: 如果你期望的是"更聪明的降级"，请也说明为什么——本项目默认拒绝静默降级。
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 最小复现
+      description: 命令、输入、轨迹文件（可以只给头部十六进制）。能一次跑通的最小步骤最好。
+      placeholder: |
+        $ cargo run -p pinbridge-cli -- replay broken.pbt
+        ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: "`pinbridge version` 的输出，或 git commit。"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 影响范围
+      options:
+        - 轨迹格式 / 编解码（.pbt）
+        - 折叠压缩 / 重放
+        - Hub 会话 / 控制权 / 能力
+        - 脚本生命周期
+        - MCP 工具层
+        - CLI
+        - agent / C ABI
+        - Python 侧
+        - 文档
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: 确认
+      options:
+        - label: 我已排除"这是 M0 桩实现导致的 not_supported 错误"
+          required: true
+        - label: 我没有在报告中附带真实样本或授权材料
+          required: true

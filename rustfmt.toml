@@ -1,0 +1,24 @@
+# PinBridge rustfmt 配置
+#
+# 原则：**只用 stable 支持的选项**。把 nightly 选项写进来会在每次 `cargo fmt`
+# 时打印一堆 "unstable features are only available in nightly channel" 警告，
+# 久而久之所有人都会无视 fmt 的输出——那才是真正的损失。
+#
+# 如果需要 nightly 专属排版（例如 imports_granularity），请在本地
+# `cargo +nightly fmt`，不要把它变成仓库级要求。
+
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+# 与 .gitattributes 的 eol=lf 对齐，避免 Windows 上出现整文件 diff
+newline_style = "Unix"
+use_small_heuristics = "Default"
+reorder_imports = true
+reorder_modules = true
+# 以下为 nightly-only，仅作记录，默认不启用：
+#   imports_granularity = "Crate"
+#   group_imports = "StdExternalCrate"
+#   wrap_comments = true
+#   comment_width = 100
+#   format_code_in_doc_comments = true

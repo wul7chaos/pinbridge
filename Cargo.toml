@@ -1,0 +1,130 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pinbridge-core",
+    "crates/pinbridge-proto",
+    "crates/pinbridge-trace",
+    "crates/pinbridge-hub",
+    "crates/pinbridge-client",
+    "crates/pinbridge-sys",
+    "crates/pinbridge-agent",
+    "crates/pinbridge-mcp",
+    "crates/pinbridge-cli",
+]
+exclude = ["apps/desktop", "native"]
+
+# ---------------------------------------------------------------------------
+# 工作区元数据：所有成员继承，禁止各 crate 自行写死版本
+# 参考 docs/dev/dependency-policy.md：依赖变更必须走单独 PR + `just deps` 门禁
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+authors = ["PinBridge Authors"]
+license = "MIT"
+repository = "https://github.com/wul7chaos/pinbridge"
+homepage = "https://github.com/wul7chaos/pinbridge"
+documentation = "https://github.com/wul7chaos/pinbridge/tree/main/docs"
+readme = "README.md"
+keywords = ["reverse-engineering", "dynamic-analysis", "instrumentation", "debugger", "mcp"]
+categories = ["development-tools::debugging", "development-tools"]
+publish = false
+
+[workspace.dependencies]
+# 内部成员：一律用 path 依赖，版本号只在 [workspace.package] 维护
+pinbridge-core = { path = "crates/pinbridge-core" }
+pinbridge-proto = { path = "crates/pinbridge-proto" }
+pinbridge-trace = { path = "crates/pinbridge-trace" }
+pinbridge-hub = { path = "crates/pinbridge-hub" }
+pinbridge-client = { path = "crates/pinbridge-client" }
+pinbridge-sys = { path = "crates/pinbridge-sys" }
+pinbridge-agent = { path = "crates/pinbridge-agent" }
+pinbridge-mcp = { path = "crates/pinbridge-mcp" }
+
+# 外部依赖：M0 阶段刻意保持极小（见 docs/adr/0003-minimal-dependency-set.md）
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false }
+# 只有 RustCrypto 的 sha2：脚本溯源需要"跨语言一致"的摘要，
+# 自己实现哈希是典型的伪优化（详见 docs/dev/dependency-policy.md §哈希）
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+
+# ---------------------------------------------------------------------------
+# 工作区 lint 策略：CI 与本配置必须等价（`cargo lint` 别名 + GitHub Actions）
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "deny"          # 只有 pinbridge-sys / pinbridge-agent 显式 allow
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_lifetimes = "warn"
+non_ascii_idents = "deny"
+
+[workspace.lints.clippy]
+# 分三层：`all` 严格门禁；`pedantic` 采纳但逐条豁免不适合本领域的项；
+# `nursery` 整体关闭（官方定义即"仍在开发中、允许存在误报"，不适合当 CI 门禁）。
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+
+# --- pedantic 中的逐条豁免（每条都必须有理由，见 docs/dev/coding-standards-rust.md）---
+missing_const_for_fn = "allow"          # const 化会改变 API 形状，收益对本项目不明显
+cast_possible_wrap = "allow"            # 地址/寄存器在 u64↔i64 间来回转换是本领域常态，已有测试兜底
+cast_possible_truncation = "allow"      # 目标地址/长度到 usize 的收窄有长度上限校验兜底
+cast_sign_loss = "allow"                # 同上：寄存器值本身就是无符号位模式
+cast_precision_loss = "allow"           # 只出现在折叠率这类展示性统计上
+cast_lossless = "allow"
+derive_partial_eq_without_eq = "allow"
+redundant_closure_for_method_calls = "allow"
+borrow_as_ptr = "allow"                 # FFI 边界上"显式取裸指针"比隐式转换更易读、更易审
+needless_pass_by_value = "allow"
+needless_pass_by_ref_mut = "allow"
+match_same_arms = "allow"               # 能力表/状态机里"结果相同但语义不同"很常见，合并会丢信息
+format_push_string = "allow"
+option_if_let_else = "allow"            # `if let ... else` 往往比 `map_or_else` 更能表达"先匹配再兜底"
+unreadable_literal = "allow"            # 地址常量按 4 位分组（0x7FF6_0000_1000）更贴近调试器显示
+trivially_copy_pass_by_ref = "allow"
+single_match_else = "allow"
+similar_names = "allow"                 # `seq`/`next`、`held`/`needed` 这类成对命名是刻意的一致
+many_single_char_names = "allow"
+items_after_statements = "allow"
+duration_suboptimal_units = "allow"
+default_trait_access = "allow"
+explicit_iter_loop = "allow"
+unnecessary_wraps = "allow"
+assigning_clones = "allow"
+unused_self = "allow"
+map_unwrap_or = "allow"
+format_collect = "allow"
+match_wildcard_for_single_variants = "allow"
+items_after_test_module = "allow"
+missing_errors_doc = "allow"            # 错误语义统一写在 crate 级文档里
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"       # trace::TraceEvent 比 trace::Event 更可读
+must_use_candidate = "allow"
+too_many_lines = "allow"
+doc_markdown = "allow"                  # 文档里大量 Pin/DynamoRIO/x64dbg 专名会误报
+
+[profile.release]
+opt-level = 3
+lto = "thin"          # Pin 的 JIT 缓存对目标进程体积敏感，先用 thin 换取编译速度
+codegen-units = 1
+panic = "abort"       # agent/abi 侧：跨 FFI 边界不能让 panic 展开
+strip = "debuginfo"
+debug = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = "none"
+panic = "unwind"      # 只有调试构建允许 unwind，便于定位
+
+[profile.bench]
+inherits = "release"
+
+[profile.dev]
+opt-level = 1         # 事件编解码在 dev 下也要能跑得动 VMP 量级轨迹
+debug = true
+incremental = true

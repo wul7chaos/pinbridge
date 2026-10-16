@@ -1,0 +1,33 @@
+# 团队统一构建配置。放在仓库里而不是 ~/.cargo/config.toml，保证 CI 与本地一致。
+#
+# 注意：本文件不会覆盖用户 registry 镜像（公司/国内镜像通常写在全局配置里）。
+
+[build]
+# PinBridge 需要 64 位宿主；x86 目标由 Pin 的 32 位 JIT 在独立进程里处理。
+target-dir = "target"
+
+[alias]
+# --- 开发日常 -------------------------------------------------------------
+b         = "build --workspace --all-targets"
+c         = "check --workspace --all-targets"
+t         = "test --workspace --all-targets"
+lint      = "clippy --workspace --all-targets --all-features -- -D warnings"
+fmt-all   = "fmt --all"
+fmt-check = "fmt --all -- --check"
+# --- 质量门禁（与 CI 一一对应）-------------------------------------------
+gate      = ["fmt-check", "lint", "t", "doc"]
+doc       = "doc --workspace --no-deps --document-private-items"
+# --- 产物 -----------------------------------------------------------------
+agent     = "build -p pinbridge-agent --release"
+abi       = "build -p pinbridge-cabi --release"
+dist      = "build --workspace --release"
+
+[target.x86_64-pc-windows-msvc]
+# 与 pinbridge.dll 的 C ABI 一致：静态 CRT，避免把 vcruntime 依赖带进目标进程
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+PINBRIDGE_LOG = "info"
