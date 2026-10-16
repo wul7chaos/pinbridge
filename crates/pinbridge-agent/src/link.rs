@@ -726,17 +726,14 @@ mod tests {
 
         // 第二道闸门：实现。给出能力后，能力这关过了，
         // 剩下的取决于**这个能力是否已经实现**。
-        // 用断点当例子：它仍是桩，因此必须明确说"不支持"。
-        // （内存读不能再当这个例子——它已是真实实现，对不可读地址返回的是
-        //   第三类结果："内部错误 + 具体原因"。）
+        // 用单步当例子：它仍是桩，而且**没有副作用**。
+        // （断点与内存读都已经是真实实现了——而且它们真的会去碰那个地址，
+        //   拿假地址当例子会把这个测试自己带崩 / 给出第三类结果。）
         // 给足全部能力：`ALL.len()` 位全开（用 `from_bits` 而不是手写常量，
         // 免得新增能力时这里悄悄少给一位）。
         let all = CapabilitySet::from_bits((1u32 << Capability::ALL.len()) - 1);
         exports::pb_set_capabilities(all.bits());
-        match dispatch(&AgentRequest::SetBreakpoint {
-            address: 0x1000,
-            label: String::new(),
-        }) {
+        match dispatch(&AgentRequest::SingleStep { count: 1 }) {
             AgentResponse::Error { code, message } => {
                 assert_eq!(code, error_code::NOT_SUPPORTED, "实际: {message}");
                 assert!(

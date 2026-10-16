@@ -108,6 +108,7 @@ pub unsafe extern "C" fn pb_push_event(raw: *const PbEventRaw) -> c_int {
     }
     // SAFETY: 上面已判空；调用方保证指针在本次调用期间有效
     let event = unsafe { *raw };
+    flush_breakpoint_hits();
     // ── 先分发，再入队 ──
     //
     // 顺序是刻意的：脚本可能在回调里 `pb.mark`/`pb.log`，那些输出会产生
@@ -272,6 +273,9 @@ pub unsafe extern "C" fn pb_drain_events(
             state.fail(Status::InvalidArgument, "pb_drain_events: capacity 为 0")
         });
     }
+    // 先把异常上下文攒下的断点命中落成事件，再连同队列一起取走——
+    // 否则"命中了但事件要等下一次推送才出现"会让调用方以为断点没生效。
+    flush_breakpoint_hits();
     // SAFETY: 由调用方保证缓冲区大小与 capacity 一致
     let buffer = unsafe { std::slice::from_raw_parts_mut(out, capacity as usize) };
     let count = AgentHost::with(|state| state.drain_into(buffer));
@@ -280,7 +284,26 @@ pub unsafe extern "C" fn pb_drain_events(
     Status::Ok.code()
 }
 
-/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。
+/// 把异常上下文记下的断点命中转成事件。
+///
+/// **只在正常上下文调用**（`pb_drain_events` / `pb_push_event` 进来时）：
+/// 向量化异常处理器里不适合分配内存、也不适合抢 agent 的全局状态锁
+/// （如果异常正好发生在持锁期间，处理器会自己等自己）。
+fn flush_breakpoint_hits() {
+    for hit in crate::breakpoint::take_pending() {
+        let mut raw = PbEventRaw::EMPTY;
+        raw.sequence = pb_allocate_sequence();
+        raw.kind = EventKind::BreakpointHit.code();
+        raw.thread_id = hit.thread_id;
+        raw.address = hit.address;
+        // args[0] = 1：**命中后已自动解除**。调用方据此知道"想重复命中要再下"，
+        // 而不是等一个永远不会来的第二次命中。
+        raw.args[0] = 1;
+        let _ = AgentHost::with(|state| state.push(&raw).is_ok());
+    }
+}
+
+/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_stats(which: c_uint) -> u64 {
     AgentHost::with(|state| match which {
@@ -435,10 +458,34 @@ pub unsafe extern "C" fn pb_memory_write(address: u64, bytes: *const u8, length:
     }
 }
 
-/// 下断点（M0 桩）。
+/// 在 `address` 上下一个软件断点（`0xCC`）。
+///
+/// ## 语义：命中一次后**自动解除**
+///
+/// 传统做法是"命中 → 恢复原字节 → 单步 → 重装"，那段舞蹈在多线程目标里
+/// 有真实竞态（恢复与重装之间别的线程可能正好执行到这条指令）。我们没有
+/// 把目标线程停下来的能力，所以选了一条**明确的语义**而不是一个偶发的崩溃：
+/// 命中即解除，事件里带 `args[0]=1` 标记；要重复命中就再下一次。
+///
+/// 这是 ABI 的既有导出，行为从"桩"变成"实现"，不需要提升 `PB_ABI_VERSION`。
 #[unsafe(no_mangle)]
-pub extern "C" fn pb_set_breakpoint(_address: u64) -> c_int {
-    stub(Capability::Breakpoint, "pb_set_breakpoint")
+pub extern "C" fn pb_set_breakpoint(address: u64) -> c_int {
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::Breakpoint)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    match crate::breakpoint::arm(address) {
+        Ok(()) => AgentHost::with(|state| {
+            state.fail(
+                Status::Ok,
+                &format!(
+                    "pb_set_breakpoint: 已在 0x{address:x} 下断点（命中一次后自动解除）；\
+                     当前共 {} 个",
+                    crate::breakpoint::armed_count()
+                ),
+            )
+        }),
+        Err(error) => AgentHost::with(|state| state.fail(Status::Internal, &error.to_string())),
+    }
 }
 
 /// 清断点（M0 桩）。
@@ -447,8 +494,26 @@ pub extern "C" fn pb_set_breakpoint(_address: u64) -> c_int {
 /// （尤其是 AI）在换策略时无法收回已经下过的断点，只能重启会话。
 /// 这是 ABI 的**追加**导出，老的加载器不解析它，因此不需要提升 `PB_ABI_VERSION`。
 #[unsafe(no_mangle)]
-pub extern "C" fn pb_clear_breakpoint(_address: u64) -> c_int {
-    stub(Capability::Breakpoint, "pb_clear_breakpoint")
+pub extern "C" fn pb_clear_breakpoint(address: u64) -> c_int {
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::Breakpoint)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    match crate::breakpoint::disarm(address) {
+        Ok(()) => AgentHost::with(|state| {
+            state.fail(
+                Status::Ok,
+                &format!(
+                    "pb_clear_breakpoint: 已解除 0x{address:x} 上的断点（原字节已写回）；\
+                     还剩 {} 个",
+                    crate::breakpoint::armed_count()
+                ),
+            )
+        }),
+        // 解一个不存在的断点**必须报错**：静默成功会让调用方一直以为那边有断点。
+        Err(error) => {
+            AgentHost::with(|state| state.fail(Status::InvalidArgument, &error.to_string()))
+        }
+    }
 }
 
 /// 单步（M0 桩）。
@@ -799,6 +864,114 @@ pb.subscribe("syscall_enter", on_syscall)
         );
         assert_eq!(ours[0].args[1], 0x50, "报回来的值必须就是事件里的 args[0]");
         println!("✓ 脚本被事件驱动，输出进了事件流：{:?}", ours[0]);
+    }
+    /// 下断点时地址打错**必须是错误**，不能把目标打崩。
+    ///
+    /// 这条不是理论问题：这个缺陷真实发生过一次——把 `SetBreakpoint` 接到
+    /// 真实实现之后，一条拿 `0x1000` 当"假地址"的老用例让整个测试进程
+    /// `STATUS_ACCESS_VIOLATION`。
+    /// Windows 专有：靶函数与软件断点都只在 Windows 上存在。
+    #[cfg(windows)]
+    #[test]
+    fn breakpoint_on_an_unmapped_address_is_an_error_not_a_crash() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        assert_eq!(
+            pb_set_capabilities(Capability::Breakpoint.bit()),
+            Status::Ok.code()
+        );
+        let code = pb_set_breakpoint(0x1000);
+        assert_eq!(code, Status::Internal.code(), "应当是错误，不是崩溃");
+        // SAFETY: 立刻拷贝
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("0x1000"), "错误要带上地址：{text}");
+        assert!(
+            text.contains("读不到") || text.contains("未映射"),
+            "错误要说清是地址问题：{text}"
+        );
+        assert_eq!(crate::breakpoint::armed_count(), 0, "失败的断点不该进表");
+        println!("✓ 不可映射地址下断点报错而不是崩溃：{text}");
+    }
+    /// 导出面：断点的能力闸门、命中事件、解除。
+    /// Windows 专有：靶函数与软件断点都只在 Windows 上存在。
+    #[cfg(windows)]
+    #[test]
+    fn breakpoints_fire_and_report_through_the_exports() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        crate::breakpoint::disarm_all();
+        let address = crate::breakpoint::tests::pinbridge_breakpoint_target as *const () as u64;
+
+        // 1) 没有 breakpoint 能力：必须被拒，且**真的没下上去**
+        assert_eq!(pb_set_capabilities(0), Status::Ok.code());
+        assert_eq!(
+            pb_set_breakpoint(address),
+            Status::CapabilityDenied.code(),
+            "没能力时必须拒绝"
+        );
+        assert_eq!(
+            crate::breakpoint::armed_count(),
+            0,
+            "被拒的断点绝不能真的下上去"
+        );
+
+        // 2) 给能力 → 下断点 → 触发它
+        assert_eq!(
+            pb_set_capabilities(Capability::Breakpoint.bit() | Capability::MemRead.bit()),
+            Status::Ok.code()
+        );
+        assert_eq!(
+            pb_set_breakpoint(address),
+            Status::Ok.code(),
+            "应当下断点成功"
+        );
+        assert_eq!(crate::breakpoint::armed_count(), 1);
+        // 调用靶函数：命中由异常处理器记录
+        let value = crate::breakpoint::tests::pinbridge_breakpoint_target(5);
+        assert_eq!(value, 16, "命中之后函数仍然要正常跑完：{value}");
+
+        // 3) 事件必须出现（命中 → 事件由正常上下文落成）
+        let mut all: Vec<PbEventRaw> = Vec::new();
+        for _ in 0..8 {
+            let mut buffer = [PbEventRaw::EMPTY; 32];
+            let mut written = 0u32;
+            // SAFETY: 缓冲区与计数指向本栈变量
+            assert_eq!(
+                unsafe { pb_drain_events(buffer.as_mut_ptr(), 32, &mut written) },
+                Status::Ok.code()
+            );
+            if written == 0 {
+                break;
+            }
+            all.extend_from_slice(&buffer[..written as usize]);
+        }
+        let hits: Vec<&PbEventRaw> = all
+            .iter()
+            .filter(|e| e.kind == EventKind::BreakpointHit.code() && e.address == address)
+            .collect();
+        assert_eq!(hits.len(), 1, "应当恰好有一条断点命中事件：{all:?}");
+        assert_eq!(hits[0].args[0], 1, "args[0]=1 表示命中后已自动解除");
+        println!("✓ 断点命中事件：{:?}", hits[0]);
+
+        // 4) 命中即解除 → 再解一次必须报错（而不是静默成功）
+        assert_eq!(crate::breakpoint::armed_count(), 0, "命中后应当自动解除");
+        assert_eq!(
+            pb_clear_breakpoint(address),
+            Status::InvalidArgument.code(),
+            "解一个已经解除的断点必须报错"
+        );
+
+        // 5) 正常解除路径
+        assert_eq!(pb_set_breakpoint(address), Status::Ok.code());
+        assert_eq!(pb_clear_breakpoint(address), Status::Ok.code());
+        assert_eq!(crate::breakpoint::armed_count(), 0);
+        // SAFETY: 读回那个字节
+        let byte = unsafe { std::ptr::read_volatile(address as *const u8) };
+        assert_ne!(byte, 0xCC, "解除之后不能留下 int3");
     }
     /// 导出面：真实的内存读写（Hub 侧走的就是这几个导出）。
     ///

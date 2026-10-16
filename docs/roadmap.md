@@ -88,7 +88,8 @@
 | 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |
 | ~~真实内存读写~~ | ✅ 已完成：`ReadProcessMemory` / `WriteProcessMemory`（**不解引用**：不可读地址要能"失败"，而不是把目标打崩；也**不临时改保护属性**——那会改变目标状态）。部分写入按失败处理；错误文本带地址 + Windows 错误码。实测：写 11 字节读回一致、不可读地址报错不崩、被拒绝的写不落盘 |
 | ~~脚本侧 `pb.read`~~ | ✅ 已完成：反向调用（`PyCFunction_NewEx` + 静态 `PyMethodDef`），能力闸门在 Rust 侧，拒绝抛 `RuntimeError` 而不是返回空数据。实测脚本读到真实内存并用 `mark` 报回魔数 |
-| 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |
+| ~~断点~~ | ✅ 已完成：软件断点（`0xCC` + 向量化异常处理器）。**命中一次后自动解除**（那段"恢复→单步→重装"的舞蹈在多线程目标里有真实竞态，而我们没有停下目标线程的能力——见 [design/breakpoints.md](design/breakpoints.md)）。地址打错会**报错而不是打崩目标**。实测：命中一次并记录线程号、函数仍正常返回、原字节已写回 |
+| 单步 / 继续 / 暂停 | ⏳ 语义先定清楚再实现：它们都需要"让目标线程停下来"这个前提，而 Pin 不是调试器。不做成"看起来像调试器"的假实现 |
 | ~~Hub 侧加载器解析 `pb_start_trace`/`pb_stop_trace`~~ | ✅ 已完成：`pinbridge-sys` 增加 `start_trace`/`stop_trace`（符号解析 + 参数校验 + 能力/状态码翻译），端到端测试**真的加载 DLL 并录出一份 `PBT1` 魔数的 `.pbt`** |
 | ~~Hub 会话缺少到 agent 的 client 句柄~~ | ✅ 已完成：Hub 定义 `TargetLink` trait（测试可注入假实现），会话持有可选链路，新增 `attach_link` / `read_memory`（参数校验 → 能力校验 → 会话状态 → 链路，顺序刻意如此）；组合根（MCP）提供 `ClientLink<T>` 把 `pinbridge_client::AgentClient` 适配成链路；`pb_memory_read` 接通。测试覆盖：能力闸门、没挂链路时的错误必须点明缺链路、长度不符必须报错（不许截短）、链路层 hex 解码与错误翻译 |
 | ~~MCP `pb_modules`~~ | ✅ 已完成：agent 侧走 **PEB 加载器链**（`gs:[0x60]` → `Ldr+0x10`）进程内枚举，不依赖 psapi；快照读法不持 loader lock，因此**跳过的不合法条目数会如实上报**。链路新增 `Modules` 请求、Hub 新增 `list_modules`、`pb_modules` 工具接通。实测枚举到 9 个模块（完整路径、主模块在首位） |

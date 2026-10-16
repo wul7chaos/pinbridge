@@ -33,6 +33,7 @@
 #![allow(linker_messages)]
 #![warn(missing_docs)]
 
+pub mod breakpoint;
 pub mod exports;
 pub mod host;
 pub mod link;
