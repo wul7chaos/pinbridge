@@ -19,6 +19,7 @@ name = "pinbridge-mcp"
 path = "src/main.rs"
 
 [dependencies]
+pinbridge-client.workspace = true
 pinbridge-core.workspace = true
 pinbridge-hub.workspace = true
 pinbridge-proto.workspace = true

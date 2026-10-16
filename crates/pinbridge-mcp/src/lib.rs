@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod link;
 pub mod server;
 
 pub use server::{serve_stdio, McpServer, ProtocolError};

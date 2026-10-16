@@ -36,6 +36,11 @@ struct SessionEntry {
     session: Session,
     runtime: SessionRuntime,
     scripts: ScriptRegistry,
+    /// 到目标端的**主动请求**通道（读内存等）。
+    ///
+    /// 为什么是可选的：会话可以先被创建、稍后才挂上链路；而没有链路时
+    /// 主动请求必须给出**说清缺什么**的错误，不能让调用方以为"目标上读不到"。
+    link: Option<Box<dyn crate::link::TargetLink>>,
 }
 
 /// 控制面服务。单实例、非线程安全：并发由上层（MCP 服务 / Tauri 命令层）
@@ -239,6 +244,9 @@ impl HubService {
             session,
             runtime: SessionRuntime::new(),
             scripts: ScriptRegistry::new(),
+            // 会话先建、链路后挂：创建时还没有"能通话"的东西，
+            // 挂了链路才能发主动请求（见 attach_link）。
+            link: None,
         };
         self.sessions.insert(id.get(), entry);
         self.provenance.record_ok(
@@ -629,6 +637,96 @@ impl HubService {
             .map(|e| e.runtime.backlog())
     }
 
+    // -------------------------------------------------- 主动请求（到目标端）
+
+    /// 给会话挂上一条到目标端的链路。
+    ///
+    /// 需要 `ProcessControl`：挂链路会**扩大这个会话能做的事**（从"只看事件"
+    /// 变成"能主动读目标内存"），所以它和创建会话是同一档操作。
+    ///
+    /// # Errors
+    ///
+    /// 能力不足、会话不存在，或会话已终结。
+    pub fn attach_link(
+        &mut self,
+        actor: &Principal,
+        session: SessionId,
+        link: Box<dyn crate::link::TargetLink>,
+    ) -> Result<String> {
+        self.ensure(actor, Capability::ProcessControl)?;
+        let described = link.describe();
+        let Some(entry) = self.sessions.get_mut(&session.get()) else {
+            return Err(Error::TargetUnavailable(format!("会话 {session} 不存在")));
+        };
+        if entry.session.state.is_terminal() {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 状态 {:?} 已终结，不再接受链路挂载",
+                entry.session.state
+            )));
+        }
+        entry.link = Some(link);
+        Ok(described)
+    }
+
+    /// 会话当前是否挂了到目标端的链路。
+    #[must_use]
+    pub fn has_link(&self, session: SessionId) -> bool {
+        self.sessions
+            .get(&session.get())
+            .is_some_and(|entry| entry.link.is_some())
+    }
+
+    /// 读目标内存（通过会话的链路）。
+    ///
+    /// 顺序是刻意的：**先校验参数、再校验能力、最后才碰链路**。
+    /// 一个 `length=0` 的请求在任何状态下都是调用方的 bug，不该被翻译成
+    /// "目标不可用"——那会让人去查目标。
+    ///
+    /// # Errors
+    ///
+    /// - `Protocol`：`length == 0`；
+    /// - `CapabilityDenied`：调用方没有 `mem_read`；
+    /// - `TargetUnavailable`：会话不存在、已终结、或**没有挂链路**（错误文本会点明）；
+    /// - 其余来自链路的错误原样透传。
+    pub fn read_memory(
+        &mut self,
+        actor: &Principal,
+        session: SessionId,
+        address: u64,
+        length: u32,
+    ) -> Result<Vec<u8>> {
+        if length == 0 {
+            return Err(Error::Protocol(
+                "read_memory: length 必须大于 0（传 0 不是“查一下能否读”，它只是调用方的 bug）"
+                    .into(),
+            ));
+        }
+        self.ensure(actor, Capability::MemRead)?;
+        let Some(entry) = self.sessions.get_mut(&session.get()) else {
+            return Err(Error::TargetUnavailable(format!("会话 {session} 不存在")));
+        };
+        if !entry.session.state.accepts_control() {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 状态 {:?} 不接受读内存请求",
+                entry.session.state
+            )));
+        }
+        let Some(link) = entry.link.as_mut() else {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 没有挂载到目标端的链路（Hub 的会话默认只有事件窗口与轨迹，\
+                 主动请求需要先 attach_link）"
+            )));
+        };
+        let bytes = link.read_memory(address, length)?;
+        if bytes.len() != length as usize {
+            return Err(Error::Protocol(format!(
+                "read_memory: 请求 {length} 字节，链路返回 {} 字节——长度不符必须报错，\
+                 否则上层会把半截数据当完整数据用",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
     // ---------------------------------------------------------------- 轨迹
 
     /// 开始录制，返回 `.pbt` 路径。
@@ -827,6 +925,42 @@ mod tests {
         HubService::with_trace_dir(dir)
     }
 
+    /// 一条只存在于测试里的链路：按预设值回答读内存。
+    ///
+    /// 这正是 `TargetLink` 存在的理由——Hub 的闸门逻辑（能力、会话状态、
+    /// 错误翻译）必须能在没有目标、没有 socket 的情况下被测到。
+    #[derive(Debug)]
+    struct FakeLink {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+
+    impl crate::link::TargetLink for FakeLink {
+        fn read_memory(&mut self, _address: u64, length: u32) -> Result<Vec<u8>> {
+            self.calls += 1;
+            let mut out = self.bytes.clone();
+            out.resize(length as usize, 0);
+            Ok(out)
+        }
+
+        fn describe(&self) -> String {
+            "测试用假链路".into()
+        }
+    }
+
+    /// 一条"少回一个字节"的链路：用来测长度校验。
+    #[derive(Debug)]
+    struct ShortLink;
+
+    impl crate::link::TargetLink for ShortLink {
+        fn read_memory(&mut self, _address: u64, _length: u32) -> Result<Vec<u8>> {
+            Ok(vec![0x90])
+        }
+
+        fn describe(&self) -> String {
+            "测试用短读链路".into()
+        }
+    }
     fn attached_session(hub: &mut HubService, actor: &Principal) -> SessionId {
         let id = hub
             .create_session(actor, TargetSpec::launch("TARGET.exe", "x86_64"))
@@ -1146,5 +1280,85 @@ mod tests {
             codes.iter().all(|c| *c != 0),
             "状态编码不得为 0（0 表示未记录）"
         );
+    }
+    #[test]
+    fn memory_read_needs_a_capability_then_a_link() {
+        let mut hub = temp_hub("read-mem-gates");
+        let human = Principal::human("alice");
+        let ai = Principal::ai("agent-7");
+        let id = attached_session(&mut hub, &human);
+
+        // 1) 先把 AI 的能力收窄成空集：此时报的必须是能力不足，不是"没有链路"。
+        //    顺序错了会把"你没权限"说成"环境没准备好"，让人去查错的地方。
+        //    （注意 AI 的**默认**集是只读基线，本身就含 mem_read，所以这里要显式收窄。）
+        let epoch = hub.epoch_of(id).unwrap();
+        hub.grant_capabilities(&human, id, epoch, &ai, &[]).unwrap();
+        let error = hub.read_memory(&ai, id, 0x1000, 8).unwrap_err();
+        assert!(
+            matches!(error, Error::CapabilityDenied { .. }),
+            "缺能力时应当报能力不足，实际: {error:?}"
+        );
+
+        // 2) 有能力但没挂链路：错误必须**点明缺的是链路**
+        let human_error = hub.read_memory(&human, id, 0x1000, 8).unwrap_err();
+        let text = human_error.to_string();
+        assert!(
+            text.contains("没有挂载到目标端的链路"),
+            "错误必须说清缺什么，实际: {text}"
+        );
+        assert!(!hub.has_link(id));
+
+        // 3) 挂上链路之后才通
+        let described = hub
+            .attach_link(
+                &human,
+                id,
+                Box::new(FakeLink {
+                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                    calls: 0,
+                }),
+            )
+            .unwrap();
+        assert!(hub.has_link(id));
+        let bytes = hub.read_memory(&human, id, 0x1000, 8).unwrap();
+        assert_eq!(bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        println!("已挂链路：{described}");
+    }
+
+    #[test]
+    fn memory_read_validates_parameters_before_anything_else() {
+        let mut hub = temp_hub("read-mem-params");
+        let human = Principal::human("alice");
+        let id = attached_session(&mut hub, &human);
+
+        // length=0 是调用方的 bug：任何状态下都必须是 Protocol，
+        // 而不是"目标不可用"（后者会让人去查目标）。
+        let error = hub.read_memory(&human, id, 0x1000, 0).unwrap_err();
+        assert!(
+            matches!(error, Error::Protocol(_)),
+            "length=0 应当是参数错误，实际: {error:?}"
+        );
+
+        // 会话不存在时也要能区分开
+        let error = hub
+            .read_memory(&human, SessionId::new(9999), 0x1000, 8)
+            .unwrap_err();
+        assert!(error.to_string().contains("不存在"), "实际: {error}");
+    }
+
+    #[test]
+    fn a_link_that_returns_the_wrong_length_is_a_protocol_error() {
+        let mut hub = temp_hub("read-mem-short");
+        let human = Principal::human("alice");
+        let id = attached_session(&mut hub, &human);
+        hub.attach_link(&human, id, Box::new(ShortLink)).unwrap();
+
+        let error = hub.read_memory(&human, id, 0x1000, 4).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            matches!(error, Error::Protocol(_)),
+            "长度不符是协议问题，实际: {error:?}"
+        );
+        assert!(text.contains("长度不符"), "错误必须点明原因，实际: {text}");
     }
 }

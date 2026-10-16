@@ -2,12 +2,15 @@
 //!
 //! ## 职责边界
 //!
-//! Hub **不做分析**。它只负责四件事：
+//! Hub **不做分析**。它负责五件事：
 //!
 //! 1. **会话**：目标进程的生命周期与其状态机；
 //! 2. **控制权**：谁现在说了算（epoch 语义见 `pinbridge-core::capability`）；
 //! 3. **脚本生命周期**：谁在什么时候注入过哪一版代码（哈希留痕）；
-//! 4. **观察窗口**：把事件通道与轨迹文件暴露成 AI 能读的东西。
+//! 4. **观察窗口**：把事件通道与轨迹文件暴露成 AI 能读的东西；
+//! 5. **主动请求的闸门**：到目标端的[链路](crate::link::TargetLink)由上层挂进来，
+//!    但"谁在读、读什么、会话是否允许"这三件事的判定在 Hub 这一层——
+//!    否则每个调用方都要各写一遍能力检查，迟早会漏一个。
 //!
 //! ## 为什么必须有"观察窗口"这一层
 //!
@@ -22,12 +25,14 @@
 #![warn(missing_docs)]
 
 pub mod hub;
+pub mod link;
 pub mod provenance;
 pub mod recorder;
 pub mod runtime;
 pub mod script;
 
 pub use hub::HubService;
+pub use link::TargetLink;
 pub use provenance::{AuditEntry, ProvenanceLog};
 pub use recorder::TraceRecorder;
 pub use runtime::SessionRuntime;

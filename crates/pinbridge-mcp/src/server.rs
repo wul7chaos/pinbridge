@@ -409,14 +409,23 @@ impl McpServer {
                     granted.iter().map(Capability::name).collect::<Vec<_>>()
                 ))
             }
-            "pb_memory_read" => Err("内存读取在链路两端都已就绪，缺的是**中间这一段**：\
-                 agent 侧 `AgentRequest::ReadMemory` 是真实实现（含单次读取上限与明确拒绝），\
-                 `pinbridge-client` 也已经能和 agent 通话（`Client::call`，有端到端测试）；\
-                 但 Hub 的会话条目里只持有 `session`/`runtime`/`scripts`，**没有一个到 agent 的\
-                 client 句柄**，所以这个工具目前到不了目标。\
-                 下一步（见 docs/roadmap.md 的 M1）：把 client 句柄挂进会话，或新增一条\
-                 「控制面 → 链路」的请求路径。在那之前请用 pb_script_load 或直接驱动 agent。"
-                .to_owned()),
+            "pb_memory_read" => {
+                let session = self.session_arg(args)?;
+                let address = arg_u64(args, "address")?;
+                // 长度按 u32 转换：一次读取的上限由 agent 侧把关（超限会**明确拒绝**
+                // 而不是悄悄截短），所以这里不做隐式收敛，只做范围转换。
+                let length = u32::try_from(arg_u64(args, "length")?).map_err(|_| {
+                    "length 超出 u32 范围（单次读取按字节计；大块请用轨迹或脚本快照）"
+                })?;
+                let bytes = self
+                    .hub
+                    .read_memory(&self.actor.clone(), session, address, length)
+                    .map_err(describe)?;
+                Ok(format!(
+                    "{address:#x} 起 {length} 字节：{}\n（回读长度与请求一致，两端都核对过）",
+                    to_hex(&bytes)
+                ))
+            }
             other => Err(format!(
                 "工具 {other} 已声明但未实现（内部不一致，请报 issue）"
             )),
@@ -446,6 +455,17 @@ fn tool_error(message: String) -> Value {
     })
 }
 
+/// 把字节序列写成十六进制（工具结果里给人/AI 看的形式）。
+///
+/// 不用 `{:02x?}` 直接打 `Vec<u8>`：那会输出 `[144, 204, …]`，
+/// 十六进制是分析场景里唯一不用换算就看得懂的写法。
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
 fn to_text<T: serde::Serialize>(value: &T) -> std::result::Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败: {e}"))
 }
@@ -551,6 +571,89 @@ mod tests {
         assert_eq!(server.actor().name(), "cline");
     }
 
+    /// 一条测试用链路：按预设字节回答读内存。
+    #[derive(Debug)]
+    struct FakeLink(Vec<u8>);
+
+    impl pinbridge_hub::TargetLink for FakeLink {
+        fn read_memory(
+            &mut self,
+            _address: u64,
+            length: u32,
+        ) -> pinbridge_core::error::Result<Vec<u8>> {
+            let mut out = self.0.clone();
+            out.resize(length as usize, 0);
+            Ok(out)
+        }
+
+        fn describe(&self) -> String {
+            "测试用假链路".into()
+        }
+    }
+
+    #[test]
+    fn memory_read_returns_hex_once_a_link_is_attached() {
+        let mut server = server();
+        call(
+            &mut server,
+            "initialize",
+            json!({"clientInfo": {"name": "alice"}}),
+        );
+        // 会话由**人类**建：MCP 的参与者是 AI，而 AI 建会话需要 ProcessControl
+        // （它默认只有只读基线 257）——这正是设计要的人机分工。
+        // 这里把"人类那一侧"直接演出来，然后让 AI 去读内存。
+        let human = Principal::human("operator");
+        let id = server
+            .hub
+            .create_session(&human, TargetSpec::launch("TARGET.exe", "x86_64"))
+            .expect("人类建会话应当成功");
+        server
+            .hub
+            .attach(&human, id, 4242, "TARGET.exe --demo")
+            .expect("附加应当成功");
+        let session = id.get();
+
+        // 先：没挂链路 → 错误必须**点明缺链路**（这是第 9 轮发现的那个缺口）
+        let before = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_memory_read", "arguments": {
+                "session": session, "address": 0x1000, "length": 4
+            }}),
+        );
+        let before_text = before["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            before_text.contains("链路"),
+            "没挂链路时必须说清缺什么，实际: {before_text}"
+        );
+
+        // 再：挂上链路 → 工具应当回出十六进制并把长度说清
+        server
+            .hub
+            .attach_link(&human, id, Box::new(FakeLink(vec![0x90, 0xcc, 0x48, 0x89])))
+            .expect("挂链路应当成功");
+        let after = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_memory_read", "arguments": {
+                "session": session, "address": 0x1000, "length": 4
+            }}),
+        );
+        let after_text = after["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            after_text.contains("90cc4889"),
+            "应当回出十六进制字节，实际: {after_text}"
+        );
+        assert!(
+            after_text.contains("0x1000"),
+            "应当带出起始地址，实际: {after_text}"
+        );
+        println!("✓ 读内存：{after_text}");
+    }
     #[test]
     fn tools_list_only_shows_what_the_actor_may_call() {
         let mut server = server();
