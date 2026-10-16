@@ -1440,6 +1440,8 @@ volatile UINT64 g_mem_unreadable = 0;
 /// 被地址范围过滤掉的条数（"事件为什么少"的可回答性靠它）。
 volatile UINT64 g_mem_filtered = 0;
 volatile bool g_mem_soft_stopped = false;
+/// 是否已经往轨迹里写过一条「采集覆盖」（只需要一条静止的；软停时再补一条带 capped 的）。
+volatile bool g_coverage_recorded = false;
 // `g_main_image_low/high` 的声明在前面（`OnImageLoad` 要填它，见那里的注释）。
 
 bool mem_address_in_scope(UINT64 address) {
@@ -1479,6 +1481,10 @@ void OnMemWriteBefore(THREADID tid, ADDRINT ins_address, ADDRINT effective_addre
 }
 
 /// 写入的第二段：此时内存里已经是**写入后**的值。
+/// 前向声明：定义在下面（用的地方在它之前）。参数类型此时已是完整类型，
+/// 所以这里不需要把定义一起搬上来。
+void push_coverage_record(ThreadStats* stats, bool capped);
+
 void OnMemWriteAfter(THREADID tid) {
   if (g_shutdown || g_mem_soft_stopped) {
     return;
@@ -1514,6 +1520,9 @@ void OnMemWriteAfter(THREADID tid) {
   stats->in_hook = false;
   if (g_mem.max_events != 0 && g_mem_captured >= g_mem.max_events) {
     g_mem_soft_stopped = true;
+    // 软停的这一刻推一条带 `capped=1` 的覆盖记录：**"后面的事件不存在"这条
+    // 信息只有这里能提供**，而离线侧正是靠它才知道"没有观察到"不等于"没发生"。
+    push_coverage_record(stats_for(0), true);
   }
 }
 
@@ -1548,6 +1557,9 @@ void OnMemRead(THREADID tid, ADDRINT ins_address, ADDRINT effective_address, UIN
   stats->in_hook = false;
   if (g_mem.max_events != 0 && g_mem_captured >= g_mem.max_events) {
     g_mem_soft_stopped = true;
+    // 软停的这一刻推一条带 `capped=1` 的覆盖记录：**"后面的事件不存在"这条
+    // 信息只有这里能提供**，而离线侧正是靠它才知道"没有观察到"不等于"没发生"。
+    push_coverage_record(stats_for(0), true);
   }
 }
 
@@ -1616,6 +1628,39 @@ VOID OnTransferRet(THREADID tid, ADDRINT source, VOID* value_ptr) {
   }
   emit_transfer(stats_for(tid), tid, source, static_cast<ADDRINT>(target), 2);
 }
+/// 把「采集覆盖」作为一条事件写进轨迹。
+///
+/// **为什么必须写进轨迹、以及为什么不能只在收尾时写**：
+///
+/// * 日志活在当时那台机器上，而轨迹会被拷走做离线分析；
+/// * 只在收尾（Fini）写会**写不进去**——实测过：轨迹由 agent 写并在程序退出前
+///   收尾，工具在 Fini 推的事件落在文件关闭之后，离线侧看到的是"完全没有这条记录"
+///   （`类型分布` 里连 `state_change` 都没有）。
+///
+/// 所以挑两个**必然发生在窗口内**的时刻推：
+///
+/// 1. 抓到第一条内存事件时（此时主模块的插装已完成，"跳过点/插装点"已定型）；
+/// 2. 探针因达到上限而**软停的那一刻**——这正是"后面的事件不存在"这条信息的
+///    唯一来源，而它恰恰是离线侧最需要知道的（第 33~34 轮就栽在这里）。
+///
+/// 事件形状：`state_change`（kind 10），`args[0] = 1` 是覆盖子码，
+/// `args[1..6]` 依次是 插装点 / 跳过点 / 读不出 / 被过滤 / 是否软停。
+/// 用此前未使用的 arg 槽，**格式不变**（与转移码同一个做法）。
+void push_coverage_record(ThreadStats* stats, bool capped) {
+  if (stats == nullptr) {
+    return;
+  }
+  const UINT64 coverage_args[6] = {
+      1,
+      static_cast<UINT64>(g_mem_sites),
+      g_mem_skipped_no_after,
+      g_mem_unreadable,
+      g_mem_filtered,
+      capped ? 1ULL : 0ULL,
+  };
+  push_probe_event(stats, 10 /* PB_EV_STATE_CHANGE */, 0, 0, coverage_args, 6);
+}
+
 /// 指令级插桩：入口点 + 系统调用 + 内存访问 + 模板命中。
 void OnInstruction(INS ins, VOID* v) {
   (void)v;
@@ -2174,36 +2219,16 @@ void OnFini(INT32 code, VOID* v) {
       }
     }
   }
-  // ── 采集覆盖的自我说明（**写进轨迹**，不只是打在日志里）────────────────
-  //
-  // 为什么必须进轨迹：日志活在当时那台机器上，轨迹却会被拷走做离线分析。
-  // 离线工具（切片、差分）只看到事件，不知道"有些事件**根本没被采集**"——
-  // 于是"这个地址没有被写过"这类结论会在数据缺口上被当成事实。
-  // 第 33 轮就是这种情况：靶子写缓冲区 2000 次，切片报"没有观察到写入"，
-  // 而真实原因是那 245 个写入点插不上 AFTER 点。
-  //
-  // 怎么送：工具侧没有把文本写进轨迹的通道（文本是脚本经链路回传的）。
-  // 所以用 `StateChange`（kind 10）在**此前未使用的 arg 槽**里带数字——
-  // 与转移码（ADR 0012 用 `RegWrite` 的 `args[2]`）同一个做法，
-  // **格式不变**：args[0] = 覆盖子码 1，args[1..4] = 各计数。
+  // ── 采集覆盖：收尾时再写一条（尽力而为，见 push_coverage_record 的注释）──
   if (g_mem.enabled) {
-    ThreadStats* stats = stats_for(0);
-    if (stats != nullptr) {
-      const UINT64 coverage_args[5] = {
-          1,
-          static_cast<UINT64>(g_mem_sites),
-          g_mem_skipped_no_after,
-          g_mem_unreadable,
-          g_mem_filtered,
-      };
-      push_probe_event(stats, 10 /* PB_EV_STATE_CHANGE */, 0, 0, coverage_args, 5);
-      report("已把采集覆盖写进轨迹（mem_write_sites=%ld skipped_no_after=%llu "
-             "unreadable=%llu filtered=%llu）",
-             static_cast<long>(g_mem_sites),
-             static_cast<unsigned long long>(g_mem_skipped_no_after),
-             static_cast<unsigned long long>(g_mem_unreadable),
-             static_cast<unsigned long long>(g_mem_filtered));
-    }
+    push_coverage_record(stats_for(0), g_mem_soft_stopped);
+    report("采集覆盖（收尾）：mem_write_sites=%ld skipped_no_after=%llu unreadable=%llu "
+           "filtered=%llu capped=%s",
+           static_cast<long>(g_mem_sites),
+           static_cast<unsigned long long>(g_mem_skipped_no_after),
+           static_cast<unsigned long long>(g_mem_unreadable),
+           static_cast<unsigned long long>(g_mem_filtered),
+           g_mem_soft_stopped ? "是（上限之后的事件**不存在**，不代表没发生）" : "否");
   }  // ── 转移的账（调用图的数据来源，见 ADR 0012）───────────────────────────
   if (g_transfers_enabled) {
     report("转移事件：插装 %llu 个点，观察到 call %llu 次 / ret %llu 次",
