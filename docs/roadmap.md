@@ -76,7 +76,7 @@
 | ~~`pinbridge.dll`：Pin tool 骨架 + **入口点探针**~~ | ✅ 已完成：`pin -t pinbridge.dll -- pb_sample_target.exe` → 命中入口 → 事件穿过桥接层与 agent → **目标进程内写出 `.pbt`** → 我们的读取器解析通过（`ctest -R pin_tool_instruments_a_target`） |
 | ~~脚本策略与生命周期（登记 / 白名单 / 状态机 / 执行预算记账）~~ | ✅ 已完成：`crates/pinbridge-agent/src/script.rs`（静态扫描带行号拒绝，**明确说明它不是沙箱**；登记 ≠ 运行由 `receives_events` 与 `is_live` 两个判断分开表达） |
 | ~~系统调用 Hook（syscall_enter）~~ | ✅ 已完成：探针识别 `syscall`（实测 59–61 个插装点），采集 SSN + 前四个参数（x64 第一个参数在 **R10**）。**回调只做内存入队，跨边界由 Pin 内部线程每 10 ms 冲刷**——这个约束是实测逼出来的（回调里调外部 DLL → 5/5 崩溃；改成入队 → 6/6 通过）。`ctest -R pin_tool_captures_syscalls` 断言三件事：捕够 300+ 条、溢出丢弃为 0、Pin 无内部故障 |
-| syscall_exit 事件 | ⏳ `INS_IsSysret` 在当前 Windows 目标上没匹配到（`exit=0`），返回路径要另找机制 |
+| ~~syscall_exit 事件~~ | ✅ 已完成：`sysret` 是内核态指令（插装不到），`INS_Next(syscall)` 也无效（syscall 是基本块终止指令）——返回地址改为**算出**（`syscall 地址 + INS_Size`）并在插桩期按地址识别。实测 441 enter / 454 exit；**16 次返回没有配对的进入**（`int 2Eh` 回退路径共用同一个 `ret`）记为 `args[0]=0` 并计数。ctest 要求进入与返回都 ≥300，且 `exit=0` 直接判失败 |
 | ~~内存访问观测（mem_read / mem_write）~~ | ✅ 已完成（**默认关闭**）：三层过滤（模块 / 地址范围 / 读或写），写入事件用"BEFORE 记地址 + AFTER 读值"两段式拿到**写入后**的值。实测靶子执行 2000 次写入、探针捕获 2000 条（一个不多一个不少），零丢弃；`ctest -R pin_tool_mem_range_filter`（脚本化：地址随 ASLR 变化，必须先问靶子再跑探针） |
 | ~~指令模板匹配（pattern_hit）~~ | ✅ 已完成：`-pb_pattern "id:name:hex"`，只扫主模块可执行段，命中点按**指令地址范围**匹配，`?` 通配、每模板上限可调（截断必报）。实测靶子带 8 字节魔数、调 500 次 → **命中 500 次**；`ctest -R pin_tool_pattern_hit` |
 | ~~TF 单步虚拟化（`flags_virtualize`）~~ | ✅ 已完成：`-pb_tf off\|watch\|virtualize`。`popfq`/`iretq` 在**栈上副本**里剥掉真实 TF，`pushfq` 在 AFTER 点把虚拟 TF 补回读副本。实测四档签名可证伪：单独跑靶子 `real_steps=50`；Pin 下不虚拟化则进程以 `0x80000004` 终止；virtualize 下 **`real_steps=0 tf_reads=50`**（目标确信自己在单步，其实没有）。`ctest -R tf` 三档覆盖 |

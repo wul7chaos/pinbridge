@@ -293,13 +293,14 @@ if(BUILD_TESTING)
                 -pb_syscalls 1
                 -pb_syscall_max 100000
                 -pb_require_syscalls 300
+                -pb_require_syscall_exits 300
                 -pb_trace "${CMAKE_BINARY_DIR}/pin-syscall-trace.pbt"
                 -pb_events 2
                 --
                 "$<TARGET_FILE:pb_sample_target>" --syscalls 300)
       set_tests_properties(pin_tool_captures_syscalls PROPERTIES
-        PASS_REGULAR_EXPRESSION "捕获数满足要求"
-        FAIL_REGULAR_EXPRESSION "失败：要求至少捕获|溢出丢弃 [1-9]|Unhandled internal exception"
+        PASS_REGULAR_EXPRESSION "返回事件捕获数满足要求"
+        FAIL_REGULAR_EXPRESSION "失败：要求至少捕获|exit=0|溢出丢弃 [1-9]|Unhandled internal exception"
         WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
       if(PINBRIDGE_AGENT_DLL)
         set_tests_properties(pin_tool_captures_syscalls PROPERTIES

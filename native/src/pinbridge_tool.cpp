@@ -128,7 +128,10 @@ KNOB<std::string> KnobSyscallMax(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_max
 // 为什么放在工具里而不是靠测试脚本数日志行：退出码是机器可判定的，
 // 而"数日志里出现了几次"既脆弱又会被日志格式改动打断。
 KNOB<std::string> KnobRequireSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_require_syscalls", "0",
-                                      "捕获到的系统调用事件少于该值时报告失败（0 表示不检查）");
+                                      "捕获到的系统调用**进入**事件少于该值时报告失败（0 表示不检查）");
+KNOB<std::string> KnobRequireSyscallExits(KNOB_MODE_WRITEONCE, "pintool",
+                                          "pb_require_syscall_exits", "0",
+                                          "捕获到的系统调用**返回**事件少于该值时报告失败（0 表示不检查）");
 // 内存探针：**默认关闭**。
 //
 // 为什么不像系统调用探针那样默认开：它是高频探针，实测在默认配置下
@@ -328,10 +331,61 @@ bool pb_syscall_enabled = true;
 UINT64 g_syscall_cap = 0;
 /// 捕获数下限（见 KnobRequireSyscalls / KnobRequireMem）。
 UINT64 g_required_syscalls = 0;
+UINT64 g_required_syscall_exits = 0;
 UINT64 g_required_mem = 0;
 UINT64 g_required_pattern_hits = 0;
 UINT64 g_required_tf_sets = 0;
 volatile long g_syscall_sites = 0;
+/// 返回点插装数（挂在 `syscall` 的下一条指令上）。
+volatile long g_syscall_exit_sites = 0;
+/// 记录到的系统调用返回地址数，以及其中被成功插装的数量。
+///
+/// `syscall` 是 Pin 里的**基本块终止指令**，所以 `INS_Next(syscall)` 无效
+/// （实测 59/59 都"没有返回点"）。返回地址只能自己算：`syscall 地址 + 指令长度`，
+/// 然后在插桩期按地址把它认出来。
+UINT64 g_syscall_returns_recorded = 0;
+UINT64 g_syscall_returns_matched = 0;
+/// 没有配对进入的返回事件数（`int 2Eh` 回退路径与 syscall 路径共用同一个 ret）。
+volatile UINT64 g_syscall_exit_without_enter = 0;
+
+constexpr UINT32 kMaxSyscallReturns = 512;
+ADDRINT g_syscall_returns[kMaxSyscallReturns];
+UINT32 g_syscall_return_count = 0;
+
+/// 登记一个"系统调用返回点"地址。
+void record_syscall_return(ADDRINT address) {
+  ++g_syscall_returns_recorded;
+  for (UINT32 i = 0; i < g_syscall_return_count; ++i) {
+    if (g_syscall_returns[i] == address) {
+      return;  // 同一个桩只记一次
+    }
+  }
+  if (g_syscall_return_count >= kMaxSyscallReturns) {
+    return;  // 上限：命中数在收尾统计里对不上时能看出来
+  }
+  UINT32 position = g_syscall_return_count;
+  while (position > 0 && g_syscall_returns[position - 1] > address) {
+    g_syscall_returns[position] = g_syscall_returns[position - 1];
+    --position;
+  }
+  g_syscall_returns[position] = address;
+  ++g_syscall_return_count;
+}
+
+/// 该地址是否是已登记的系统调用返回点（二分查找）。
+bool is_syscall_return(ADDRINT address) {
+  UINT32 low = 0;
+  UINT32 high = g_syscall_return_count;
+  while (low < high) {
+    const UINT32 middle = low + (high - low) / 2;
+    if (g_syscall_returns[middle] < address) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low < g_syscall_return_count && g_syscall_returns[low] == address;
+}
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
 /// 转发层 → agent → 事件队列 → 轨迹文件 → Hub 侧加载器。
@@ -814,6 +868,15 @@ struct ThreadStats {
   UINT64 mem_reads;
   /// 模板命中计数。
   UINT64 pattern_hits;
+  /// 最近一次系统调用进入时的调用号（返回点已经看不到它了）。
+  UINT64 last_syscall_ssn;
+  /// 是否有一次"已进入、尚未返回"的系统调用。
+  ///
+  /// 需要它是因为**返回事件可能没有配对的进入**：ntdll 的桩里
+  /// `int 2Eh` 回退路径与 `syscall` 路径**共用同一个 `ret`**，
+  /// 那条 `ret` 两条路径都会经过。此时拿上一次的调用号来填 args[0]
+  /// 就是伪造数据——所以宁可记 0（未知）并计数。
+  bool syscall_pending;
   /// 目标的虚拟 TF 状态（TF 虚拟化用）。
   bool virtual_tf;
   /// 写入的两段式实现用的待处理槽（BEFORE 记地址，AFTER 读值）。
@@ -1001,6 +1064,11 @@ void OnSyscallEnter(THREADID tid, ADDRINT address, ADDRINT ssn, ADDRINT arg0,
   stats->in_hook = true;
   ++stats->enters;
   ++g_syscall_captured;
+  // 记住调用号：返回点已经看不到它了（那时 RAX 是 NTSTATUS）。
+  // 事件模型里 `syscall_exit` 的 args[0] 是**调用号**、args[1] 是返回值，
+  // 所以这个记忆不是可选优化，而是让事件符合约定的一部分。
+  stats->last_syscall_ssn = static_cast<UINT64>(ssn);
+  stats->syscall_pending = true;
   const UINT64 args[5] = {static_cast<UINT64>(ssn), static_cast<UINT64>(arg0),
                           static_cast<UINT64>(arg1), static_cast<UINT64>(arg2),
                           static_cast<UINT64>(arg3)};
@@ -1013,7 +1081,17 @@ void OnSyscallEnter(THREADID tid, ADDRINT address, ADDRINT ssn, ADDRINT arg0,
   }
 }
 
-/// `sysret` 之前：此时 RAX 已经是内核写回的返回状态。
+/// 系统调用的**返回点**：`syscall` 之后的那条指令。
+///
+/// ## 为什么不是 `sysret`
+///
+/// 第一版挂在 `INS_IsSysret` 上，实测在当前 Windows 上**一次都没命中**
+/// （收尾统计里 `exit=0`）。原因不是 Pin 的问题：内核返回用户态用的 `sysret`
+/// 是**内核态指令**，Pin 插装的是用户态代码。用户态能看到的返回路径就是
+/// ntdll 系统调用桩里 `syscall` 指令的**下一条指令**（通常是 `ret`）。
+///
+/// 所以这里在插桩期取 `INS_Next(syscall_ins)`，把回调挂在那个点上：
+/// 此时内核已经返回、RAX 里是 NTSTATUS。
 void OnSyscallExit(THREADID tid, ADDRINT address, ADDRINT status) {
   if (g_shutdown || g_syscall_soft_stopped) {
     return;
@@ -1026,9 +1104,22 @@ void OnSyscallExit(THREADID tid, ADDRINT address, ADDRINT status) {
   stats->in_hook = true;
   ++stats->exits;
   ++g_syscall_captured;
-  const UINT64 args[1] = {static_cast<UINT64>(status)};
-  push_probe_event(stats, 4 /* PB_EV_SYSCALL_EXIT */, tid, address, args, 1);
+  // 顺序与 `syscall_exit` 的约定一致：args[0] = 调用号，args[1] = 返回值。
+  UINT64 ssn = 0;
+  if (stats->syscall_pending) {
+    ssn = stats->last_syscall_ssn;
+    stats->syscall_pending = false;
+  } else {
+    // 没有配对的进入：调用号**未知**。记 0 并计数，而不是拿上一次的号冒充——
+    // 轨迹里出现一个错的调用号比出现一个 0 危险得多。
+    ++g_syscall_exit_without_enter;
+  }
+  const UINT64 args[2] = {ssn, static_cast<UINT64>(status)};
+  push_probe_event(stats, 4 /* PB_EV_SYSCALL_EXIT */, tid, address, args, 2);
   stats->in_hook = false;
+  if (g_syscall_cap != 0 && static_cast<UINT64>(g_syscall_captured) >= g_syscall_cap) {
+    request_syscall_stop();
+  }
 }
 
 /// 映像卸载回调：**这是我们能拿到的最早的退出信号**。
@@ -1238,6 +1329,15 @@ void OnInstruction(INS ins, VOID* v) {
       g_syscall_soft_stopped) {
     return;
   }
+  // 先认返回点：它在自己所在的那个块里，与含 `syscall` 的块不是同一个。
+  if (is_syscall_return(address)) {
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnSyscallExit),
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RAX,
+                   IARG_END);
+    ++g_syscall_exit_sites;
+    ++g_syscall_returns_matched;
+    // 不早退：这条指令仍可能命中别的探针（模板等）。
+  }
   if (INS_IsSyscall(ins)) {
     // 只登记 SSN 与四个参数寄存器，不做任何地址计算——这些值在
     // IPOINT_BEFORE 处读，正是内核即将看到的那一份。
@@ -1247,13 +1347,30 @@ void OnInstruction(INS ins, VOID* v) {
                    LEVEL_BASE::REG_RDX, IARG_REG_VALUE, LEVEL_BASE::REG_R8,
                    IARG_REG_VALUE, LEVEL_BASE::REG_R9, IARG_END);
     ++g_syscall_sites;
+
+    // ── 返回点：`syscall` 之后的那条指令 ──
+    // 用户态能看到的返回路径就在这里（内核用的 `sysret` 是内核态指令，
+    // Pin 插装不到——这是第一版 `exit=0` 的原因，见 OnSyscallExit 的注释）。
+    //
+    // 不能写 `INS_Next(ins)`：`syscall` 是 Pin 里的**基本块终止指令**，
+    // 它没有"块内下一条"。返回地址只能算出来，然后在插桩期按地址认出来
+    // （见 is_syscall_return / record_syscall_return）。
+    //
+    // 为什么这个顺序能成立：含 `syscall` 的块必然先被翻译并执行，
+    // 之后内核才返回到下一条指令——而那条指令所在的**新块**是那时才被翻译的，
+    // 所以我们登记在先、匹配在后。少数反例（有人从别处跳进返回点）会让
+    // 记录数与匹配数对不上，收尾统计里会如实显示。
+    record_syscall_return(static_cast<ADDRINT>(INS_Address(ins) + INS_Size(ins)));
     return;
   }
   if (INS_IsSysret(ins)) {
+    // 保底：某些实现/平台确实用 `sysret` 返回。当前 Windows 上一次都没命中，
+    // 但它不该被删掉——删掉就再也不知道"什么时候会命中"了。
     INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnSyscallExit),
                    IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE,
                    LEVEL_BASE::REG_RAX, IARG_END);
     ++g_syscall_sites;
+    ++g_syscall_exit_sites;
     return;
   }
 
@@ -1548,10 +1665,22 @@ void OnFini(INT32 code, VOID* v) {
   exits += g_overflow_slot.exits;
   skips += g_overflow_slot.reentrant_skips;
   failures += g_overflow_slot.push_failures;
-  report("系统调用探针：插装点 %ld 个，捕获 enter=%llu exit=%llu",
+  report("系统调用探针：进入点 %ld 个 / 返回点 %ld 个；捕获 enter=%llu exit=%llu",
          static_cast<long>(g_syscall_sites),
+         static_cast<long>(g_syscall_exit_sites),
          static_cast<unsigned long long>(enters),
          static_cast<unsigned long long>(exits));
+  report("  返回点：登记 %llu 个、成功插装 %llu 个%s",
+         static_cast<unsigned long long>(g_syscall_returns_recorded),
+         static_cast<unsigned long long>(g_syscall_returns_matched),
+         g_syscall_returns_matched < g_syscall_returns_recorded
+             ? "（有差额：返回点所在的基本块在登记之前就被翻译过了，那些返回不会被捕获）"
+             : "");
+  if (g_syscall_exit_without_enter != 0) {
+    report("  有 %llu 次返回没有配对的进入（回退路径与 syscall 路径共用同一个 ret），\
+这些事件的 args[0] 记为 0（调用号未知，不猜）",
+           static_cast<unsigned long long>(g_syscall_exit_without_enter));
+  }
   report("  重入跳过 %llu 条，推事件失败 %llu 条%s",
          static_cast<unsigned long long>(skips),
          static_cast<unsigned long long>(failures),
@@ -1578,13 +1707,24 @@ void OnFini(INT32 code, VOID* v) {
   if (g_required_syscalls != 0) {
     const UINT64 captured = enters + exits;
     if (captured < g_required_syscalls) {
-      report("失败：要求至少捕获 %llu 条系统调用事件，实际 %llu 条",
+      report("失败：要求至少捕获 %llu 条系统调用**进入**事件，实际 %llu 条",
              static_cast<unsigned long long>(g_required_syscalls),
              static_cast<unsigned long long>(captured));
     } else {
-      report("✓ 捕获数满足要求（%llu >= %llu）",
+      report("✓ 进入事件捕获数满足要求（%llu >= %llu）",
              static_cast<unsigned long long>(captured),
              static_cast<unsigned long long>(g_required_syscalls));
+    }
+  }
+  if (g_required_syscall_exits != 0) {
+    if (exits < g_required_syscall_exits) {
+      report("失败：要求至少捕获 %llu 条系统调用**返回**事件，实际 %llu 条",
+             static_cast<unsigned long long>(g_required_syscall_exits),
+             static_cast<unsigned long long>(exits));
+    } else {
+      report("✓ 返回事件捕获数满足要求（%llu >= %llu）",
+             static_cast<unsigned long long>(exits),
+             static_cast<unsigned long long>(g_required_syscall_exits));
     }
   }
 
@@ -1738,6 +1878,7 @@ int main(int argc, char** argv) {
 
   g_syscall_cap = parse_u64(KnobSyscallMax.Value().c_str(), 4096);
   g_required_syscalls = parse_u64(KnobRequireSyscalls.Value().c_str(), 0);
+  g_required_syscall_exits = parse_u64(KnobRequireSyscallExits.Value().c_str(), 0);
 
   // 内存探针：模式串 `0/w/r/rw`；范围形如 `lo-hi`（十六进制）。
   const std::string mem_mode = KnobMem.Value();
