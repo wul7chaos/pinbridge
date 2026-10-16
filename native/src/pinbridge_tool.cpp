@@ -153,6 +153,11 @@ KNOB<std::string> KnobPatternMax(KNOB_MODE_WRITEONCE, "pintool", "pb_pattern_max
 KNOB<std::string> KnobRequirePatternHits(KNOB_MODE_WRITEONCE, "pintool",
                                          "pb_require_pattern_hits", "0",
                                          "模板命中次数少于该值时报告失败（0 表示不检查）");
+// TF 单步：默认 watch（只观察，不改目标行为；成本只在异常发生时才有）。
+KNOB<std::string> KnobTf(KNOB_MODE_WRITEONCE, "pintool", "pb_tf", "watch",
+                         "TF 单步：off（不注册）/ watch（只观察）/ virtualize（虚拟化，会改变目标行为）");
+KNOB<std::string> KnobRequireTfSets(KNOB_MODE_WRITEONCE, "pintool", "pb_require_tf_sets", "0",
+                                    "观察到的 TF 置位意图少于该值时报告失败（0 表示不检查）");
 
 /// 能力位（与 pinbridge.h / capability.rs 一致；只用到这两个组合）。
 constexpr UINT32 PB_CAP_MEM_READ = 1u << 0;
@@ -325,6 +330,7 @@ UINT64 g_syscall_cap = 0;
 UINT64 g_required_syscalls = 0;
 UINT64 g_required_mem = 0;
 UINT64 g_required_pattern_hits = 0;
+UINT64 g_required_tf_sets = 0;
 volatile long g_syscall_sites = 0;
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
@@ -808,6 +814,8 @@ struct ThreadStats {
   UINT64 mem_reads;
   /// 模板命中计数。
   UINT64 pattern_hits;
+  /// 目标的虚拟 TF 状态（TF 虚拟化用）。
+  bool virtual_tf;
   /// 写入的两段式实现用的待处理槽（BEFORE 记地址，AFTER 读值）。
   /// 每线程一份，同一线程内两条回调严格相邻，不需要任何同步。
   bool pending_write_valid;
@@ -1196,9 +1204,11 @@ void OnMemRead(THREADID tid, ADDRINT ins_address, ADDRINT effective_address, UIN
   }
 }
 
-// 前置声明：定义在文件后面的"模板命中"一节（它们要用到那里的全局量）。
+// 前置声明：定义在文件后面的"模板命中"与"TF 单步"两节
+//（它们要用到那里的全局量，而 C++ 要求先声明后使用）。
 void on_instruction_patterns(INS ins, ADDRINT address);
 void OnPatternHit(THREADID tid, ADDRINT ins_address, ADDRINT pattern_id);
+void instrument_tf(INS ins);
 
 /// 指令级插桩：入口点 + 系统调用 + 内存访问 + 模板命中。
 void OnInstruction(INS ins, VOID* v) {
@@ -1246,6 +1256,9 @@ void OnInstruction(INS ins, VOID* v) {
     ++g_syscall_sites;
     return;
   }
+
+  // ── TF 相关指令（popfq/iretq/pushfq）──
+  instrument_tf(ins);
 
   // ── 模板命中（放在会 return 的分支之前）──
   on_instruction_patterns(ins, address);
@@ -1314,6 +1327,175 @@ void OnPatternHit(THREADID tid, ADDRINT ins_address, ADDRINT pattern_id) {
   push_probe_event(stats, 5 /* PB_EV_PATTERN_HIT */, tid, ins_address, args, 2);
   stats->in_hook = false;
 }
+// ══════════════════════════════════════════════════════════════ TF 单步虚拟化
+//
+// EFLAGS.TF（位 8）是反跟踪最常用的一招：置位之后每条指令都会触发
+// STATUS_SINGLE_STEP 异常，调试器/工具会被淹没；反过来，如果我们要单步观察
+// 又不让目标察觉，就得把"目标看到的 TF"和"真实的 TF"分开。
+//
+// 三种模式（`-pb_tf`）：
+//   off        ：不注册任何东西，零开销。
+//   watch      ：只**观察**——目标是真想单步还是想骗我们，看得见。
+//   virtualize ：在 watch 基础上把真实 TF 剥掉。目标的判断依然成立
+//                （它读 flags 时 TF 是置位的），但它永远不会真的被单步打断。
+//
+// ── 为什么改栈上的副本，而不是改上下文 ──────────────────────────────────
+// `popfq` / `iretq` 会**从栈加载** flags：在 IPOINT_BEFORE 改 EFLAGS 会被这条
+// 指令自己覆盖掉。改它即将加载的那份副本才有效。
+//
+// 读的那一侧（`pushfq`）反过来：在 BEFORE 没法改"即将压栈的值"，
+// 但在 **AFTER** 改栈上刚压好的那份副本就行——此时 RSP 已经减过 8，
+// `[RSP]` 就是刚压进去的 flags。
+//
+// ── 实测依据（决定这个设计能不能被验证）─────────────────────────────────
+// MSVC 的 `__writeeflags()` 会编译成 `popfq`、`__readeflags()` 会编译成
+// `pushfq`（用 dumpbin 确认过）。所以自写靶子不需要内联汇编就能走完整条路径，
+// 判据可以精确到：
+//   virtualize：靶子报告 real_steps=0、tf_reads=N（它确信自己在单步，其实没有）
+//   不虚拟化  ：靶子报告 real_steps=N、tf_reads=0（内核在派发异常时清掉了 TF）
+enum class TfMode { Off, Watch, Virtualize };
+
+TfMode g_tf_mode = TfMode::Off;
+volatile bool g_tf_enabled = false;
+UINT64 g_tf_sets = 0;                // 观察到"置位 TF"的意图
+UINT64 g_tf_clears = 0;              // 观察到"清除 TF"的意图
+UINT64 g_tf_masked = 0;              // 实际从栈上副本里剥掉的置位
+UINT64 g_tf_read_patches = 0;        // 往 pushfq 压栈副本里补回去的次数
+UINT64 g_tf_steps_observed = 0;      // 真实单步异常次数
+UINT64 g_tf_steps_suppressed = 0;    // virtualize 下被清掉 TF 的真实单步
+UINT64 g_tf_stack_failures = 0;      // 读/写栈上副本失败
+UINT64 g_tf_sites = 0;               // 插装了多少个 popfq/iretq/pushfq 点
+
+/// `STATUS_SINGLE_STEP`（不能 include windows.h：Pin 自己的 minwindef 会冲突）。
+constexpr INT32 kExceptionSingleStep = static_cast<INT32>(0x80000004);
+/// EFLAGS.TF
+constexpr UINT64 kTrapFlagBit = 0x100ULL;
+
+/// `popfq` / `iretq`：flags 即将从栈上加载。
+VOID OnFlagsLoadBefore(THREADID tid, ADDRINT ins_address, ADDRINT stack_pointer,
+                       INT32 is_iret) {
+  if (!g_tf_enabled || g_shutdown) {
+    return;
+  }
+  // iretq 的栈布局：RIP、CS、RFLAGS、RSP、SS —— flags 在 RSP+16。
+  const ADDRINT flags_address = is_iret != 0 ? stack_pointer + 16 : stack_pointer;
+  UINT64 flags = 0;
+  if (PIN_SafeCopy(&flags, reinterpret_cast<const VOID*>(flags_address), 8) != 8) {
+    ++g_tf_stack_failures;
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  const bool setting = (flags & kTrapFlagBit) != 0;
+  if (setting == stats->virtual_tf) {
+    return;  // 与当前虚拟状态相同：没有意图变化，不报（否则会刷屏）
+  }
+  stats->virtual_tf = setting;
+  if (setting) {
+    ++g_tf_sets;
+  } else {
+    ++g_tf_clears;
+  }
+  // 上报：args[0] 的语义见 docs（1=置位意图 0=清除意图 2=真实单步异常）。
+  const UINT64 args[2] = {setting ? 1ULL : 0ULL, 0};
+  push_probe_event(stats, 9 /* PB_EV_TRAP_FLAG */, tid, ins_address, args, 2);
+
+  if (g_tf_mode == TfMode::Virtualize && setting) {
+    // 把真实 TF 从这份副本里剥掉：目标不会被真的单步打断。
+    const UINT64 masked = flags & ~kTrapFlagBit;
+    if (PIN_SafeCopy(reinterpret_cast<VOID*>(flags_address), &masked, 8) == 8) {
+      ++g_tf_masked;
+    } else {
+      ++g_tf_stack_failures;
+    }
+  }
+}
+
+/// `pushfq` 之后：把虚拟 TF 补回刚压栈的那份副本，让目标"读到"它设置的 TF。
+VOID OnFlagsStoreAfter(THREADID tid, ADDRINT stack_pointer) {
+  if (!g_tf_enabled || g_tf_mode != TfMode::Virtualize || g_shutdown) {
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  if (!stats->virtual_tf) {
+    return;
+  }
+  // AFTER 点：RSP 已经减过 8，`[RSP]` 就是刚压进去的那份 flags。
+  UINT64 flags = 0;
+  if (PIN_SafeCopy(&flags, reinterpret_cast<const VOID*>(stack_pointer), 8) != 8) {
+    ++g_tf_stack_failures;
+    return;
+  }
+  const UINT64 patched = flags | kTrapFlagBit;
+  if (PIN_SafeCopy(reinterpret_cast<VOID*>(stack_pointer), &patched, 8) == 8) {
+    ++g_tf_read_patches;
+  } else {
+    ++g_tf_stack_failures;
+  }
+}
+
+/// 上下文变化：真实单步异常。
+VOID OnContextChange(THREADID tid, CONTEXT_CHANGE_REASON reason, const CONTEXT* from,
+                     CONTEXT* to, INT32 info, VOID* v) {
+  (void)from;
+  (void)v;
+  if (!g_tf_enabled || reason != CONTEXT_CHANGE_REASON_EXCEPTION ||
+      info != kExceptionSingleStep) {
+    return;
+  }
+  ++g_tf_steps_observed;
+  // 立刻诊断：收到真实单步说明"没有拦住"，这一刻的计数就是原因线索。
+  report("TF 单步：收到真实单步异常（已剥离 %llu 次 / 读补 %llu 次 / 栈失败 %llu 次 / 插装点 %llu 个）",
+         static_cast<unsigned long long>(g_tf_masked),
+         static_cast<unsigned long long>(g_tf_read_patches),
+         static_cast<unsigned long long>(g_tf_stack_failures),
+         static_cast<unsigned long long>(g_tf_sites));
+  ThreadStats* stats = stats_for(tid);
+  const UINT64 args[2] = {2, 0};
+  push_probe_event(stats, 9 /* PB_EV_TRAP_FLAG */, tid,
+                   PIN_GetContextReg(to, LEVEL_BASE::REG_INST_PTR), args, 2);
+  if (g_tf_mode == TfMode::Virtualize && to != nullptr) {
+    // Pin 明确允许在这里改 `to`：把这个真实单步消化掉，不让它级联。
+    // 注意这**会改变目标看到的行为**（这正是 virtualize 的目的），
+    // 所以它必须是显式选择，不能是默认。
+    const ADDRINT flags = PIN_GetContextReg(to, LEVEL_BASE::REG_GFLAGS);
+    PIN_SetContextReg(to, LEVEL_BASE::REG_GFLAGS, flags & ~kTrapFlagBit);
+    ++g_tf_steps_suppressed;
+  }
+}
+
+/// TF 相关指令的插桩（只在 `-pb_tf` 打开时才做助记符比较）。
+void instrument_tf(INS ins) {
+  if (!g_tf_enabled) {
+    return;
+  }
+  if (INS_IsIRet(ins)) {
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnFlagsLoadBefore),
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE,
+                   LEVEL_BASE::REG_STACK_PTR, IARG_ADDRINT, static_cast<ADDRINT>(1),
+                   IARG_END);
+    return;
+  }
+  const std::string mnemonic = INS_Mnemonic(ins);
+  // ⚠ `INS_Mnemonic` 返回的是**大写**助记符（实测：第一条指令打印出来是
+  // "MOV"）。第一版按小写 "popfq" 比较，于是一个相关指令都没插桩，
+  // 表现为"虚拟化没生效"——而其实是识别环节就断了。
+  if (mnemonic == "POPFQ" || mnemonic == "POPF") {
+    ++g_tf_sites;
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnFlagsLoadBefore),
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE,
+                   LEVEL_BASE::REG_STACK_PTR, IARG_ADDRINT, static_cast<ADDRINT>(0),
+                   IARG_END);
+    return;
+  }
+  if ((mnemonic == "PUSHFQ" || mnemonic == "PUSHF") &&
+      INS_IsValidForIpointAfter(ins)) {
+    INS_InsertCall(ins, IPOINT_AFTER, reinterpret_cast<AFUNPTR>(OnFlagsStoreAfter),
+                   IARG_THREAD_ID, IARG_REG_VALUE, LEVEL_BASE::REG_STACK_PTR, IARG_END);
+    ++g_tf_sites;
+  }
+}
+
+
 // ══════════════════════════════════════════════════════════════════ 收尾
 /// 进程退出前：停录、把事件取回来打印。
 ///
@@ -1437,6 +1619,35 @@ void OnFini(INT32 code, VOID* v) {
       }
     }
   }
+  // ── TF 单步的账 ───────────────────────────────────────────────────────
+  if (g_tf_enabled) {
+    report("TF 单步：置位意图 %llu 次、清除意图 %llu 次，真实单步异常 %llu 次",
+           static_cast<unsigned long long>(g_tf_sets),
+           static_cast<unsigned long long>(g_tf_clears),
+           static_cast<unsigned long long>(g_tf_steps_observed));
+    if (g_tf_mode == TfMode::Virtualize) {
+      report("  虚拟化：剥离真实 TF %llu 次，补回读副本 %llu 次，消化真实单步 %llu 次",
+             static_cast<unsigned long long>(g_tf_masked),
+             static_cast<unsigned long long>(g_tf_read_patches),
+             static_cast<unsigned long long>(g_tf_steps_suppressed));
+    }
+    if (g_tf_stack_failures != 0) {
+      report("  栈上 flags 副本读写失败 %llu 次（这部分没能虚拟化）",
+             static_cast<unsigned long long>(g_tf_stack_failures));
+    }
+    if (g_required_tf_sets != 0) {
+      if (g_tf_sets < g_required_tf_sets) {
+        report("失败：要求至少观察到 %llu 次 TF 置位意图，实际 %llu 次",
+               static_cast<unsigned long long>(g_required_tf_sets),
+               static_cast<unsigned long long>(g_tf_sets));
+      } else {
+        report("✓ TF 置位意图数满足要求（%llu >= %llu）",
+               static_cast<unsigned long long>(g_tf_sets),
+               static_cast<unsigned long long>(g_required_tf_sets));
+      }
+    }
+  }
+
   // ── 模板命中的账 ──────────────────────────────────────────────────────
   if (g_pattern_enabled) {
     UINT64 hits = 0;
@@ -1549,6 +1760,27 @@ int main(int argc, char** argv) {
       g_mem.high = swap;
     }
   }
+  // TF 单步：三档语义完全不同，所以旋钮值必须**精确**匹配，不猜。
+  {
+    const std::string tf_mode = KnobTf.Value();
+    if (tf_mode == "off") {
+      g_tf_mode = TfMode::Off;
+    } else if (tf_mode == "watch") {
+      g_tf_mode = TfMode::Watch;
+    } else if (tf_mode == "virtualize") {
+      g_tf_mode = TfMode::Virtualize;
+    } else {
+      report("无法识别 -pb_tf 的取值 \"%s\"（只能是 off / watch / virtualize）", tf_mode.c_str());
+      return 7;
+    }
+    g_tf_enabled = g_tf_mode != TfMode::Off;
+    g_required_tf_sets = parse_u64(KnobRequireTfSets.Value().c_str(), 0);
+    report("TF 单步：%s%s", tf_mode.c_str(),
+           g_tf_mode == TfMode::Virtualize
+               ? "（**会改变目标行为**：真实 TF 会被剥掉，目标读到的仍是置位的）"
+               : "");
+  }
+
   // 模板：解析失败就直接结束（不静默跳过某一条）。
   g_pattern_enabled = KnobPattern.Value().empty() == false;
   g_pattern_max_per_pattern = parse_u64(KnobPatternMax.Value().c_str(), 64);
@@ -1590,6 +1822,10 @@ int main(int argc, char** argv) {
   }
 
   IMG_AddInstrumentFunction(OnImageLoad, nullptr);
+  if (g_tf_enabled) {
+    // 只在需要时才注册：这个回调只在异常发生时才被调用，平时零成本。
+    PIN_AddContextChangeFunction(OnContextChange, nullptr);
+  }
   IMG_AddUnloadFunction(OnImageUnload, nullptr);
   INS_AddInstrumentFunction(OnInstruction, nullptr);
   PIN_AddFiniFunction(OnFini, nullptr);

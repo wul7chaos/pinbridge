@@ -306,6 +306,57 @@ if(BUILD_TESTING)
           ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
       endif()
 
+      # -------------------------------------------------- TF 单步虚拟化
+      # 靶子的 TF 实验：置位 TF（`__writeeflags` → `popfq`）→ 执行一条语句 →
+      # 用 SEH 统计真实单步次数 → 读回 flags（`__readeflags` → `pushfq`）。
+      #
+      # 四种配置的签名各不相同，每一档都可证伪：
+      #   单独跑靶子            ：real_steps=50 tf_reads=0（内核派发异常时清掉了 TF）
+      #   Pin + -pb_tf off/watch：进程以 0x80000004 (STATUS_SINGLE_STEP) 终止
+      #                            —— 目标自己的 SEH 收不到它自己的单步异常
+      #   Pin + -pb_tf virtualize：real_steps=0 tf_reads=50
+      #                            —— 目标确信自己在单步，其实一次都没被单步
+      add_test(NAME sample_target_tf_control
+        COMMAND "$<TARGET_FILE:pb_sample_target>" --tf-set 50)
+      set_tests_properties(sample_target_tf_control PROPERTIES
+        PASS_REGULAR_EXPRESSION "PB_TF_RESULT real_steps=50 tf_reads=0")
+
+      add_test(NAME pin_tool_tf_virtualize
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_tf virtualize
+                -pb_require_tf_sets 50
+                -pb_events 0
+                -pb_trace "${CMAKE_BINARY_DIR}/pin-tf-trace.pbt"
+                --
+                "$<TARGET_FILE:pb_sample_target>" --tf-set 50)
+      set_tests_properties(pin_tool_tf_virtualize PROPERTIES
+        PASS_REGULAR_EXPRESSION "PB_TF_RESULT real_steps=0 tf_reads=50"
+        FAIL_REGULAR_EXPRESSION "real_steps=[1-9]|Unhandled internal exception|失败：要求至少观察到"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+      if(PINBRIDGE_AGENT_DLL)
+        set_tests_properties(pin_tool_tf_virtualize PROPERTIES
+          ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
+      endif()
+
+      # 不虚拟化时目标会**死于它自己的单步**。这条用例刻意断言"它会失败"：
+      # 如果哪天它不再失败了，说明要么 Pin 行为变了、要么我们不小心虚拟化了，
+      # 两种都值得被测试套件叫醒。
+      add_test(NAME pin_tool_tf_without_virtualize_is_fatal
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_tf off
+                -pb_events 0
+                --
+                "$<TARGET_FILE:pb_sample_target>" --tf-set 5)
+      set_tests_properties(pin_tool_tf_without_virtualize_is_fatal PROPERTIES
+        WILL_FAIL TRUE
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+      if(PINBRIDGE_AGENT_DLL)
+        set_tests_properties(pin_tool_tf_without_virtualize_is_fatal PROPERTIES
+          ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
+      endif()
+
       # -------------------------------------------------- 指令模板匹配端到端
       # 靶子里那个函数带 8 字节魔数（0x5042524944474531），编译后作为立即数
       # 出现在代码段里。模式**必须按小端写**（31 45 47 44 49 52 42 50）：

@@ -79,8 +79,8 @@
 | syscall_exit 事件 | ⏳ `INS_IsSysret` 在当前 Windows 目标上没匹配到（`exit=0`），返回路径要另找机制 |
 | ~~内存访问观测（mem_read / mem_write）~~ | ✅ 已完成（**默认关闭**）：三层过滤（模块 / 地址范围 / 读或写），写入事件用"BEFORE 记地址 + AFTER 读值"两段式拿到**写入后**的值。实测靶子执行 2000 次写入、探针捕获 2000 条（一个不多一个不少），零丢弃；`ctest -R pin_tool_mem_range_filter`（脚本化：地址随 ASLR 变化，必须先问靶子再跑探针） |
 | ~~指令模板匹配（pattern_hit）~~ | ✅ 已完成：`-pb_pattern "id:name:hex"`，只扫主模块可执行段，命中点按**指令地址范围**匹配，`?` 通配、每模板上限可调（截断必报）。实测靶子带 8 字节魔数、调 500 次 → **命中 500 次**；`ctest -R pin_tool_pattern_hit` |
-| TF 单步虚拟化（`flags_virtualize`） | ⏳ 下一项（第四类插桩点） |
-| TF 虚拟化（`flags_virtualize.cpp`） | ⏳ |
+| ~~TF 单步虚拟化（`flags_virtualize`）~~ | ✅ 已完成：`-pb_tf off\|watch\|virtualize`。`popfq`/`iretq` 在**栈上副本**里剥掉真实 TF，`pushfq` 在 AFTER 点把虚拟 TF 补回读副本。实测四档签名可证伪：单独跑靶子 `real_steps=50`；Pin 下不虚拟化则进程以 `0x80000004` 终止；virtualize 下 **`real_steps=0 tf_reads=50`**（目标确信自己在单步，其实没有）。`ctest -R tf` 三档覆盖 |
+
 | agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 策略层已就绪，缺的是运行时 |
 | 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |
 | 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |

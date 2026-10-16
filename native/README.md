@@ -193,6 +193,47 @@ pin.exe -t pinbridge.dll -pb_pattern "1:pbridge_magic:3145474449524250" `
 
 事件里 `args[0]` 是模板 ID（与命令行给的 id 对应），事件地址是**命中指令的地址**。
 
+### TF 单步虚拟化（`-pb_tf`）
+
+EFLAGS.TF（位 8）是反跟踪最常用的一招：置位后每条指令都触发 STATUS_SINGLE_STEP，
+调试器/工具会被淹没。反过来，我们要单步观察又不让目标察觉时，就得把
+「目标看到的 TF」和「真实的 TF」分开。
+
+| 模式 | 行为 |
+|------|------|
+| `off` | 不注册任何东西，零开销 |
+| `watch`（默认） | 只**观察**：`popfq`/`iretq` 里的 TF 意图、真实单步异常，都上报为 `TrapFlag` 事件（args[0]：1=置位意图，0=清除意图，2=真实单步异常） |
+| `virtualize` | 在 watch 基础上**剥掉真实 TF**：目标读到 TF 仍是置位的，但它永远不会真被单步打断（**会改变目标行为**，所以必须是显式选择） |
+
+**为什么改栈上的副本而不是改上下文**：`popfq`/`iretq` 会从栈加载 flags，
+在 `IPOINT_BEFORE` 改 EFLAGS 会被这条指令自己覆盖。改它即将加载的副本才有效。
+读的那一侧（`pushfq`）反之：`IPOINT_BEFORE` 没法改「即将压栈的值」，
+但在 `IPOINT_AFTER` 改栈上刚压好的副本就行（此时 RSP 已经减过 8，`[RSP]` 就是它）。
+
+**实测四档签名（每档都可证伪，已进 ctest）**：
+
+| 配置 | 结果 |
+|------|------|
+| 单独跑靶子 | `real_steps=50 tf_reads=0`（内核在派发异常时清掉了 TF） |
+| Pin + `-pb_tf off`/`watch` | 进程以 **`0x80000004` (STATUS_SINGLE_STEP) 终止** |
+| Pin + `-pb_tf virtualize` | **`real_steps=0 tf_reads=50`** —— 目标确信自己在单步，其实一次都没被单步 |
+| 工具侧统计（virtualize） | 置位意图 50 / 清除意图 50、剥离真实 TF 50 次、补回读副本 100 次、真实单步 **0** 次 |
+
+**两个只有跑起来才会发现的坑（都踩过）**：
+
+1. **`INS_Mnemonic` 返回的是大写助记符**（实测第一条指令打印出来是 `"MOV"`）。
+   第一版按小写 `"popfq"` 比较，于是一个相关指令都没插桩，
+   表现出来却是「虚拟化没生效」——识别环节就断了。
+2. **在 Pin 下，目标收不到自己的单步异常**：靶子自己的 SEH 抓不到
+   STATUS_SINGLE_STEP，进程直接以 `0x80000004` 退出（连 Pin 的 Fini 都不跑，
+   所以「收尾统计」永远不会出现）。这也是虚拟化对本项目**必需**的理由：
+   不虚拟化，任何自己开 TF 的目标都会死在 Pin 下。
+
+`ctest -R tf` 覆盖三档：`sample_target_tf_control`（对照：真的单步 50 次）、
+`pin_tool_tf_virtualize`（`real_steps=0 tf_reads=50`）、
+`pin_tool_tf_without_virtualize_is_fatal`（**刻意断言它会失败**——哪天它不再失败，
+说明 Pin 行为变了或我们不小心虚拟化了，两种情况都值得被叫醒）。
+
 ### 验收
 
 
