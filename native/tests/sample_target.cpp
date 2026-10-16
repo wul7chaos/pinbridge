@@ -151,6 +151,39 @@ void pattern_loop(unsigned long iterations) {
 ///   -pb_tf virtualize ：real_steps=0、tf_reads=N ← **目标确信自己在单步，其实没有**
 volatile unsigned long long g_tf_sink = 0;
 
+/// 单步异常里读到的**异常位置**（`ExceptionAddress`）。
+///
+/// 为什么要有它：工具侧也在观察同一次单步（`KiUserExceptionDispatcher` 那条路
+/// 走不通，改挂 `RtlRaiseException` 的是应用抛的异常；真实单步走的是另一个口），
+/// 两边报出来的地址**必须一致** —— 否则说明我们观察到的"异常发生在哪"与目标
+/// 自己看到的那份对不上，而这种偏差会直接让分析结论错位。
+///
+/// 工具侧用 `to->REG_INST_PTR`（异常发生时要执行的那条指令）记同样的东西。
+constexpr unsigned long kMaxTfSamples = 8;
+unsigned long long g_tf_exception_addresses[kMaxTfSamples] = {0};
+/// 已占用的槽位数（**用 `InterlockedIncrement` 取号**，见 `tf_note_exception`）。
+volatile long g_tf_exception_slots = 0;
+unsigned long g_tf_exception_count = 0;
+
+/// `__except` 过滤器里顺手记一份异常信息（返回处置方式，语义不变）。
+///
+/// **两条线程会同时调它**（`--tf-threads` 场景），所以槽位用 `InterlockedIncrement`
+/// 预留：否则两个线程会读到同一个计数、写同一个槽，把另一个样本覆盖掉。
+/// 样本丢失本身不影响判据（两条线程步到的位置相同，取到哪个都行），但
+/// "计数对不对"是能被看出来的 —— 那种不一致最难查。
+int tf_note_exception(PEXCEPTION_POINTERS info) {
+  if (info != nullptr && info->ExceptionRecord != nullptr) {
+    const unsigned long slot =
+        static_cast<unsigned long>(InterlockedIncrement(const_cast<volatile long*>(
+            reinterpret_cast<volatile long*>(&g_tf_exception_slots)))) - 1;
+    if (slot < kMaxTfSamples) {
+      g_tf_exception_addresses[slot] =
+          reinterpret_cast<unsigned long long>(info->ExceptionRecord->ExceptionAddress);
+    }
+  }
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
 __declspec(noinline) unsigned long tf_experiment(unsigned long iterations,
                                                 unsigned long* real_steps) {
   unsigned long steps = 0;
@@ -161,7 +194,7 @@ __declspec(noinline) unsigned long tf_experiment(unsigned long iterations,
     __try {
       // TF 置位后，这里的第一条指令会触发 STATUS_SINGLE_STEP。
       g_tf_sink += 1;
-    } __except (GetExceptionCode() == EXCEPTION_SINGLE_STEP ? EXCEPTION_EXECUTE_HANDLER
+    } __except (GetExceptionCode() == EXCEPTION_SINGLE_STEP ? tf_note_exception(GetExceptionInformation())
                                                              : EXCEPTION_CONTINUE_SEARCH) {
       ++steps;
     }
@@ -171,6 +204,12 @@ __declspec(noinline) unsigned long tf_experiment(unsigned long iterations,
     __writeeflags(__readeflags() & ~0x100ULL);  // 收尾清掉，避免污染后续逻辑
   }
   *real_steps = steps;
+  // 报出目标**自己**看到的异常位置：比对判据的一半（另一半由工具打）。
+  std::printf("PB_TF_EXC count=%lu", g_tf_exception_count);
+  for (unsigned long i = 0; i < g_tf_exception_count && i < kMaxTfSamples; ++i) {
+    std::printf(" addr%lu=0x%llX", i, g_tf_exception_addresses[i]);
+  }
+  std::printf("\n");
   return reads_with_tf;
 }
 
@@ -229,7 +268,7 @@ unsigned long __stdcall tf_thread_main(void* arg) {
       if ((__readeflags() & 0x100ULL) != 0) {
         ++reads_with_tf;
       }
-    } __except (GetExceptionCode() == EXCEPTION_SINGLE_STEP ? EXCEPTION_EXECUTE_HANDLER
+    } __except (GetExceptionCode() == EXCEPTION_SINGLE_STEP ? tf_note_exception(GetExceptionInformation())
                                                              : EXCEPTION_CONTINUE_SEARCH) {
       ++steps;
     }
@@ -263,6 +302,12 @@ int tf_threads_experiment(unsigned long rounds) {
   for (int i = 0; i < 2; ++i) {
     CloseHandle(threads[i]);
   }
+  // 与 `--tf-set` 那条路同样报出目标自己看到的异常位置（判据的一半）。
+  std::printf("PB_TF_EXC count=%lu", g_tf_exception_count);
+  for (unsigned long i = 0; i < g_tf_exception_count && i < kMaxTfSamples; ++i) {
+    std::printf(" addr%lu=0x%llX", i, g_tf_exception_addresses[i]);
+  }
+  std::printf("\n");
   std::printf("PB_TF_THREADS rounds=%lu a(sets=%lu clears=%lu read_tf=%lu) "
               "b(sets=%lu clears=%lu read_tf=%lu)\n",
               rounds, results[0].sets, results[0].clears, results[0].reads_with_tf,

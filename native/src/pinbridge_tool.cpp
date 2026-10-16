@@ -1966,6 +1966,13 @@ UINT64 g_tf_clears = 0;              // 观察到"清除 TF"的意图
 UINT64 g_tf_masked = 0;              // 实际从栈上副本里剥掉的置位
 UINT64 g_tf_read_patches = 0;        // 往 pushfq 压栈副本里补回去的次数
 UINT64 g_tf_steps_observed = 0;      // 真实单步异常次数
+/// 首个真实单步异常发生时**要执行的那条指令**的地址。
+///
+/// 用途：与靶子自己读到的 `ExceptionAddress` 比对（见 `scripts/check-tf-location.ps1`）。
+/// 两边不一致就意味着"我们说的异常位置"与"目标看到的"不是同一处 —— 那会让后续
+/// 所有基于地址的分析错位。只在 `-pb_tf watch` 下比较才有意义：`virtualize` 会
+/// 把真实单步消化掉，目标根本看不到异常。
+UINT64 g_tf_first_exception_ip = 0;
 UINT64 g_tf_steps_suppressed = 0;    // virtualize 下被清掉 TF 的真实单步
 UINT64 g_tf_stack_failures = 0;      // 读/写栈上副本失败
 UINT64 g_tf_sites = 0;               // 插装了多少个 popfq/iretq/pushfq 点
@@ -2285,6 +2292,9 @@ VOID OnContextChange(THREADID tid, CONTEXT_CHANGE_REASON reason, const CONTEXT* 
   // ── 真实单步异常（TF 虚拟化的漏网）─────────────────────────────────────
   if (!g_tf_enabled) {
     return;
+  }
+  if (g_tf_steps_observed == 0) {
+    g_tf_first_exception_ip = fault_ip;  // 判据的一半（另一半由靶子打）
   }
   ++g_tf_steps_observed;
   // 立刻诊断：收到真实单步说明"没有拦住"，这一刻的计数就是原因线索。
@@ -2653,6 +2663,19 @@ void OnFini(INT32 code, VOID* v) {
         summary += std::to_string(g_thread_slots[i].tf_clears);
       }
       report("%s", summary.c_str());
+    }
+    // ── TF 异常位置 ──────────────────────────────────────────────────────
+    // 与靶子自己读到的 `ExceptionAddress` 比对用（见
+    // `scripts/check-tf-location.ps1`）：工具报一行、靶子报一行，脚本比对它们是否
+    // 指向同一处。只在 `-pb_tf watch` 下比较才有意义 —— `virtualize` 会把真实单步
+    // 消化掉，目标根本看不到异常（那正是反向对照要验的事）。
+    if (g_tf_steps_observed != 0) {
+      report("TF 异常位置：0x%llX（首个真实单步，共 %llu 次）",
+             static_cast<unsigned long long>(g_tf_first_exception_ip),
+             static_cast<unsigned long long>(g_tf_steps_observed));
+    } else {
+      report("TF 异常位置：没有观察到真实单步（%s 模式下这不一定是问题，见 -pb_tf 的说明）",
+             g_tf_mode == TfMode::Virtualize ? "virtualize" : "watch");
     }
     if (g_required_tf_sets != 0) {
       if (g_tf_sets < g_required_tf_sets) {

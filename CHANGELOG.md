@@ -41,6 +41,27 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（第 47 轮：TF 异常位置的两侧比对 —— 能验的验了，验不了的**明确跳过**）
+- **工具侧**新增一行 `TF 异常位置：0x…（首个真实单步，共 N 次）`；`virtualize` 下如实报
+  `没有观察到真实单步`。**靶子侧**新增 `PB_TF_EXC count=N addr0=0x…`（它自己从
+  `GetExceptionInformation()->ExceptionAddress` 读到的位置）。
+- **比对脚本** `scripts/check-tf-location.ps1` + ctest `pin_tool_tf_location`
+  （`SKIP_RETURN_CODE 77`）。判据分两段：
+  * `virtualize` 段**现在就是真断言**：靶子 0 次异常、工具明说没有真实单步、目标完整跑完轮数；
+  * `watch` 段（想要两侧都看到异常）**目前跳过**：见下面的已知缺陷；缺陷修好那天它会
+    自动执行"工具的地址 ∈ 靶子报出的集合"这条真判据，**脚本不用改**。
+- **修正第 45 轮的一个结论**（当时写成"与 TF 旋钮无关"）。实测细分如下：
+  | 场景 | 结果 |
+  |------|------|
+  | `--tf-threads` + `virtualize` | ✅ 正常（既有 ctest 一直在跑这条） |
+  | `--tf-threads` + `watch` | ✗ **靶子跑死**：输出停在「入口点命中」，目标一行输出都没有 |
+  | `--tf-set` | ✗ 任何模式都死（`watch`/`off`/不带 `-pb_tf` 一样） |
+  ⇒ 是 **`watch` 模式**把靶子跑死（而不是 TF 场景本身），已记为**已知缺陷**并写进
+  `docs/dev/tf-location-in-progress.md`（含现象、判据、下一步排查建议）。
+- 顺带修掉靶子侧一个并发问题：异常样本的槽位改用 `InterlockedIncrement` 预留 ——
+  `--tf-threads` 下**两条线程会同时写**，原来的"读计数、写槽、自增"会丢更新。
+- 用例：ctest 新增 `pin_tool_tf_location`（本次实跑：既有 `pin_tool_tf_per_thread`
+  **Passed**、新用例 **Skipped(77)** 且原因为已知缺陷）。
 ### 新增（第 44 轮：M2 最后一块 —— **应用异常事件**）
 - 换挂点解决：`RaiseException` 到不了 `PIN_AddContextChangeFunction`，`NtRaiseException`
   也不在系统调用边界上。**主挂点改成 `ntdll!RtlRaiseException`** —— 应用抛异常必经它，

@@ -553,6 +553,21 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "异常事件：观察到 32 次.*code=0xE0000001"
         FAIL_REGULAR_EXPRESSION "PB_EXCEPTION_FLOW FAIL|Unhandled internal exception|not-raised|异常事件：一次都没观察到")
 
+      # ── TF 异常位置：两侧比对（脚本，见脚本头部说明）───────────────────────
+      #
+      # 为什么用脚本：正则比不出两个值**相等**，而这条要验的恰恰是"工具说的异常位置"
+      # 与"靶子自己读到的那一处"是不是同一个。
+      #
+      # 脚本分两段：`virtualize` 那段现在就能成立（验对照关系：目标 0 次异常 +
+      # 工具明说没有真实单步 + 目标完整跑完）；`watch` 那段因一个**已知缺陷**
+      # （`-pb_tf watch` 下靶子跑死）而 exit 77 跳过 —— 缺陷修好那天它会自动变成
+      # 真正的断言，脚本不用改。
+      add_test(NAME pin_tool_tf_location
+          COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
+                  "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-tf-location.ps1"
+                  -PinRoot "third_party/pin" -BuildDir "native/build-pin")
+        set_tests_properties(pin_tool_tf_location PROPERTIES SKIP_RETURN_CODE 77)
+
       add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-mem-probe.ps1"
