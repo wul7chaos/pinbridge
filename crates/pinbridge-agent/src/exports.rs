@@ -1004,6 +1004,29 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
     })
 }
 
+/// 记录工具侧报来的采集覆盖（元信息，见 `host::Coverage` 的说明）。
+///
+/// 刻意**不做能力闸门**：它写的是元信息而不是目标数据，而且调用点就在收尾
+/// 前一刻——在那里因为能力不足而静默丢弃，等于让离线分析永远看不到采集缺口
+/// （这正是第 33~35 轮反复踩的那个坑）。
+#[unsafe(no_mangle)]
+pub extern "C" fn pb_set_coverage(
+    sites: u64,
+    skipped: u64,
+    unreadable: u64,
+    filtered: u64,
+    capped: u32,
+) -> c_int {
+    crate::host::set_coverage(crate::host::Coverage {
+        sites,
+        skipped,
+        unreadable,
+        filtered,
+        capped: capped != 0,
+    });
+    Status::Ok.code()
+}
+
 /// 开始录制轨迹（M0 已可用）。
 ///
 /// # Safety

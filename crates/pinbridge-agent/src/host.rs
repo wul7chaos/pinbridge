@@ -43,6 +43,56 @@ pub const EVENT_QUEUE_CAPACITY: usize = 65_536;
 /// 一个标状态）。现在统一走 `ScriptHost`。
 pub use crate::script::Script;
 
+/// 工具侧报来的**采集覆盖**（元信息）。
+///
+/// 存成模块级而不是 `AgentState` 的字段，是因为它由工具线程在收尾前一刻写入、
+/// 由 `stop_trace` 读取，中间不参与任何状态机迁移；放进状态里反而给它一个
+/// "会被 attach/reset 清掉"的错误语义。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// 插装的内存事件点数量。
+    pub sites: u64,
+    /// 因无法插 `AFTER` 点而**整点跳过**的写入点数量。
+    pub skipped: u64,
+    /// 值读不出的条数。
+    pub unreadable: u64,
+    /// 被地址范围过滤掉的条数（这是**有意**过滤，不算缺口）。
+    pub filtered: u64,
+    /// 探针是否因达到上限而**软停**：上限之后的事件**不存在**，但不等于没发生。
+    pub capped: bool,
+}
+
+static COVERAGE: std::sync::Mutex<Option<Coverage>> = std::sync::Mutex::new(None);
+
+/// 记录工具侧报来的采集覆盖。
+pub fn set_coverage(coverage: Coverage) {
+    if let Ok(mut slot) = COVERAGE.lock() {
+        *slot = Some(coverage);
+    }
+}
+
+/// 读回当前记录（供测试与离线工具对照）。
+#[must_use]
+pub fn coverage() -> Option<Coverage> {
+    COVERAGE.lock().ok().and_then(|slot| *slot)
+}
+
+/// 生成写进 `AUDIT` 的那一行。
+///
+/// 格式固定为 `key=value` 空格分隔，且用 `pb_coverage` 作前缀：
+/// 离线侧要**机器可判**地认出它（人读的散文不适合当判据）。
+fn coverage_audit_line() -> Option<String> {
+    let coverage = coverage()?;
+    Some(format!(
+        "pb_coverage mem_write_sites={} skipped_no_after={} unreadable={} filtered={} capped={}",
+        coverage.sites,
+        coverage.skipped,
+        coverage.unreadable,
+        coverage.filtered,
+        u8::from(coverage.capped)
+    ))
+}
+
 /// agent 状态。
 #[derive(Debug)]
 pub struct AgentState {
@@ -472,6 +522,16 @@ impl AgentState {
             }
         }
         recorder.writer.note_dropped(self.events.dropped());
+        // 把工具侧报来的**采集覆盖**写进 AUDIT 文本通道。
+        //
+        // 为什么必须是 agent 写、而且必须走 AUDIT：覆盖信息是**元信息**，
+        // 不能靠事件通道传——工具的每线程环形缓冲满时，连它自己的覆盖记录
+        // 都会被丢掉（第 35 轮实测：`溢出丢弃 10252 条`，轨迹里连
+        // `state_change` 都没有）。而 agent 是**拥有文件并负责收尾**的一方，
+        // 在这里写一定进得去。
+        if let Some(line) = coverage_audit_line() {
+            recorder.writer.audit_line(&line)?;
+        }
         let (_inner, summary) = recorder.writer.finish()?;
         Ok(summary)
     }
@@ -706,6 +766,49 @@ mod tests {
         let records = reader.read_all().unwrap();
         assert_eq!(pinbridge_trace::fold::expand_records(&records).len(), 300);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 采集覆盖要**真的写进轨迹的 AUDIT 通道**。
+    ///
+    /// 这条用例是这一整条链路的独立证据：它绕开桥接层与 Pin 工具，
+    /// 直接"设覆盖 → 录一点 → 收尾 → 读文件"，所以一旦失败就能确定
+    /// 问题在 agent 这一侧（而不是转发层或工具）。
+    ///
+    /// 为什么要这么较真：覆盖信息是**元信息**，之前两轮都栽在"它在事件通道里
+    /// 被环形缓冲丢掉了"，所以它必须走文件级通道，而**写进去了没有**只能靠
+    /// 读回文件来证明。
+    #[test]
+    fn coverage_is_written_into_the_trace_audit_channel() {
+        let mut state = AgentState::new();
+        let dir = std::env::temp_dir().join(format!("pb-agent-coverage-{}", std::process::id()));
+        let path = dir.join("coverage.pbt");
+        state
+            .start_trace(&path, r#"{"tool":"pinbridge-agent"}"#, false)
+            .unwrap();
+        // 工具侧会在运行期报来这些数字（这里直接调 agent 的入口）。
+        set_coverage(Coverage {
+            sites: 1452,
+            skipped: 245,
+            unreadable: 3,
+            filtered: 7,
+            capped: true,
+        });
+        state
+            .push_event(Event::new(1, EventKind::MemWrite, 5, 0x1000).with_arg(0, 0x2000))
+            .unwrap();
+        state.stop_trace().unwrap();
+
+        let mut reader = pinbridge_trace::pbt::PbtReader::open(File::open(&path).unwrap()).unwrap();
+        reader.read_all().unwrap();
+        let audit = reader.audit_log().to_owned();
+        assert!(
+            audit.contains("pb_coverage mem_write_sites=1452 skipped_no_after=245"),
+            "AUDIT 里必须有覆盖行，实际: {audit:?}"
+        );
+        assert!(audit.contains("capped=1"), "上限用尽要如实标出: {audit:?}");
+        let _ = std::fs::remove_dir_all(dir);
+        // 全局状态是共享的：清掉，别影响同一进程里别的用例。
+        set_coverage(Coverage::default());
     }
 
     #[test]

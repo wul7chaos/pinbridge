@@ -99,6 +99,9 @@ struct BridgeApi {
   /// 交线程的寄存器快照。**可选**符号：旧版转发层没有它只是拿不到寄存器，
   /// 不该让整个采集起不来（见 agent_bridge.cpp 里的同名说明）。
   INT32 (*set_thread_registers)(UINT32, const UINT64*, UINT32) = nullptr;
+  /// 交采集覆盖（**元信息**）。**可选**符号：旧转发层没有它只是离线侧
+  /// 看不到缺口，不该让整个采集起不来。
+  INT32 (*set_coverage)(UINT64, UINT64, UINT64, UINT64, UINT32) = nullptr;
   INT32 (*drain_events)(PbEventRaw*, UINT32, UINT32*) = nullptr;
   INT32 (*start_trace)(const char*, UINT32) = nullptr;
   INT32 (*stop_trace)(UINT64*, UINT64*) = nullptr;
@@ -382,6 +385,10 @@ bool load_bridge() {
   // 可选符号：解析失败只是"拿不到寄存器"，不算导出面不全（不参与下面的检查）。
   g_api.set_thread_registers =
       resolve<INT32 (*)(UINT32, const UINT64*, UINT32)>(module, "pb_set_thread_registers");
+  // 可选符号：采集覆盖。旧版转发层没有它，只是离线侧看不到缺口
+  // （**追加能力不能变成硬依赖**，同 set_thread_registers 的理由）。
+  g_api.set_coverage =
+      resolve<INT32 (*)(UINT64, UINT64, UINT64, UINT64, UINT32)>(module, "pb_set_coverage");
   g_api.drain_events = resolve<INT32 (*)(PbEventRaw*, UINT32, UINT32*)>(module, "pb_drain_events");
   g_api.start_trace = resolve<INT32 (*)(const char*, UINT32)>(module, "pb_start_trace");
   g_api.stop_trace = resolve<INT32 (*)(UINT64*, UINT64*)>(module, "pb_stop_trace");
@@ -1484,6 +1491,7 @@ void OnMemWriteBefore(THREADID tid, ADDRINT ins_address, ADDRINT effective_addre
 /// 前向声明：定义在下面（用的地方在它之前）。参数类型此时已是完整类型，
 /// 所以这里不需要把定义一起搬上来。
 void push_coverage_record(ThreadStats* stats, bool capped);
+bool hand_coverage_to_agent(bool capped);
 
 void OnMemWriteAfter(THREADID tid) {
   if (g_shutdown || g_mem_soft_stopped) {
@@ -1523,6 +1531,7 @@ void OnMemWriteAfter(THREADID tid) {
     // 软停的这一刻推一条带 `capped=1` 的覆盖记录：**"后面的事件不存在"这条
     // 信息只有这里能提供**，而离线侧正是靠它才知道"没有观察到"不等于"没发生"。
     push_coverage_record(stats_for(0), true);
+    hand_coverage_to_agent(true);
   }
 }
 
@@ -1560,6 +1569,7 @@ void OnMemRead(THREADID tid, ADDRINT ins_address, ADDRINT effective_address, UIN
     // 软停的这一刻推一条带 `capped=1` 的覆盖记录：**"后面的事件不存在"这条
     // 信息只有这里能提供**，而离线侧正是靠它才知道"没有观察到"不等于"没发生"。
     push_coverage_record(stats_for(0), true);
+    hand_coverage_to_agent(true);
   }
 }
 
@@ -1646,6 +1656,30 @@ VOID OnTransferRet(THREADID tid, ADDRINT source, VOID* value_ptr) {
 /// 事件形状：`state_change`（kind 10），`args[0] = 1` 是覆盖子码，
 /// `args[1..6]` 依次是 插装点 / 跳过点 / 读不出 / 被过滤 / 是否软停。
 /// 用此前未使用的 arg 槽，**格式不变**（与转移码同一个做法）。
+/// 把采集覆盖交给**转发层**（由 agent 在收尾时写进轨迹的 AUDIT 通道）。
+///
+/// **必须在窗口内调用**：实测在工具收尾（Fini）调用会拿到
+/// `PB_STATUS_NOT_ATTACHED`（-2）——那一刻程序正在退出，转发层已经进入
+/// detach，"什么都不碰"是它刻意的行为（见 agent_bridge.cpp 的注释）。
+/// 所以只在两个**必然在运行期**的时刻调用：抓到第一条事件时、探针软停时。
+///
+/// 返回 true 表示已经交出去了。
+bool hand_coverage_to_agent(bool capped) {
+  if (!g_mem.enabled || g_api.set_coverage == nullptr) {
+    return false;
+  }
+  const INT32 code = g_api.set_coverage(
+      static_cast<UINT64>(g_mem_sites), g_mem_skipped_no_after, g_mem_unreadable,
+      g_mem_filtered, capped ? 1u : 0u);
+  if (code != 0) {
+    report("采集覆盖交给转发层失败：%d %s", code, last_error_text().c_str());
+    return false;
+  }
+  report("采集覆盖已交给转发层（将写进轨迹的 AUDIT 通道，capped=%s）",
+         capped ? "是" : "否");
+  return true;
+}
+
 void push_coverage_record(ThreadStats* stats, bool capped) {
   if (stats == nullptr) {
     return;

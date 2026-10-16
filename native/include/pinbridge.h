@@ -165,6 +165,18 @@ PB_EXPORT int32_t PB_CALL pb_pause(void);
 PB_EXPORT int32_t PB_CALL pb_load_script(const char* name, const char* source);
 PB_EXPORT int32_t PB_CALL pb_start_trace(const char* path, uint32_t fold);
 PB_EXPORT int32_t PB_CALL pb_stop_trace(uint64_t* out_records, uint64_t* out_events);
+/* 采集覆盖（**元信息**）：探针事件上限、环形缓冲丢弃、跳过的写入点、地址过滤。
+ *
+ * 由 agent 在收尾时写进轨迹的 `AUDIT` 文本通道——**不走事件通道**：工具的
+ * 每线程环形缓冲满时，连这条记录自己都会被丢掉（实测 `溢出丢弃 10252 条`），
+ * 而离线分析最需要知道的恰恰是"有些事件根本没被采集"。
+ *
+ * `capped` 非 0 表示探针因达到事件上限而**软停**：上限之后的事件
+ * **不存在**，但那不等于"没发生"。
+ *
+ * **可选符号**：旧版 agent 没有它，只是离线侧看不到覆盖缺口，不该让采集起不来。 */
+PB_EXPORT int32_t PB_CALL pb_set_coverage(uint64_t sites, uint64_t skipped, uint64_t unreadable,
+                                          uint64_t filtered, uint32_t capped);
 
 /*-------------------------------------------------------------- tool 导出面 */
 /* 以下函数由 pinbridge.dll（C++）导出，由 Hub 侧通过 pinbridge-sys 运行时加载。

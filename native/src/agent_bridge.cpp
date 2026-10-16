@@ -57,6 +57,9 @@ using fn_last_error = const char*(PB_CALL*)();
 using fn_allocate_sequence = uint64_t(PB_CALL*)();
 using fn_push_event = int32_t(PB_CALL*)(const pb_event_raw*);
 using fn_stats = uint64_t(PB_CALL*)(uint32_t);
+// 采集覆盖（元信息，最终由 agent 写进轨迹的 AUDIT 通道）。
+// **可选**符号：老 agent 没有它，只是离线侧看不到覆盖缺口。
+using fn_set_coverage = int32_t(PB_CALL*)(uint64_t, uint64_t, uint64_t, uint64_t, uint32_t);
 // 轨迹录制也属于**工具 ABI**（头文件第 156-157 行声明了它们）。
 // 早先桥接层漏了这两个转发，于是"Hub/Pin tool 让目标自己录一份轨迹"
 // 这条路径在桥接拓扑下不可达——而且失败信息是"导出面不完整"，
@@ -83,6 +86,7 @@ struct AgentApi {
   fn_allocate_sequence allocate_sequence = nullptr;
   fn_push_event push_event = nullptr;
   fn_stats stats = nullptr;
+  fn_set_coverage set_coverage = nullptr;
   fn_start_trace start_trace = nullptr;
   fn_stop_trace stop_trace = nullptr;
 
@@ -245,6 +249,12 @@ void load_agent(AgentApi* api) {
     api->set_thread_registers =
         resolve_symbol<fn_set_thread_registers>(module, "pb_set_thread_registers",
                                                 &optional_missing);
+  }
+  // 采集覆盖同样是**可选**符号，理由同上：追加能力不能变成硬依赖。
+  {
+    std::string optional_missing;
+    api->set_coverage = resolve_symbol<fn_set_coverage>(module, "pb_set_coverage",
+                                                       &optional_missing);
   }
   api->drain_events = resolve_symbol<fn_drain_events>(module, "pb_drain_events", &missing);
   api->last_error = resolve_symbol<fn_last_error>(module, "pb_last_error", &missing);
@@ -411,6 +421,26 @@ PB_EXPORT int32_t PB_CALL pb_set_thread_registers(uint32_t thread, const uint64_
 // 单步：与 `pb_pause` 同样的转发形状。它当前**明确未实现**（agent 侧返回
 // NOT_SUPPORTED），但 Hub 必须能**够到**它——否则调用方拿到的是
 // "符号缺失"，而那是"桥接层坏了"的语义，不是"这个能力还没做"。
+// 采集覆盖：工具侧的探针上限/环形缓冲丢弃/跳过点这些**元信息**，
+// 经 agent 写进轨迹的 AUDIT 文本通道。
+//
+// 为什么不走事件通道：工具的每线程环形缓冲满时，连这条记录自己都会被丢掉
+// （第 35 轮实测 `溢出丢弃 10252 条`，轨迹里连 `state_change` 都没有）。
+// 而 agent 是拥有文件、负责收尾的一方，在收尾前写一定进得去。
+PB_EXPORT int32_t PB_CALL pb_set_coverage(uint64_t sites, uint64_t skipped, uint64_t unreadable,
+                                          uint64_t filtered, uint32_t capped) {
+  int32_t status = PB_STATUS_OK;
+  if (!require_agent(&status)) {
+    return status;
+  }
+  if (agent().set_coverage == nullptr) {
+    // 老 agent：明确说"这个能力没有"，而不是静默成功。
+    set_error("pb_set_coverage: agent 没有导出该符号（旧版 agent）");
+    return PB_STATUS_NOT_SUPPORTED;
+  }
+  return agent().set_coverage(sites, skipped, unreadable, filtered, capped);
+}
+
 PB_EXPORT int32_t PB_CALL pb_single_step(uint32_t count) {
   int32_t status = PB_STATUS_OK;
   if (!require_agent(&status)) {
