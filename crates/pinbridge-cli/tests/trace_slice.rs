@@ -214,3 +214,84 @@ fn the_taint_command_shows_byte_granularity_beating_the_region_approximation() {
         "差值就是误报字节数: {stdout}"
     );
 }
+
+/// 工作台视图的 CLI 端到端判据：`view` 必须把**告警排在数据之前**，
+/// 并且 `--json` 产出的是界面能直接吃的载荷。
+///
+/// 这条守住的是工作台里最容易做错的一件事：把摘要放在最上面、告警放在角落。
+/// 残缺的轨迹与完整的轨迹长得一模一样，人不先说清楚就会拿残缺的结论当结论。
+#[test]
+fn the_view_command_puts_warnings_before_the_data() {
+    let path = temp_path("view");
+    let file = std::fs::File::create(&path).expect("建立轨迹文件");
+    let mut writer = PbtWriter::create(file, 0).expect("建立写入器");
+    writer.meta("{\"tool\":\"view-test\"}").expect("写 meta");
+    writer
+        .audit_line(
+            "pb_coverage mem_write_sites=1452 skipped_no_after=245 unreadable=0 filtered=0 capped=1",
+        )
+        .expect("写审计行");
+    let mut event = Event::new(1, EventKind::MemWrite, 7, 0x2000).with_arg(0, 0x6000);
+    event.sequence = 1;
+    writer.write_record(&event).expect("写记录");
+    writer.flush().expect("刷盘（模拟收尾被拒的真实文件）");
+
+    let (stdout, ok) = run_slice(&path, &["--at", "0x2000", "--len", "8"]);
+    assert!(ok, "slice 命令本身不应失败: {stdout}");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pinbridge"))
+        .args(["view", &path.to_string_lossy(), "--head", "5"])
+        .output()
+        .expect("运行 pinbridge view");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "view 命令失败: {text}");
+    assert!(text.contains("PB_VIEW"), "要有机器行: {text}");
+    let warning_at = text.find("⚠").expect("必须有告警（这份轨迹没有收尾段）");
+    let summary_at = text.find("摘要:").expect("要有摘要行");
+    assert!(warning_at < summary_at, "告警必须在摘要之前: {text}");
+    assert!(text.contains("没有收尾段"), "要用 END 段作为判据: {text}");
+    assert!(text.contains("达到事件上限"), "上限缺口要报: {text}");
+
+    let json = std::process::Command::new(env!("CARGO_BIN_EXE_pinbridge"))
+        .args(["view", &path.to_string_lossy(), "--head", "5", "--json"])
+        .output()
+        .expect("运行 pinbridge view --json");
+    let payload = String::from_utf8_lossy(&json.stdout).into_owned();
+    assert!(
+        payload.trim_start().starts_with('{'),
+        "应当是一行 JSON: {payload}"
+    );
+    for key in [
+        "\"path\"",
+        "\"kinds\"",
+        "\"events\"",
+        "\"warnings\"",
+        "\"coverage\"",
+    ] {
+        assert!(payload.contains(key), "JSON 缺少 {key}: {payload}");
+    }
+}
+
+/// 能力矩阵必须来自单一真相：12 项，且 CLI 输出与 crate 一致。
+#[test]
+fn the_capabilities_command_reports_the_single_source_matrix() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pinbridge"))
+        .args(["capabilities"])
+        .output()
+        .expect("运行 pinbridge capabilities");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("PB_CAPS count=12"), "12 项能力: {text}");
+    assert!(text.contains("mem_read"), "要有可读的能力名: {text}");
+
+    let json = std::process::Command::new(env!("CARGO_BIN_EXE_pinbridge"))
+        .args(["capabilities", "--json"])
+        .output()
+        .expect("运行 pinbridge capabilities --json");
+    let payload = String::from_utf8_lossy(&json.stdout).into_owned();
+    assert!(
+        payload.trim_start().starts_with('['),
+        "应当是 JSON 数组: {payload}"
+    );
+    assert!(payload.contains("\"bit\":0"), "位序号从 0 开始: {payload}");
+}

@@ -129,6 +129,24 @@ try {
         }
     }
 
+    # ---------------------------------------------------------------- 桌面端
+    # 只跑**不需要依赖**的那部分：NDJSON 客户端的逻辑是纯 ESM，用 Node 自带的
+    # 测试运行器即可验证（`node --test`）。装配依赖（React/Tauri）需要 registry，
+    # 那个由 CI 装 —— 这里跑不了的就不假装跑过。
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        Step '桌面端: node --test（NDJSON 客户端）' {
+            Push-Location (Join-Path $root 'apps/desktop')
+            try {
+                node --test src/api/
+                if ($LASTEXITCODE -ne 0) { throw "node --test 失败" }
+            } finally {
+                Pop-Location
+            }
+        } '分帧/关联/错误传播的用例失败时不要改断言，先看是不是真的写错了'
+    } else {
+        Write-Host "· 未找到 node，跳过桌面端用例（CI 会跑）" -ForegroundColor Yellow
+    }
+
     Write-Host ""
     Write-Host "全部通过：" -ForegroundColor Green
     $results.GetEnumerator() | ForEach-Object { "  {0,-32} {1}" -f $_.Key, $_.Value }

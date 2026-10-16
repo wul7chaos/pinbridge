@@ -20,6 +20,7 @@ pinbridge-hub.workspace = true
 pinbridge-mcp.workspace = true
 pinbridge-proto.workspace = true
 pinbridge-trace.workspace = true
+pinbridge-workbench.workspace = true
 
 [lints]
 workspace = true

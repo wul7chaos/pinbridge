@@ -26,6 +26,7 @@ use pinbridge_trace::fold::expand_records;
 use pinbridge_trace::pbt::{PbtReader, Summary};
 use pinbridge_trace::slice::{parse_coverage_audit, reverse_slice};
 use pinbridge_trace::taint::{propagate, Granularity};
+use pinbridge_workbench::{capability_matrix, capability_matrix_json, view_trace, TraceView};
 
 /// 报告里最多列出几处分岔（总数仍然准确）。
 const MAX_DIFFERENCES: usize = 8;
@@ -116,6 +117,29 @@ fn main() -> ExitCode {
             }
             None => {
                 eprintln!("用法: pinbridge calls <FILE.pbt> [--top N]");
+                ExitCode::FAILURE
+            }
+        },
+        "capabilities" => match capabilities_command(args.iter().any(|arg| arg == "--json")) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("能力矩阵失败: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        "view" => match args.get(1) {
+            Some(path) => {
+                let head = parse_head(&args).unwrap_or(20);
+                match view_command(path, head, args.iter().any(|arg| arg == "--json")) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("生成视图失败: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            None => {
+                eprintln!("用法：pinbridge view <轨迹> [--head N] [--json] [--capabilities]");
                 ExitCode::FAILURE
             }
         },
@@ -312,6 +336,76 @@ fn calls(path: &str, top: usize) -> Result<(), String> {
 ///
 /// `--compare` 会在**同一份事件流**上跑两个粒度并给出候选数之差——ADR 0014 的验收
 /// 判据就是它（"误报显著减少"必须能被测出来，否则这句话没有意义）。
+/// 工作台视图：`pinbridge view <轨迹> [--head N] [--json] [--capabilities]`
+///
+/// 这是 `apps/desktop` 那条链路要消费的**真实入口**（Tauri 侧只是把它包成
+/// `#[tauri::command]`）。视图本身在 `pinbridge-workbench` 里，带用例 ——
+/// 界面壳子最容易写完却最晚能验证，所以逻辑不放在界面里。
+fn view_command(path: &str, head: usize, json: bool) -> Result<(), String> {
+    let view: TraceView = view_trace(std::path::Path::new(path), head)?;
+    if json {
+        println!("{}", view.to_json()?);
+        return Ok(());
+    }
+    println!("文件: {}", view.path);
+    // **告警排在最前**：残缺的结论与完整的结论长得一样。
+    for warning in &view.warnings {
+        println!("⚠ {warning}");
+    }
+    match &view.summary {
+        Some(summary) => println!(
+            "摘要: 记录 {} 条 → 事件 {} 条（折叠 {}，折叠率 {:.1}%）、丢弃 {}",
+            summary.records,
+            summary.events,
+            summary.folded,
+            summary.fold_ratio() * 100.0,
+            summary.dropped
+        ),
+        None => println!("摘要: 无（见上面的告警）"),
+    }
+    println!(
+        "事件流（{} 条记录，显示前 {} 条）：",
+        view.records,
+        view.events.len()
+    );
+    for event in &view.events {
+        let repeats = event
+            .repeats
+            .map_or_else(String::new, |count| format!(" ×{count}"));
+        println!(
+            "  #{:<6} {:<16} tid={} addr={:#x}{}",
+            event.seq, event.kind, event.thread, event.address, repeats
+        );
+    }
+    if view.has_more {
+        println!("  …（还有更多，用 --head 调整）");
+    }
+    println!("类型分布：");
+    for kind in &view.kinds {
+        println!("  {:<16} {}", kind.kind, kind.count);
+    }
+    println!("{}", view.machine_line());
+    Ok(())
+}
+
+/// 能力矩阵（工作台底部的那些格子）。
+fn capabilities_command(json: bool) -> Result<(), String> {
+    let matrix = capability_matrix();
+    if json {
+        println!("{}", capability_matrix_json()?);
+        return Ok(());
+    }
+    println!(
+        "能力矩阵（{} 项，来自 pinbridge-core 的单一真相）：",
+        matrix.len()
+    );
+    for row in &matrix {
+        println!("  bit {:<2} {}", row.bit, row.name);
+    }
+    println!("PB_CAPS count={}", matrix.len());
+    Ok(())
+}
+
 fn taint_command(path: &str, target: u64, len: u64, args: &[String]) -> Result<(), String> {
     let (events, _summary) = load_trace(path)?;
     let mut gap = None;

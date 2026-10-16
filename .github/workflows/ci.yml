@@ -106,6 +106,21 @@ jobs:
         working-directory: python
         run: mypy
 
+  desktop:
+    name: 桌面端（NDJSON 客户端逻辑）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 只跑不需要依赖的那部分：客户端逻辑是纯 ESM，Node 自带的测试运行器就能验证。
+      # 装配 React/Tauri 需要 registry，而且需要系统 WebView —— 那部分刻意不进 CI
+      # （见 apps/desktop/README.md 的理由：会把门禁从几十秒变成十分钟）。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node --test（分帧 / 关联 / 错误传播 / 回环约束）
+        working-directory: apps/desktop
+        run: node --test src/api/
+
   native:
     name: native 层（C++ 桥接 + ABI 自检）
     runs-on: windows-latest

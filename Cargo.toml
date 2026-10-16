@@ -37,6 +37,7 @@ publish = false
 pinbridge-core = { path = "crates/pinbridge-core" }
 pinbridge-proto = { path = "crates/pinbridge-proto" }
 pinbridge-trace = { path = "crates/pinbridge-trace" }
+pinbridge-workbench = { path = "crates/pinbridge-workbench" }
 pinbridge-hub = { path = "crates/pinbridge-hub" }
 pinbridge-client = { path = "crates/pinbridge-client" }
 pinbridge-sys = { path = "crates/pinbridge-sys" }

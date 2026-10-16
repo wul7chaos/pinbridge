@@ -95,6 +95,7 @@ dependencies = [
  "pinbridge-mcp",
  "pinbridge-proto",
  "pinbridge-trace",
+ "pinbridge-workbench",
 ]
 
 [[package]]

@@ -285,6 +285,14 @@ pub fn capability_matrix() -> Vec<CapabilityRow> {
         .collect()
 }
 
+/// 能力矩阵的 JSON（工作台底部那些格子的数据源）。
+///
+/// # Errors
+/// 序列化失败（实际上不会发生），把错误原样交出去。
+pub fn capability_matrix_json() -> Result<String, String> {
+    serde_json::to_string(&capability_matrix()).map_err(|e| e.to_string())
+}
+
 /// 把能力集转成"矩阵 + 当前是否已授予"的形态：界面用它显示每一格。
 #[must_use]
 pub fn capability_state(set: CapabilitySet) -> Vec<(CapabilityRow, bool)> {

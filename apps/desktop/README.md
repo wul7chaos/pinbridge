@@ -1,9 +1,17 @@
 # apps/desktop —— 人类的位置
 
-> **状态：M0 骨架。** 界面组件与结构已经定义，但**没有接线到真实数据**，
-> 也没有在本仓库的 CI 中构建（Tauri 构建需要 Rust + Node + 系统 WebView，
-> 把它塞进每次 CI 会让门禁从 40 秒变成 10 分钟）。
-> 接线计划见 [../../docs/roadmap.md](../../docs/roadmap.md) 的 M3。
+> **状态：数据层已接真实产物，界面接线待做。**
+>
+> * **真实数据层**：`pinbridge-workbench`（Rust crate，带用例）读真实 `.pbt`
+>   产出首屏载荷；CLI 入口 `pinbridge view <轨迹> [--json]` 与
+>   `pinbridge capabilities [--json]`。**告警永远排在数据之前** ——
+>   残缺的结论与完整的结论长得一样。
+> * **真实客户端**：`src/api/ndjson.mjs`（Hub 的 NDJSON 实现，附 `.d.ts`），
+>   7 条 `node --test` 用例覆盖分帧、请求关联、错误传播、`dropped` 强制、
+>   回环约束。**门禁里会跑**（第 11 步），CI 有独立 job。
+> * **仍未做**：把 Tauri 壳装起来、把 `view --json` 的输出喂给组件。
+>   Tauri/React 的**构建**刻意不进 CI（需要 Node 依赖 + 系统 WebView，
+>   会让门禁从几十秒变成十分钟）；只验证不依赖 registry 的那部分逻辑。
 
 ## 这里是谁用的
 
