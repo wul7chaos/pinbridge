@@ -84,7 +84,7 @@ jobs:
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then echo "CHANGELOG 里没有 ${version} 的条目" >&2; exit 1; fi
           cat release-notes.md
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           body_path: release-notes.md
           files: dist/*.zip
