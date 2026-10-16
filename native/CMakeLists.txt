@@ -306,6 +306,30 @@ if(BUILD_TESTING)
           ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
       endif()
 
+      # -------------------------------------------------- 指令模板匹配端到端
+      # 靶子里那个函数带 8 字节魔数（0x5042524944474531），编译后作为立即数
+      # 出现在代码段里。模式**必须按小端写**（31 45 47 44 49 52 42 50）：
+      # 按文本顺序写会命中 0 处，而且看起来像"模板功能没生效"。
+      # 判据是"调 500 次 → 恰好 500 次命中"，由工具自己比对并打标记。
+      add_test(NAME pin_tool_pattern_hit
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_pattern "1:pbridge_magic:3145474449524250"
+                -pb_pattern_max 64
+                -pb_require_pattern_hits 500
+                -pb_trace "${CMAKE_BINARY_DIR}/pin-pattern-trace.pbt"
+                -pb_events 4
+                --
+                "$<TARGET_FILE:pb_sample_target>" --pattern-hits 500)
+      set_tests_properties(pin_tool_pattern_hit PROPERTIES
+        PASS_REGULAR_EXPRESSION "模板命中次数满足要求"
+        FAIL_REGULAR_EXPRESSION "失败：要求至少命中|登记命中点 0 个|Unhandled internal exception"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+      if(PINBRIDGE_AGENT_DLL)
+        set_tests_properties(pin_tool_pattern_hit PROPERTIES
+          ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
+      endif()
+
       # -------------------------------------------------- 内存探针端到端
       # 这条必须用脚本：判断"-pb_mem_range 过滤生效"需要先知道缓冲区地址，
       # 而它每次运行都不同（ASLR）。ctest 的一条命令里做不到"先读输出再决定参数"。

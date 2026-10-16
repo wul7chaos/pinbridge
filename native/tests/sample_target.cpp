@@ -77,6 +77,35 @@ void touch_loop(unsigned long iterations) {
   g_sink = static_cast<int>(checksum & 0x7FFFFFFF);
 }
 
+/// 一个**签名可寻址**的函数。
+///
+/// 函数体里的 8 字节魔数会作为立即数（`movabs`）出现在编译产物里，
+/// 因此在**代码段**里能被字节模式找到——这正是"没有符号时怎么定位函数"
+/// 的最小示例。
+///
+/// 模式（十六进制）**必须按小端写**：立即数在机器码里是低位字节在前，
+/// 所以 `0x5042524944474531`（文本 "PBRIDGE1"）在代码段里是
+///     31 45 47 44 49 52 42 50
+/// 写反了会命中 0 处，而且看起来像"模板功能没生效"。
+/// （这条是实测出来的：第一版按文本顺序写，扫描结果就是 0 个命中点。）
+/// 用 `--print-buffer` 之外的排查手段：直接在 exe 里按字节搜。
+///
+/// 之所以让靶子自己带这个魔数：测试要能**精确**断言"调用了 N 次就有 N 次命中"，
+/// 而不是"看到了一些 pattern_hit"。
+volatile unsigned long long g_pattern_sink = 0;
+
+__declspec(noinline) void pattern_demo_function(unsigned long long value) {
+  const unsigned long long magic = 0x5042524944474531ULL;  // "PBRIDGE1"
+  g_pattern_sink = value ^ magic;
+}
+
+/// 调用上面那个函数 N 次。
+void pattern_loop(unsigned long iterations) {
+  for (unsigned long i = 0; i < iterations; ++i) {
+    pattern_demo_function(i);
+  }
+}
+
 /// 把缓冲区地址打印出来：脚本据此构造 `-pb_mem_range`。
 void print_touch_buffer() {
   std::printf("PB_TOUCH_BUFFER=0x%p size=0x%lX\n",
@@ -89,6 +118,7 @@ int main(int argc, char** argv) {
   unsigned long syscalls = 0;
   unsigned long spins = 0;
   unsigned long touches = 0;
+  unsigned long pattern_hits = 0;
   bool print_buffer = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--syscalls") == 0 && i + 1 < argc) {
@@ -97,6 +127,8 @@ int main(int argc, char** argv) {
       spins = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--touch") == 0 && i + 1 < argc) {
       touches = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--pattern-hits") == 0 && i + 1 < argc) {
+      pattern_hits = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--print-buffer") == 0) {
       print_buffer = true;
     }
@@ -110,6 +142,9 @@ int main(int argc, char** argv) {
   }
   if (touches != 0) {
     touch_loop(touches);
+  }
+  if (pattern_hits != 0) {
+    pattern_loop(pattern_hits);
   }
   if (print_buffer) {
     print_touch_buffer();

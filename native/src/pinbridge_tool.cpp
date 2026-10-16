@@ -145,6 +145,14 @@ KNOB<std::string> KnobMemMax(KNOB_MODE_WRITEONCE, "pintool", "pb_mem_max", "2000
                              "捕获多少条内存事件后停止插桩（0 表示不限制）");
 KNOB<std::string> KnobRequireMem(KNOB_MODE_WRITEONCE, "pintool", "pb_require_mem", "0",
                                  "捕获到的内存事件少于该值时报告失败（0 表示不检查）");
+// 指令模板（字节签名）：只扫主模块，命中点会被插桩。
+KNOB<std::string> KnobPattern(KNOB_MODE_WRITEONCE, "pintool", "pb_pattern", "",
+                              "模板：id:name:hex（hex 两位一组、? 通配），多条用 ; 分隔");
+KNOB<std::string> KnobPatternMax(KNOB_MODE_WRITEONCE, "pintool", "pb_pattern_max", "64",
+                                 "每个模板最多登记多少个命中地址");
+KNOB<std::string> KnobRequirePatternHits(KNOB_MODE_WRITEONCE, "pintool",
+                                         "pb_require_pattern_hits", "0",
+                                         "模板命中次数少于该值时报告失败（0 表示不检查）");
 
 /// 能力位（与 pinbridge.h / capability.rs 一致；只用到这两个组合）。
 constexpr UINT32 PB_CAP_MEM_READ = 1u << 0;
@@ -316,6 +324,7 @@ UINT64 g_syscall_cap = 0;
 /// 捕获数下限（见 KnobRequireSyscalls / KnobRequireMem）。
 UINT64 g_required_syscalls = 0;
 UINT64 g_required_mem = 0;
+UINT64 g_required_pattern_hits = 0;
 volatile long g_syscall_sites = 0;
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
@@ -425,8 +434,262 @@ void format_hex_into(char* buffer, UINT32 capacity, UINT64 value) {
   buffer[written] = 0;
 }
 
+// ── 指令模板（字节签名）匹配 ────────────────────────────────────────────
+//
+// 为什么需要它：现实里的目标常常**没有符号**（发布版被 strip、被混淆、
+// 逻辑内联到只剩一堆立即数）。用"一段字节 + 通配"定位函数，比依赖符号名
+// 更接近实际可用的手段。命中的位置会被插桩，执行到就打一条 `pattern_hit`。
+//
+// 模式在命令行里给，不读文件：格式 `id:name:hex`（hex 两位一组，`?` 通配），
+// 多条用 `;` 分隔：
+//     -pb_pattern "1:demo:5042524944474531;2:prologue:48 89 5C 24 ??"
+// 不读文件是为了避开"工具自带的 CRT 不一定有 fopen"这类坑——本项目已经踩过
+// `std::strtoull` 与 `std::snprintf` 各一次。
+struct Pattern {
+  UINT32 id;
+  char name[32];
+  UINT8 bytes[32];
+  UINT8 mask[32];  // 1 = 必须匹配，0 = 通配
+  UINT32 length;
+  UINT64 matches;  // 在这个映像里找到的地址数
+};
+
+constexpr UINT32 kMaxPatterns = 8;
+constexpr UINT32 kMaxPatternBytes = 32;
+constexpr UINT32 kMaxMatchSites = 512;
+
+Pattern g_patterns[kMaxPatterns];
+UINT32 g_pattern_count = 0;
+UINT64 g_pattern_max_per_pattern = 64;
+UINT64 g_pattern_hits = 0;
+UINT64 g_pattern_sites = 0;
+UINT64 g_pattern_limit_skipped = 0;
+volatile bool g_pattern_enabled = false;
+
+/// 命中地址表（按地址升序，供插桩期二分查找）。
+struct MatchSite {
+  ADDRINT address;
+  UINT32 pattern_id;
+};
+MatchSite g_match_sites[kMaxMatchSites];
+UINT32 g_match_count = 0;
+
+void record_match(ADDRINT address, UINT32 pattern_id) {
+  if (g_match_count >= kMaxMatchSites) {
+    ++g_pattern_limit_skipped;
+    return;
+  }
+  // 插入排序：命中数被上限压着（最多 512），代价可忽略，
+  // 换来插桩期能二分查找而不是每处理一条指令就线性扫一遍。
+  UINT32 position = g_match_count;
+  while (position > 0 && g_match_sites[position - 1].address > address) {
+    g_match_sites[position] = g_match_sites[position - 1];
+    --position;
+  }
+  g_match_sites[position].address = address;
+  g_match_sites[position].pattern_id = pattern_id;
+  ++g_match_count;
+  ++g_pattern_sites;
+}
+
+/// 该地址是否落在模板命中点**所在指令**的范围内。返回命中的模板 id，没有则 0。
+///
+/// 为什么按范围而不是按起始地址比对：字节模式匹配到的是**字节**，
+/// 它常常落在指令中间——例如 `movabs rax, imm64`（`48 B8 <8 字节>`）里
+/// 立即数的偏移是 +2。第一版按"指令起始地址 == 命中地址"比对，
+/// 结果是扫描找到 1 个命中点、命中次数却是 0（实测踩过，写在这里省得再踩）。
+UINT32 pattern_id_in_range(ADDRINT instruction, UINT32 size) {
+  const ADDRINT end = instruction + size;
+  UINT32 low = 0;
+  UINT32 high = g_match_count;
+  while (low < high) {
+    const UINT32 middle = low + (high - low) / 2;
+    if (g_match_sites[middle].address < instruction) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  if (low < g_match_count && g_match_sites[low].address < end) {
+    return g_match_sites[low].pattern_id;
+  }
+  return 0;
+}
+
+bool pattern_matches_at(const UINT8* data, const Pattern& pattern) {
+  for (UINT32 i = 0; i < pattern.length; ++i) {
+    if (pattern.mask[i] == 1 && data[i] != pattern.bytes[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// 扫描映像的**可执行段**，登记命中点。
+///
+/// 必须在 `IMG_AddInstrumentFunction` 的回调里做完：Pin 明确说明
+/// `SEC_Data()` 返回的指针在回调返回之后就失效。
+void scan_image_for_patterns(IMG img) {
+  if (!g_pattern_enabled || g_pattern_count == 0) {
+    return;
+  }
+  for (UINT32 p = 0; p < g_pattern_count; ++p) {
+    g_patterns[p].matches = 0;
+  }
+  for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec)) {
+    if (!SEC_IsExecutable(sec)) {
+      continue;
+    }
+    const UINT8* data = static_cast<const UINT8*>(SEC_Data(sec));
+    const USIZE size = SEC_Size(sec);
+    const ADDRINT base = SEC_Address(sec);
+    if (data == nullptr || size == 0) {
+      continue;
+    }
+    for (UINT32 p = 0; p < g_pattern_count; ++p) {
+      const Pattern& pattern = g_patterns[p];
+      if (pattern.length == 0 || pattern.length > size) {
+        continue;
+      }
+      for (USIZE offset = 0; offset + pattern.length <= size; ++offset) {
+        if (!pattern_matches_at(data + offset, pattern)) {
+          continue;
+        }
+        record_match(base + offset, pattern.id);
+        if (++g_patterns[p].matches >= g_pattern_max_per_pattern) {
+          // 上限截断**必须说出来**：不然"模板只命中这么几处"会被当成事实。
+          report("模板 %u（%s）在 %s 命中数达到上限 %llu，后续地址未登记", pattern.id,
+                 pattern.name, SEC_Name(sec).c_str(),
+                 static_cast<unsigned long long>(g_pattern_max_per_pattern));
+          ++g_pattern_limit_skipped;
+          break;
+        }
+      }
+    }
+  }
+  report("模板扫描完毕：登记命中点 %u 个（被上限截断 %llu 个）", g_match_count,
+         static_cast<unsigned long long>(g_pattern_limit_skipped));
+}
+
+/// 解析 `id:name:hex`。返回 hex 里的字节数（0 表示失败）。
+UINT32 parse_hex_bytes(const char* text, UINT8* bytes, UINT8* mask, UINT32 capacity) {
+  const char* cursor = text;
+  UINT32 index = 0;
+  while (*cursor != 0) {
+    if (*cursor == ' ' || *cursor == '-' || *cursor == ',') {
+      ++cursor;
+      continue;
+    }
+    if (index >= capacity) {
+      return 0;  // 超出容量：明确失败，不截断
+    }
+    if (*cursor == '?') {
+      bytes[index] = 0;
+      mask[index] = 0;
+      ++index;
+      while (*cursor == '?') {
+        ++cursor;
+      }
+      continue;
+    }
+    if (*(cursor + 1) == 0) {
+      return 0;  // 半个字节
+    }
+    UINT32 value = 0;
+    for (UINT32 i = 0; i < 2; ++i) {
+      const char c = *(cursor + i);
+      UINT32 digit = 0;
+      if (c >= '0' && c <= '9') {
+        digit = static_cast<UINT32>(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        digit = static_cast<UINT32>(c - 'a' + 10);
+      } else if (c >= 'A' && c <= 'F') {
+        digit = static_cast<UINT32>(c - 'A' + 10);
+      } else {
+        return 0;
+      }
+      value = value * 16 + digit;
+    }
+    bytes[index] = static_cast<UINT8>(value);
+    mask[index] = 1;
+    ++index;
+    cursor += 2;
+  }
+  return index;
+}
+
+bool parse_pattern_spec(const char* spec, Pattern* out) {
+  const char* cursor = spec;
+  UINT32 id = 0;
+  bool saw_digit = false;
+  while (*cursor >= '0' && *cursor <= '9') {
+    id = id * 10 + static_cast<UINT32>(*cursor - '0');
+    saw_digit = true;
+    ++cursor;
+  }
+  if (!saw_digit || *cursor != ':') {
+    return false;
+  }
+  ++cursor;  // 跳过第一个冒号
+
+  UINT32 name_length = 0;
+  while (*cursor != 0 && *cursor != ':' && name_length + 1 < sizeof(out->name)) {
+    out->name[name_length++] = *cursor++;
+  }
+  out->name[name_length] = 0;
+  if (*cursor != ':') {
+    return false;
+  }
+  ++cursor;
+
+  const UINT32 length = parse_hex_bytes(cursor, out->bytes, out->mask, kMaxPatternBytes);
+  if (length == 0) {
+    return false;
+  }
+  out->id = id;
+  out->length = length;
+  return true;
+}
+
+/// 解析整串（`;` 分隔）。任何一条解析失败就**整串失败**——不静默跳过，
+/// 否则"某个模板没生效"会被当成"那个模板没命中"。
+bool parse_patterns(const char* text) {
+  if (text == nullptr || *text == 0) {
+    return true;
+  }
+  const char* start = text;
+  while (*start != 0 && g_pattern_count < kMaxPatterns) {
+    const char* end = start;
+    while (*end != 0 && *end != ';') {
+      ++end;
+    }
+    char buffer[128];
+    UINT32 length = 0;
+    for (const char* cursor = start; cursor < end && length + 1 < sizeof(buffer); ++cursor) {
+      buffer[length++] = *cursor;
+    }
+    buffer[length] = 0;
+    if (length > 0) {
+      if (!parse_pattern_spec(buffer, &g_patterns[g_pattern_count])) {
+        report("无法解析模板 \"%s\"（期望 id:name:hex，例如 1:demo:48 89 5C 24 ??）", buffer);
+        return false;
+      }
+      ++g_pattern_count;
+    }
+    start = (*end == ';') ? end + 1 : end;
+  }
+  return true;
+}
+
 void OnImageLoad(IMG img, VOID* v) {
   (void)v;
+
+  // ── 模板扫描（在回调内部做完：SEC_Data 的指针出了回调就失效）──
+  // 只扫主模块：模板是要找"我们自己关心的那段代码"，扫全进程会把
+  // 系统 DLL 里的巧合匹配也拉进来。
+  if (g_pattern_enabled && IMG_IsMainExecutable(img)) {
+    scan_image_for_patterns(img);
+  }
   const std::string name = module_name_of(IMG_Name(img));
 
   // ── 排除自己 ──
@@ -543,6 +806,8 @@ struct ThreadStats {
   /// 内存探针的计数。
   UINT64 mem_writes;
   UINT64 mem_reads;
+  /// 模板命中计数。
+  UINT64 pattern_hits;
   /// 写入的两段式实现用的待处理槽（BEFORE 记地址，AFTER 读值）。
   /// 每线程一份，同一线程内两条回调严格相邻，不需要任何同步。
   bool pending_write_valid;
@@ -931,7 +1196,11 @@ void OnMemRead(THREADID tid, ADDRINT ins_address, ADDRINT effective_address, UIN
   }
 }
 
-/// 指令级插桩：入口点 + 系统调用 + 内存访问。
+// 前置声明：定义在文件后面的"模板命中"一节（它们要用到那里的全局量）。
+void on_instruction_patterns(INS ins, ADDRINT address);
+void OnPatternHit(THREADID tid, ADDRINT ins_address, ADDRINT pattern_id);
+
+/// 指令级插桩：入口点 + 系统调用 + 内存访问 + 模板命中。
 void OnInstruction(INS ins, VOID* v) {
   (void)v;
 
@@ -978,6 +1247,9 @@ void OnInstruction(INS ins, VOID* v) {
     return;
   }
 
+  // ── 模板命中（放在会 return 的分支之前）──
+  on_instruction_patterns(ins, address);
+
   // ── 内存访问探针 ──
   // 注意这一段在系统调用判断**之后**：系统调用指令本身不访存用户内存，
   // 两者互斥，早 return 也省掉了重复判断。
@@ -1010,6 +1282,38 @@ void OnInstruction(INS ins, VOID* v) {
   }
 }
 
+/// 模板命中的插桩入口（每条指令都会来这里查一次）。
+void on_instruction_patterns(INS ins, ADDRINT address) {
+  if (!g_pattern_enabled || g_match_count == 0 || g_shutdown) {
+    return;
+  }
+  // 按指令**范围**匹配（模式常常落在指令中间，例如 movabs 的立即数）。
+  const UINT32 pattern_id = pattern_id_in_range(address, INS_Size(ins));
+  if (pattern_id == 0) {
+    return;
+  }
+  INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnPatternHit),
+                 IARG_THREAD_ID, IARG_INST_PTR, IARG_ADDRINT,
+                 static_cast<ADDRINT>(pattern_id), IARG_END);
+}
+
+/// 模板命中：执行到了登记过的地址。
+void OnPatternHit(THREADID tid, ADDRINT ins_address, ADDRINT pattern_id) {
+  if (g_shutdown) {
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  if (stats->in_hook) {
+    ++stats->reentrant_skips;
+    return;
+  }
+  stats->in_hook = true;
+  ++stats->pattern_hits;
+  ++g_pattern_hits;
+  const UINT64 args[2] = {static_cast<UINT64>(pattern_id), 0};
+  push_probe_event(stats, 5 /* PB_EV_PATTERN_HIT */, tid, ins_address, args, 2);
+  stats->in_hook = false;
+}
 // ══════════════════════════════════════════════════════════════════ 收尾
 /// 进程退出前：停录、把事件取回来打印。
 ///
@@ -1133,6 +1437,28 @@ void OnFini(INT32 code, VOID* v) {
       }
     }
   }
+  // ── 模板命中的账 ──────────────────────────────────────────────────────
+  if (g_pattern_enabled) {
+    UINT64 hits = 0;
+    for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+      hits += g_thread_slots[i].pattern_hits;
+    }
+    hits += g_overflow_slot.pattern_hits;
+    report("模板命中：登记地址 %u 个，命中 %llu 次", g_match_count,
+           static_cast<unsigned long long>(hits));
+    if (g_required_pattern_hits != 0) {
+      if (hits < g_required_pattern_hits) {
+        report("失败：要求至少命中 %llu 次，实际 %llu 次",
+               static_cast<unsigned long long>(g_required_pattern_hits),
+               static_cast<unsigned long long>(hits));
+      } else {
+        report("✓ 模板命中次数满足要求（%llu >= %llu）",
+               static_cast<unsigned long long>(hits),
+               static_cast<unsigned long long>(g_required_pattern_hits));
+      }
+    }
+  }
+
   const UINT32 want = KnobEvents.Value();
   if (want == 0) {
     return;
@@ -1223,6 +1549,23 @@ int main(int argc, char** argv) {
       g_mem.high = swap;
     }
   }
+  // 模板：解析失败就直接结束（不静默跳过某一条）。
+  g_pattern_enabled = KnobPattern.Value().empty() == false;
+  g_pattern_max_per_pattern = parse_u64(KnobPatternMax.Value().c_str(), 64);
+  g_required_pattern_hits = parse_u64(KnobRequirePatternHits.Value().c_str(), 0);
+  if (g_pattern_enabled) {
+    if (!parse_patterns(KnobPattern.Value().c_str())) {
+      report("模板解析失败，拒绝继续（静默跳过某条模板会让\"它没生效\"看起来像\"它没命中\"）");
+      return 6;
+    }
+    for (UINT32 i = 0; i < g_pattern_count; ++i) {
+      report("模板 %u：%s（%u 字节，%s）", g_patterns[i].id, g_patterns[i].name,
+             g_patterns[i].length, "只扫主模块");
+    }
+  } else {
+    g_pattern_enabled = false;
+  }
+
   char range_lo[24];
   char range_hi[24];
   format_hex_into(range_lo, sizeof(range_lo), g_mem.low);
