@@ -37,9 +37,29 @@ EOF
   exit 1
 fi
 
-length=$(printf '%s' "$first_line" | wc -c | tr -d ' ')
-if [ "$length" -gt 73 ]; then
-  printf '✗ 首行过长（%s 字符，上限 72）：%s\n' "$length" "$first_line" >&2
+# 标题长度：按**显示列**算，中文按 2 列。
+#
+# 为什么不用 `wc -c`：那是字节数，一个汉字占 3 字节，
+# 于是"很短的合法中文标题"会被误判为超长——而 hooks 一旦出现误报，
+# 大家就会开始统一使用 `--no-verify`，那这个钩子就彻底废了。
+#
+# 也不用 `wc -m`：在 C locale 下它退化成字节数，结论不可靠。
+# 这里直接按 UTF-8 结构数：ASCII 记 1 列，三字节及以上（CJK/全角）记 2 列，
+# 两字节（拉丁重音等）记 1 列。与 locale 无关。
+width=$(printf '%s' "$first_line" | LC_ALL=C od -An -tu1 -v \
+  | tr -s ' \n' '\n' | awk '
+      NF == 0 { next }
+      {
+        b = $1
+        if (b < 128)            { w += 1 }   # ASCII
+        else if (b < 192)       { next }     # UTF-8 连续字节，不单独计数
+        else if (b < 224)       { w += 1 }   # 2 字节（拉丁重音等）
+        else                    { w += 2 }   # 3~4 字节（CJK / 全角）
+      }
+      END { print w + 0 }')
+if [ "$width" -gt 72 ]; then
+  printf '✗ 标题过长（%s 显示列，上限 72；中文按 2 列计）：%s\n' "$width" "$first_line" >&2
+  printf '  把细节移到正文里，标题只留"做了什么"这一个动作。\n' >&2
   exit 1
 fi
 

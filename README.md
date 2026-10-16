@@ -154,5 +154,9 @@ third_party/pin/        Intel Pin SDK 放置位置（不入库）
 
 ## 许可
 
-MIT（见 [LICENSE](LICENSE)）。Intel Pin 是第三方组件，按 Intel 自己的许可分发，
-不包含在本仓库中，获取方式见 [third_party/pin/README.md](third_party/pin/README.md)。
+MIT（见 [LICENSE](LICENSE)）。使用边界与第三方（Intel Pin）声明见 [NOTICE.md](NOTICE.md)。
+
+Intel Pin 是第三方组件，按 Intel 自己的许可分发，**不包含在本仓库中**，
+获取方式见 [third_party/pin/README.md](third_party/pin/README.md)。
+
+> 请只对**你拥有或已获授权**的目标使用本项目。
