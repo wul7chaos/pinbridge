@@ -125,6 +125,35 @@ impl<T: Transport> TargetLink for ClientLink<T> {
             ))),
         }
     }
+    fn read_registers(&mut self, thread: u32) -> Result<Vec<(String, u64)>> {
+        let response = self
+            .client
+            .call(&AgentRequest::ReadRegisters { thread })
+            .map_err(|error| Error::TargetUnavailable(format!("读寄存器请求失败：{error}")))?;
+        match response {
+            AgentResponse::Registers {
+                thread: answered,
+                values,
+            } => {
+                // 回答的线程号必须与请求一致。不一致说明对端把请求与应答配错了
+                // （并发链路上的串台），而寄存器**看起来永远像合法数据**——
+                // 不检查就会把一个线程的寄存器当成另一个线程的。
+                if answered != thread {
+                    return Err(Error::Protocol(format!(
+                        "读寄存器：请求线程 {thread}，agent 回了线程 {answered}（应答串台）"
+                    )));
+                }
+                Ok(values)
+            }
+            AgentResponse::Error { code, message } => Err(Error::TargetUnavailable(format!(
+                "agent 拒绝读寄存器（{code}）：{message}"
+            ))),
+            other => Err(Error::Protocol(format!(
+                "agent 对 registers 回了意外类型：{other:?}"
+            ))),
+        }
+    }
+
     fn describe(&self) -> String {
         format!("agent 链路（{}）", self.client.transport_description())
     }

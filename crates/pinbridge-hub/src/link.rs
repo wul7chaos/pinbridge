@@ -53,6 +53,17 @@ pub trait TargetLink: std::fmt::Debug {
     ///
     /// 链路不可用或目标拒绝时出错。
     fn list_modules(&mut self) -> Result<(Vec<ModuleInfo>, u32)>;
+    /// 读某个线程**最近一次**的寄存器快照。
+    ///
+    /// 名字里的"最近一次"是语义的一部分，不是修饰：寄存器由**能拿到探针线程
+    /// 上下文的那一侧**（Pin 工具）在命中时捕获，链路这边只能存与取。
+    /// 因此"没有快照"是一个**正常结果**（该线程还没被探针看见过），
+    /// 实现方必须把"没有快照"与"链路坏了"区分开。
+    ///
+    /// # Errors
+    ///
+    /// 链路不可用、目标拒绝（含"该线程没有快照"）时出错。
+    fn read_registers(&mut self, thread: u32) -> Result<Vec<(String, u64)>>;
     /// 这条链路的自我描述（用于错误信息与审计）。
     fn describe(&self) -> String;
 }

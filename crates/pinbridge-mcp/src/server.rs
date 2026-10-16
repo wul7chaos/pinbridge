@@ -264,6 +264,37 @@ impl McpServer {
                     .map_err(describe)?;
                 Ok(format!("命令已受理: {command:?}（epoch={epoch}）"))
             }
+            "pb_registers" => {
+                let session = self.session_arg(args)?;
+                let thread_arg = arg_u64(args, "thread")?;
+                // 线程号在协议里是 u32；超出范围说明调用方搞错了对象
+                // （例如把地址当成线程号传进来），要明确拒绝而不是截断。
+                let thread = u32::try_from(thread_arg).map_err(|_| {
+                    format!(
+                        "thread={thread_arg} 超出 u32 范围（线程号取自事件里的 thread_id，不是地址）"
+                    )
+                })?;
+                let values = self
+                    .hub
+                    .read_registers(&self.actor.clone(), session, thread)
+                    .map_err(describe)?;
+                if values.is_empty() {
+                    // 空是"不该出现"的一种：agent 要么给出快照，要么报错。
+                    // 真出现了也要说清楚，不能让它看起来像"这个线程没有寄存器"。
+                    return Ok(format!(
+                        "线程 {thread} 的寄存器快照是空的——这不该发生（要么有值、\
+                         要么报错），请把它当作缺陷报告。"
+                    ));
+                }
+                // 快照是"最近一次探针命中时"的，不是"此刻"。这句话必须跟着数据
+                // 一起回给调用方：AI 很容易把它当成实时值去做时序推断。
+                let mut text =
+                    format!("线程 {thread} 最近一次探针命中时的寄存器（**不是此刻的值**）：\n");
+                for (name, value) in &values {
+                    text.push_str(&format!("  {name:<4} {value:#018x}\n"));
+                }
+                Ok(text)
+            }
             "pb_breakpoint_set" => {
                 let session = self.session_arg(args)?;
                 let address = arg_u64(args, "address")?;
@@ -636,11 +667,128 @@ mod tests {
             ))
         }
 
+        fn read_registers(
+            &mut self,
+            thread: u32,
+        ) -> pinbridge_core::error::Result<Vec<(String, u64)>> {
+            // 线程 7 有快照；其它线程给出"没有快照"的**正常失败**——
+            // 这样用例能覆盖"有值"与"正常地没有"两条路径。
+            if thread == 7 {
+                return Ok(vec![
+                    ("rip".into(), 0x1_4000_1234),
+                    ("rsp".into(), 0x20_FF00),
+                ]);
+            }
+            Err(pinbridge_core::error::Error::TargetUnavailable(format!(
+                "pb_read_registers: 线程 {thread} 没有快照（有快照的线程：[7]）\
+                 。快照只在探针命中时由 Pin 工具捕获，没命中过就没有"
+            )))
+        }
+
         fn describe(&self) -> String {
             "测试用假链路".into()
         }
     }
 
+    #[test]
+    fn registers_tool_returns_values_and_says_what_is_missing() {
+        let mut server = server();
+        call(
+            &mut server,
+            "initialize",
+            json!({"clientInfo": {"name": "alice"}}),
+        );
+        let human = Principal::human("operator");
+        let id = server
+            .hub
+            .create_session(&human, TargetSpec::launch("TARGET.exe", "x86_64"))
+            .expect("人类建会话应当成功");
+        server
+            .hub
+            .attach(&human, id, 4242, "TARGET.exe --demo")
+            .expect("附加应当成功");
+        server
+            .hub
+            .attach_link(&human, id, Box::new(FakeLink(vec![0x90])))
+            .expect("挂链路应当成功");
+        // 给人授足以读寄存器（AI 默认只有只读基线，而 mem_read 就在基线里）；
+        // 这里之所以显式授权：会话是**人类**建的，但 MCP 请求的 actor 是 initialize
+        // 报上来的名字，两边的能力集是分开的。
+        server
+            .hub
+            .grant_capabilities(
+                &human,
+                id,
+                server.hub.epoch_of(id).unwrap(),
+                &human,
+                &[Capability::MemRead],
+            )
+            .expect("授权应当成功");
+
+        // 1) 工具在清单里（能力足够时）
+        let listed = call(&mut server, "tools/list", json!({}));
+        let names: Vec<String> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            names.contains(&"pb_registers".to_owned()),
+            "实际: {names:?}"
+        );
+
+        // 2) 有快照的线程：值必须逐个打出来，而且要说清"这不是此刻的值"
+        let response = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_registers", "arguments": {"session": id.get(), "thread": 7}}),
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("rip"), "实际: {text}");
+        // 值按 16 位十六进制补零打出来（`0x` + 16 位），便于逐字节比对。
+        assert!(text.contains("0x0000000140001234"), "实际: {text}");
+        assert!(
+            text.contains("不是此刻"),
+            "必须带上『最近一次而不是此刻』这句话（否则会被当成实时值）: {text}"
+        );
+
+        // 3) 没有快照的线程：这是**正常失败**，错误里要给出"有快照的线程"
+        let response = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_registers", "arguments": {"session": id.get(), "thread": 3}}),
+        );
+        assert_eq!(
+            response["result"]["isError"], true,
+            "工具级错误：{response}"
+        );
+        let err = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(err.contains("没有快照"), "实际: {err}");
+        assert!(err.contains("[7]"), "要说清哪些线程有快照: {err}");
+
+        // 4) 线程号超出 u32：明确拒绝，而不是截断
+        let response = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_registers", "arguments": {"session": id.get(), "thread": 5_000_000_000u64}}),
+        );
+        assert_eq!(
+            response["result"]["isError"], true,
+            "工具级错误：{response}"
+        );
+        let err = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(err.contains("超出 u32"), "实际: {err}");
+        println!("✓ 寄存器工具：有快照给值、没快照说清、越界拒绝");
+    }
     #[test]
     fn modules_tool_prints_base_and_path_after_link_attach() {
         let mut server = server();

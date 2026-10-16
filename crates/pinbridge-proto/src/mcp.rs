@@ -81,6 +81,16 @@ pub const TOOLS: &[ToolDescriptor] = &[
         executes_in_target: false,
     },
     ToolDescriptor {
+        name: "pb_registers",
+        description: "读某个线程最近一次探针命中时的寄存器快照。\
+注意这是「最近一次」而不是「此刻」：寄存器由 Pin 工具侧在探针命中时捕获\
+（agent 自己抓不到探针线程的上下文），所以没命中过就没有快照——那时返回的错误\
+会列出「有快照的线程」。线程号取自事件里的 thread_id。",
+        input_schema_json: r#"{"type":"object","properties":{"session":{"type":"integer"},"thread":{"type":"integer"}},"required":["session","thread"],"additionalProperties":false}"#,
+        requires: &[Capability::MemRead],
+        executes_in_target: false,
+    },
+    ToolDescriptor {
         name: "pb_breakpoint_set",
         description: "在指定地址下断点。地址必须是目标进程的虚拟地址（模块基址 + RVA 需自行换算，可用 pb_modules 获取基址）。",
         input_schema_json: r#"{"type":"object","properties":{"session":{"type":"integer"},"address":{"type":"integer"},"label":{"type":"string"}},"required":["session","address"],"additionalProperties":false}"#,

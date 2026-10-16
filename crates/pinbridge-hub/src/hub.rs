@@ -758,6 +758,43 @@ impl HubService {
         };
         link.list_modules()
     }
+    /// 读某个线程**最近一次**的寄存器快照。
+    ///
+    /// 闸门顺序与 [`Self::read_memory`] / [`Self::list_modules`] 完全一致
+    /// （能力 → 会话 → 状态 → 链路）。寄存器属于进程状态快照，走 `mem_read`
+    /// 同一档能力——协议侧 `ReadRegisters` 也是这么映射的，两处不能分叉。
+    ///
+    /// **"没有快照"不是错误路径上的意外，而是正常结果之一**：寄存器由 Pin 工具
+    /// 在探针命中时捕获，没命中过的线程就是没有。所以这里原样把 agent 的
+    /// 说法（含"有快照的线程"列表）交给调用方，不翻译成"内部错误"。
+    ///
+    /// # Errors
+    ///
+    /// - `CapabilityDenied`：没有 `mem_read`；
+    /// - `TargetUnavailable`：会话不存在、已终结、没有挂链路，或该线程没有快照。
+    pub fn read_registers(
+        &mut self,
+        actor: &Principal,
+        session: SessionId,
+        thread: u32,
+    ) -> Result<Vec<(String, u64)>> {
+        self.ensure(actor, Capability::MemRead)?;
+        let Some(entry) = self.sessions.get_mut(&session.get()) else {
+            return Err(Error::TargetUnavailable(format!("会话 {session} 不存在")));
+        };
+        if !entry.session.state.accepts_control() {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 状态 {:?} 不接受读寄存器请求",
+                entry.session.state
+            )));
+        }
+        let Some(link) = entry.link.as_mut() else {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 没有挂载到目标端的链路（读寄存器需要先 attach_link）"
+            )));
+        };
+        link.read_registers(thread)
+    }
     // ---------------------------------------------------------------- 轨迹
 
     /// 开始录制，返回 `.pbt` 路径。
@@ -986,6 +1023,20 @@ mod tests {
             ))
         }
 
+        fn read_registers(&mut self, thread: u32) -> Result<Vec<(String, u64)>> {
+            // 假链路只答"这条线程有快照"这一种情形（以及线程号 0 的"没有"），
+            // 让 Hub 的闸门测试能覆盖成功与"正常地没有"两条路径。
+            if thread == 0 {
+                return Err(Error::TargetUnavailable(
+                    "pb_read_registers: 线程 0 没有快照（有快照的线程：[7]）".into(),
+                ));
+            }
+            Ok(vec![
+                ("rip".into(), 0x1_4000_1000),
+                ("rsp".into(), 0x20_FF00),
+            ])
+        }
+
         fn describe(&self) -> String {
             "测试用假链路".into()
         }
@@ -1004,10 +1055,15 @@ mod tests {
             Ok((Vec::new(), 0))
         }
 
+        fn read_registers(&mut self, _thread: u32) -> Result<Vec<(String, u64)>> {
+            Ok(Vec::new())
+        }
+
         fn describe(&self) -> String {
             "测试用短读链路".into()
         }
     }
+
     fn attached_session(hub: &mut HubService, actor: &Principal) -> SessionId {
         let id = hub
             .create_session(actor, TargetSpec::launch("TARGET.exe", "x86_64"))
@@ -1016,6 +1072,41 @@ mod tests {
         id
     }
 
+    /// 读寄存器：能力闸门、链路需求、以及"没有快照"这条**正常失败**路径。
+    #[test]
+    fn registers_go_through_the_same_gates_and_no_snapshot_is_normal() {
+        let mut hub = temp_hub("regs");
+        let human = Principal::human("alice");
+        let id = attached_session(&mut hub, &human);
+        // 没挂链路：必须先说清缺的是链路，而不是"读不到寄存器"。
+        let error = hub.read_registers(&human, id, 7).unwrap_err();
+        assert!(format!("{error}").contains("attach_link"), "实际: {error}");
+        hub.attach_link(
+            &human,
+            id,
+            Box::new(FakeLink {
+                bytes: vec![0x90],
+                calls: 0,
+            }),
+        )
+        .expect("挂链路应当成功");
+
+        // 有快照：值原样出来
+        let values = hub.read_registers(&human, id, 7).expect("读寄存器应当成功");
+        assert_eq!(values[0], ("rip".to_string(), 0x1_4000_1000));
+        println!("✓ 寄存器（线程 7）：{values:?}");
+
+        // 没有快照：**正常失败**，消息里带"有快照的线程"，不能被翻译成内部错误
+        let error = hub.read_registers(&human, id, 0).unwrap_err();
+        match error {
+            Error::TargetUnavailable(message) => {
+                assert!(message.contains("没有快照"), "实际: {message}");
+                assert!(message.contains("[7]"), "要说清哪些线程有: {message}");
+                println!("✓ 没有快照是正常失败：{message}");
+            }
+            other => panic!("期望 TargetUnavailable，实际: {other:?}"),
+        }
+    }
     #[test]
     fn ai_starts_read_only_and_cannot_escalate_itself() {
         let mut hub = temp_hub("caps");

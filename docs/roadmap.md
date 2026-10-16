@@ -98,9 +98,9 @@
 | ~~Hub 会话缺少到 agent 的 client 句柄~~ | ✅ 已完成：Hub 定义 `TargetLink` trait（测试可注入假实现），会话持有可选链路，新增 `attach_link` / `read_memory`（参数校验 → 能力校验 → 会话状态 → 链路，顺序刻意如此）；组合根（MCP）提供 `ClientLink<T>` 把 `pinbridge_client::AgentClient` 适配成链路；`pb_memory_read` 接通。测试覆盖：能力闸门、没挂链路时的错误必须点明缺链路、长度不符必须报错（不许截短）、链路层 hex 解码与错误翻译 |
 | ~~MCP `pb_modules`~~ | ✅ 已完成：agent 侧走 **PEB 加载器链**（`gs:[0x60]` → `Ldr+0x10`）进程内枚举，不依赖 psapi；快照读法不持 loader lock，因此**跳过的不合法条目数会如实上报**。链路新增 `Modules` 请求、Hub 新增 `list_modules`、`pb_modules` 工具接通。实测枚举到 9 个模块（完整路径、主模块在首位） |
 | ~~寄存器捕获段~~ | ✅ 已接通：入口探针用 `IARG_REG_VALUE` 取 7 个寄存器 + `IARG_INST_PTR` 取 RIP，随事件交给 agent；端到端断言 `registers=1 rip=0x…`（RIP 必须落在靶子主模块内） |
-| MCP `pb_registers` 工具 | ⏳ agent 侧与链路已就绪（含捕获段），缺的是 MCP 工具本身的接线 |
-| MCP 新增工具：`pb_modules` | ⏳ 协议与 agent 侧已实现，缺 MCP 工具接线 |：agent 活在目标进程里，拿不到别的线程上下文） | |
-| MCP 新增工具：`pb_modules` / `pb_registers` | ⏳ |
+| ~~MCP `pb_registers` 工具~~ | ✅ 已接线（proto 工具描述 → hub 闸门 → MCP link → 工具处理器）；用例覆盖"有快照给值 / 没快照说清哪些线程有 / 线程号越界拒绝" |
+| ~~MCP `pb_modules` 工具~~ | ✅ 早已接线（本轮核对过，roadmap 这一行是过期的） |：agent 活在目标进程里，拿不到别的线程上下文） | |
+| ~~MCP 工具 `pb_modules` / `pb_registers`~~ | ✅ 均已接线 |
 
 ### 明确不做（占位）
 
