@@ -55,6 +55,12 @@ using fn_last_error = const char*(PB_CALL*)();
 using fn_allocate_sequence = uint64_t(PB_CALL*)();
 using fn_push_event = int32_t(PB_CALL*)(const pb_event_raw*);
 using fn_stats = uint64_t(PB_CALL*)(uint32_t);
+// 轨迹录制也属于**工具 ABI**（头文件第 156-157 行声明了它们）。
+// 早先桥接层漏了这两个转发，于是"Hub/Pin tool 让目标自己录一份轨迹"
+// 这条路径在桥接拓扑下不可达——而且失败信息是"导出面不完整"，
+// 看不出缺的是哪两个。这是 Pin tool 第一次跑起来才暴露出来的。
+using fn_start_trace = int32_t(PB_CALL*)(const char*, uint32_t);
+using fn_stop_trace = int32_t(PB_CALL*)(uint64_t*, uint64_t*);
 
 struct AgentApi {
   HMODULE module = nullptr;
@@ -73,6 +79,8 @@ struct AgentApi {
   fn_allocate_sequence allocate_sequence = nullptr;
   fn_push_event push_event = nullptr;
   fn_stats stats = nullptr;
+  fn_start_trace start_trace = nullptr;
+  fn_stop_trace stop_trace = nullptr;
 
   /// ABI 版本一致时才算“可用”。
   bool usable() const { return load_status == PB_STATUS_OK; }
@@ -218,6 +226,8 @@ void load_agent(AgentApi* api) {
       resolve_symbol<fn_allocate_sequence>(module, "pb_allocate_sequence", &missing);
   api->push_event = resolve_symbol<fn_push_event>(module, "pb_push_event", &missing);
   api->stats = resolve_symbol<fn_stats>(module, "pb_stats", &missing);
+  api->start_trace = resolve_symbol<fn_start_trace>(module, "pb_start_trace", &missing);
+  api->stop_trace = resolve_symbol<fn_stop_trace>(module, "pb_stop_trace", &missing);
 
   if (!missing.empty()) {
     api->load_status = PB_STATUS_NOT_SUPPORTED;
@@ -316,6 +326,30 @@ PB_EXPORT int32_t PB_CALL pb_pause(void) {
     return status;
   }
   return agent().pause();
+}
+
+PB_EXPORT int32_t PB_CALL pb_start_trace(const char* path, uint32_t fold) {
+  if (path == nullptr) {
+    set_error("pb_start_trace: path 为空指针");
+    return PB_STATUS_INVALID_ARGUMENT;
+  }
+  int32_t status = PB_STATUS_OK;
+  if (!require_agent(&status)) {
+    return status;
+  }
+  return agent().start_trace(path, fold);
+}
+
+PB_EXPORT int32_t PB_CALL pb_stop_trace(uint64_t* out_records, uint64_t* out_events) {
+  if (out_records == nullptr || out_events == nullptr) {
+    set_error("pb_stop_trace: out_records/out_events 为空指针");
+    return PB_STATUS_INVALID_ARGUMENT;
+  }
+  int32_t status = PB_STATUS_OK;
+  if (!require_agent(&status)) {
+    return status;
+  }
+  return agent().stop_trace(out_records, out_events);
 }
 
 PB_EXPORT int32_t PB_CALL pb_drain_events(pb_event_raw* out, uint32_t capacity,

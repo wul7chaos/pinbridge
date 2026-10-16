@@ -62,17 +62,43 @@
 
 **目标**：让 M0 的桩变成真能力，且**权限链路第一次真正执行**。
 
+**Pin 已就位并跑通**（2026-10-16）：`third_party/pin/` 是实测过的 3.31 kit
+（`pin-3.31-98869-fa6f126a8`，zip 的 sha256 记在
+[third_party/pin/README.md](../third_party/pin/README.md)）。本机是 AMD Ryzen 7
+9700X——"AMD 上不受官方支持"这件事已实测澄清，结论与边界写在
+[ADR 0010](adr/0010-pin-now-dynamorio-as-swappable-probe-layer.md)。
+
 | 任务 | 状态 |
 |------|------|
 | ~~`pinbridge-sys` 加载器端到端~~ | ✅ M0.5 已完成（真实 DLL，真实 ABI 校验） |
 | ~~agent 加载与调用转发的桥接拓扑~~ | ✅ M0.5 已完成（`agent_bridge.cpp`，Pin tool 复用同一拓扑） |
 | ~~Hub ↔ agent 回环链路（真实握手、版本协商、重连）~~ | ✅ M0.5 已完成（`link.rs` + 两端共用协议；连接断开后重新 `ping` 即可，状态属于进程而不属于连接） |
-| `pinbridge.dll`：Pin tool 入口、探针注册、JIT 上下文 | ⏳ 需要 Pin SDK |
-| agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ |
-| 脚本沙箱白名单（禁 `os`/`ctypes`/`socket`/写文件） | ⏳ |
-| 脚本执行时间预算（超时 → `TimedOut` + 强制卸载） | ⏳ |
+| ~~`pinbridge.dll`：Pin tool 骨架 + **入口点探针**~~ | ✅ 已完成：`pin -t pinbridge.dll -- pb_sample_target.exe` → 命中入口 → 事件穿过桥接层与 agent → **目标进程内写出 `.pbt`** → 我们的读取器解析通过（`ctest -R pin_tool_instruments_a_target`） |
+| ~~脚本策略与生命周期（登记 / 白名单 / 状态机 / 执行预算记账）~~ | ✅ 已完成：`crates/pinbridge-agent/src/script.rs`（静态扫描带行号拒绝，**明确说明它不是沙箱**；登记 ≠ 运行由 `receives_events` 与 `is_live` 两个判断分开表达） |
+| 系统调用 Hook（syscall_enter/exit） | ⏳ 下一个 |
+| 内存访问观测（mem_read/mem_write） | ⏳ 需要 `IARG_MEMORYREAD_EA`/`IARG_MEMORYWRITE_EA` + 过滤 |
+| 指令模板匹配（pattern_hit） | ⏳ |
+| TF 虚拟化（`flags_virtualize.cpp`） | ⏳ |
+| agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 策略层已就绪，缺的是运行时 |
+| 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |
 | 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |
+| Hub 侧加载器解析 `pb_start_trace`/`pb_stop_trace`（让 Hub 能驱动**目标内**录制） | ⏳ 桥接层与 agent 都已就绪，只差 `pinbridge-sys` 的符号表 |
 | MCP 新增工具：`pb_modules` / `pb_registers` | ⏳ |
+
+### 明确不做（占位）
+
+**VMP / 强壳的自动化分析不做**，先占位。边界与理由：
+
+* 它要解决的是另一个问题（定位虚拟机 dispatcher、还原 handler 语义），
+  与"四类插桩点 + 事件模型"不是同一条路径；先塞进来会把 M1 拖成没有边界的黑洞。
+* 现有能力对它**部分是通用的**（轨迹录制、内存读写、模板匹配可以做锚点），
+  所以定位是"暂不承诺"，而不是"架构上做不到"。
+* 真要做就单独立项，并且**先用自写样本**复现出一个虚拟机，再谈自动化——不去分析
+  来路不明的壳样本。
+
+**测试靶子一律自写**：`native/tests/sample_target.cpp` 就是模板。不拿系统二进制
+或外部样本当靶子——那样"测试失败"的原因会同时包含"我们的工具坏了"与
+"那个二进制有反调试"，两者必须能分开。
 
 | 验收标准 | 判据 |
 |----------|------|

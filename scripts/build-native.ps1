@@ -24,6 +24,13 @@
 .PARAMETER RequireAgent
   agent DLL 缺失时直接失败（CI 用）。默认只警告。
 
+.PARAMETER WithPin
+  同时构建依赖 Intel Pin 的 Pin tool（pinbridge.dll）。需要 third_party/pin/
+  下已放好 Pin kit（用 scripts/fetch-pin.ps1 -Verify 检查真实布局）。
+
+  默认**不开**：CI 拿不到 Pin（许可要求人接受），而"缺 Pin"必须是一眼能看懂的
+  失败，不能变成整个仓库都构建不出来。
+
 .EXAMPLE
   pwsh scripts/build-native.ps1
   pwsh scripts/build-native.ps1 -RequireAgent
@@ -33,7 +40,8 @@ param(
     [string]$Configuration = 'Release',
     [string]$BuildDir = 'native/build',
     [switch]$SkipTests,
-    [switch]$RequireAgent
+    [switch]$RequireAgent,
+    [switch]$WithPin
 )
 
 $ErrorActionPreference = 'Stop'
@@ -108,6 +116,24 @@ try {
     # ------------------------------------------------------------------ 4. 构建
     $configArgs = @('-S', 'native', '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Configuration")
     if ($agentDll) { $configArgs += "-DPINBRIDGE_AGENT_DLL=$($agentDll.FullName)" }
+
+# Pin kit：只检查"存在且能报版本"，路径按第三方的**实测**布局
+# （见 third_party/pin/README.md——早先按记忆写成 source/tools/Pin/pin.H，
+# 结果脚本永远报"缺 Pin"，而实际是装好的）。
+if ($WithPin) {
+    $pinRoot = Join-Path $root 'third_party/pin'
+    $pinExe = Join-Path $pinRoot 'pin.exe'
+    $pinLib = Join-Path $pinRoot 'intel64/lib/pin.lib'
+    if (-not (Test-Path $pinExe) -or -not (Test-Path $pinLib)) {
+        Die "启用了 -WithPin 但没有 Pin kit：$pinRoot（获取方式见 third_party/pin/README.md）"
+    }
+    $pinVersion = (& $pinExe -version 2>&1 | Select-Object -First 1)
+    Write-Host "Pin: $pinVersion" -ForegroundColor Cyan
+    $configArgs += "-DPINBRIDGE_WITH_PIN=ON"
+    $configArgs += "-DPIN_ROOT=$pinRoot"
+} else {
+    $configArgs += "-DPINBRIDGE_WITH_PIN=OFF"
+}
     Info "配置：cmake $($configArgs -join ' ')"
     & $cmake @configArgs 2>&1 | Select-String -Pattern 'agent DLL|WARNING|Error|error' | Select-Object -First 5
 

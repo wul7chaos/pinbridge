@@ -78,38 +78,125 @@ else()
 endif()
 
 # --------------------------------------------------------------------------
-# 真正的工具 DLL：需要 Pin SDK（PIN_ROOT）
+# 真正的工具 DLL：需要 Pin SDK（PIN_ROOT = kit 根目录）
+#
+# 下面这些编译/链接参数**不是凭经验猜的**：它们逐条取自 kit 里的
+# `source/tools/Config/makefile.win.config`（行号见各行注释）。
+# Pin 用自己的 CRT（pincrt），还要求关掉 C++ 异常/RTTI、强制包含
+# msvc_compat.h、并用 Ptrace_DllMainCRTStartup 作为入口——
+# 少任何一条都会得到一串看起来毫无关联的链接错误。
 # --------------------------------------------------------------------------
 option(PINBRIDGE_WITH_PIN "构建依赖 Intel Pin 的工具 DLL" OFF)
 
 if(PINBRIDGE_WITH_PIN)
   if(NOT DEFINED PIN_ROOT)
     message(FATAL_ERROR
-      "启用 PINBRIDGE_WITH_PIN 时必须指定 PIN_ROOT=.../pin-3.31-xxx\\source\\tools\\Pin"
-      "（获取方式见 third_party/pin/README.md）")
+      "启用 PINBRIDGE_WITH_PIN 时必须指定 PIN_ROOT=<pin kit 根目录>"
+      "（即含 pin.exe 与 intel64/ 的那一层；获取与校验见 third_party/pin/README.md）")
   endif()
-  if(NOT EXISTS "${PIN_ROOT}/pin.H")
-    message(FATAL_ERROR "PIN_ROOT 下找不到 pin.H：${PIN_ROOT}")
+  if(NOT EXISTS "${PIN_ROOT}/source/include/pin/pin.H")
+    message(FATAL_ERROR "PIN_ROOT 下找不到 source/include/pin/pin.H：${PIN_ROOT}")
+  endif()
+  if(NOT EXISTS "${PIN_ROOT}/intel64/lib/pin.lib")
+    message(FATAL_ERROR "PIN_ROOT 下找不到 intel64/lib/pin.lib：${PIN_ROOT}")
   endif()
 
-  add_library(pinbridge SHARED
-    src/pinbridge_tool.cpp     # Pin 工具入口：探针注册、JIT 上下文
-    src/agent_bridge.cpp       # 加载 pinbridge_agentdll 并转发 C ABI 调用
-    src/flags_virtualize.cpp   # TF 虚拟化（见 docs/design/flags-virtualization.md）
-  )
-  target_include_directories(pinbridge PRIVATE include "${PIN_ROOT}")
+  # `_WINDOWS_H_PATH_` 必须是**不带引号**的裸路径：
+  # Pin 的 extras/crt/include/windows.h 第 38 行这样用它——
+  #     #define WINDOWS_H_PATH <_WINDOWS_H_PATH_/Windows.h>
+  #     #include WINDOWS_H_PATH
+  # 所以宏里多一对引号会得到 `<"C:/..."/Windows.h>`，报出
+  # "无法打开包括文件: "C:/..."/Windows.h" 这种带引号的怪路径（实测踩过）。
+  # 官方 makefile 也是靠命令行把引号吃掉才成立的
+  # （Config/makefile.win.config:104）。
+  find_path(PINBRIDGE_WINDOWS_H_DIR Windows.h)
+  if(NOT PINBRIDGE_WINDOWS_H_DIR)
+    message(FATAL_ERROR "找不到 Windows.h：请在 vcvars 环境里配置（先运行 vcvars64.bat）")
+  endif()
+  message(STATUS "Windows.h 目录：${PINBRIDGE_WINDOWS_H_DIR}")
+
+  # 复用已经测过的转发层，再叠加探针：
+  #   探针（本文件）→ pinbridge_bridge.dll → pinbridge_agent.dll
+  # 这样 Pin tool 不需要第二套"加载 agent / 校验 ABI / 转发调用"的实现。
+  add_library(pinbridge SHARED src/pinbridge_tool.cpp)
   target_link_libraries(pinbridge PRIVATE pinbridge::abi_selfcheck)
+
+  target_include_directories(pinbridge PRIVATE
+    include
+    # makefile.win.config:193-208（KIT=1 分支的 TOOL_INCLUDES）
+    "${PIN_ROOT}/source/include/pin"
+    "${PIN_ROOT}/source/include/pin/gen"
+    "${PIN_ROOT}/extras/stlport/include"
+    "${PIN_ROOT}/extras"
+    "${PIN_ROOT}/extras/libstdc++/include"
+    "${PIN_ROOT}/extras/crt/include"
+    "${PIN_ROOT}/extras/crt"
+    "${PIN_ROOT}/extras/crt/include/arch-x86_64"
+    "${PIN_ROOT}/extras/crt/include/kernel/uapi"
+    "${PIN_ROOT}/extras/crt/include/kernel/uapi/asm-x86"
+    # makefile.win.config:278（XED_ROOT/include/xed —— 注意末尾的 xed，
+    # 少了它 pin.H 会报"找不到 xed-interface.h"，而那个错误看起来像缺文件）
+    "${PIN_ROOT}/extras/xed-intel64/include/xed"
+    "${PIN_ROOT}/source/tools/Utils"
+    "${PIN_ROOT}/source/tools/InstLib"
+    "${PIN_ROOT}/extras/components/include"
+  )
+
+  # makefile.win.config:100/106/111/310/327 与 158（OPT_CXX := /MD）
+  target_compile_options(pinbridge PRIVATE
+    /EHs- /EHa- /wd4530 /DTARGET_WINDOWS /nologo /Gy
+    /Oi- /GR- /GS-
+    /DPIN_CRT=1
+    "/D_WINDOWS_H_PATH_=${PINBRIDGE_WINDOWS_H_DIR}"
+    /D__LP64__ /DTARGET_IA32E /DHOST_IA32E
+    /Zc:threadSafeInit- /Zc:sizedDealloc- /wd5208
+    /FIinclude/msvc_compat.h
+  )
   target_compile_definitions(pinbridge PRIVATE PINBRIDGE_TOOL_BUILD=1)
 
-  # Pin 的约定：工具 DLL 不能链接 CRT 的调试版；且必须是 /MT
-  if(MSVC)
-    target_compile_options(pinbridge PRIVATE /MT /EHsc)
-  endif()
+  # Pin 要求 /MD（与仓库其它目标的 /MT 相反）：**必须逐目标覆盖**，
+  # 否则会得到"pincrt 与 libcmt 冲突"这类含义晦涩的链接错误。
+  set_property(TARGET pinbridge PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+
+  # makefile.win.config:128/137/218/283-284/329
+  target_link_options(pinbridge PRIVATE
+    /DLL /EXPORT:main /NODEFAULTLIB /NOLOGO /INCREMENTAL:NO
+    /IGNORE:4210 /IGNORE:4049 /MACHINE:x64
+    /ENTRY:Ptrace_DllMainCRTStartup /DYNAMICBASE /NXCOMPAT
+    "${PIN_ROOT}/intel64/runtime/pincrt/crtbeginS.obj"
+  )
+  # makefile.win.config:72 与 211-213/283-284。
+  # 路径必须按**实测**布局写：pincrt.lib 在 runtime/pincrt 下，不在 lib 下。
+  target_link_libraries(pinbridge PRIVATE
+    "${PIN_ROOT}/intel64/lib/pin.lib"
+    "${PIN_ROOT}/extras/xed-intel64/lib/xed.lib"
+    "${PIN_ROOT}/intel64/lib/pinipc.lib"
+    "${PIN_ROOT}/intel64/runtime/pincrt/pincrt.lib"
+    kernel32.lib
+  )
+  target_link_directories(pinbridge PRIVATE
+    "${PIN_ROOT}/intel64/lib"
+    "${PIN_ROOT}/intel64/lib-ext"
+    "${PIN_ROOT}/intel64/runtime/pincrt"
+  )
 
   set_target_properties(pinbridge PROPERTIES
     PREFIX ""                 # pin.exe -t pinbridge.dll 期望没有 lib 前缀
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dist"
   )
+
+  # 把 agent DLL 一并放到 dist/：这样 `dist/` 是一个**自包含**的可运行目录，
+  # `cd dist && pin.exe -t pinbridge.dll -- TARGET.exe` 直接就能跑通，
+  # 不需要任何环境变量。少一个环境变量 = 少一类"在我机器上能跑"。
+  if(WIN32 AND PINBRIDGE_AGENT_DLL AND EXISTS "${PINBRIDGE_AGENT_DLL}")
+    add_custom_command(TARGET pinbridge POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${PINBRIDGE_AGENT_DLL}"
+              "${CMAKE_BINARY_DIR}/dist/pinbridge_agent.dll"
+      COMMENT "把 pinbridge_agent.dll 复制到 dist/（让 dist 自包含）")
+  endif()
+
+  message(STATUS "Pin tool 目标已启用：PIN_ROOT=${PIN_ROOT}")
 endif()
 
 # --------------------------------------------------------------------------
@@ -163,6 +250,38 @@ if(BUILD_TESTING)
               "$<TARGET_FILE:pinbridge_bridge>" "${CMAKE_CURRENT_BINARY_DIR}/不存在-pinbridge_agent.dll"
               "missing")
     set_tests_properties(bridge_roundtrip bridge_missing_agent PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ------------------------------------------------------------ Pin tool 端到端
+    # 只有真正构建了 Pin tool 才注册：注册一个"跑不了"的测试只会制造
+    # 无法解释的失败（"平台不适用"与"实现坏了"必须能区分）。
+    if(PINBRIDGE_WITH_PIN AND EXISTS "${PIN_ROOT}/pin.exe")
+      add_executable(pb_sample_target tests/sample_target.cpp)
+      set_target_properties(pb_sample_target PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+      add_test(NAME pin_tool_instruments_a_target
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_trace "${CMAKE_BINARY_DIR}/pin-tool-trace.pbt"
+                -pb_events 16
+                --
+                "$<TARGET_FILE:pb_sample_target>")
+      # Pin 的 stdout/stderr 都是我们要检查的证据，失败时原样打出来。
+      set_tests_properties(pin_tool_instruments_a_target PROPERTIES
+        FAIL_REGULAR_EXPRESSION "入口探针\\*\\*未\\*\\*命中"
+        PASS_REGULAR_EXPRESSION "入口点命中"
+        # 工作目录设成 dist：Pin tool 用 `LoadLibraryA("pinbridge_bridge.dll")`
+        # 按名字加载同目录的桥接层，而 Windows 的搜索顺序里包含当前目录。
+        # 这不只是"让测试通过"——它就是人手工运行时该做的事
+        # （`cd native/build/dist`，然后 pin.exe -t pinbridge.dll -- ...）。
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+      if(PINBRIDGE_AGENT_DLL)
+        # agent DLL 的位置**显式**告诉桥接层：ctest 的环境与我们不同，
+        # 靠"同目录猜测"失败时会报"无法加载 agent DLL，已尝试 …"这种含糊信息。
+        set_tests_properties(pin_tool_instruments_a_target PROPERTIES
+          ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
+      endif()
+    endif()
   else()
     message(STATUS "非 Windows：只注册 abi_selfcheck（桥接层不可用）")
   endif()

@@ -337,8 +337,12 @@ pub unsafe extern "C" fn pb_start_trace(path: *const c_char, fold: c_uint) -> c_
             )
         });
     };
+    // 元数据键名是 `abi_version`：它是**会被上游解析**的字段（Hub、Python 侧、
+    // 事后审计都会读），写成 `abel_version` 这种错别字不会让任何东西立刻报错，
+    // 只会让读取方永远拿不到 ABI 版本。这个 bug 是 Pin tool 第一次跑通、
+    // 用 `pinbridge replay` 打印元数据时才看见的——"能跑通"不等于"内容对"。
     let meta = format!(
-        "{{\"tool\":\"pinbridge-agent\",\"abel_version\":{PB_ABI_VERSION},\"fold\":{}}}",
+        "{{\"tool\":\"pinbridge-agent\",\"abi_version\":{PB_ABI_VERSION},\"fold\":{}}}",
         fold != 0
     );
     AgentHost::call(|state| {
@@ -404,6 +408,40 @@ mod tests {
 
     /// 全局状态在测试间共享，因此把有状态的断言集中在一个测试里顺序执行，
     /// 并用 `GLOBAL_STATE_LOCK` 与其它触碰全局状态的测试互斥。
+    /// 轨迹元数据里的键名是上游会解析的契约，别写错。
+    #[test]
+    fn trace_metadata_uses_the_documented_keys() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pb-meta-{}", std::process::id()));
+        let path = dir.join("meta.pbt");
+        let text = path.to_string_lossy().into_owned();
+        // 只用导出面（而不是直接摸全局状态）：这样测的是调用方真正会走的那条路。
+        pb_set_capabilities(Capability::operator_default().bits());
+        // `pb_attach` 是普通 extern "C" fn（不是 unsafe fn），无需 unsafe 块
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        let c_path = std::ffi::CString::new(text).unwrap();
+        // SAFETY: 传入的是有效的 NUL 结尾字符串
+        assert_eq!(
+            unsafe { pb_start_trace(c_path.as_ptr(), 1) },
+            Status::Ok.code()
+        );
+        // SAFETY: 空指针会让导出立刻返回错误，这里传 null 只为触发写入路径
+        let mut records = 0u64;
+        let mut events = 0u64;
+        // SAFETY: 两个输出指针都指向本栈变量
+        assert_eq!(
+            unsafe { pb_stop_trace(&mut records, &mut events) },
+            Status::Ok.code()
+        );
+        let bytes = std::fs::read(&path).expect("轨迹文件应当存在");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("abi_version"), "元数据键名必须是 abi_version");
+        assert!(!text.contains("abel_version"), "错别字不该回来");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn abi_surface_smoke() {
         let _guard = crate::host::GLOBAL_STATE_LOCK

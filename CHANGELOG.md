@@ -55,7 +55,36 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
   加载器端到端测试。
 - `scripts/verify.ps1` 新增 native 步骤（装了 VS 就自动跑）。
 
+### 新增（M1：Pin 探针层落地，第一次真正插装一个进程）
+- Pin 3.31 kit 就位并记录（版本串、zip 的 sha256、**实测**目录结构）。
+  `scripts/fetch-pin.ps1` 的检查路径按实测布局修正——早先按记忆写成
+  `source/tools/Pin/pin.H`（那是源码树内部的路径），结果脚本永远报"缺 Pin"。
+- `native/src/pinbridge_tool.cpp`：Pin tool 骨架 + **入口点探针**。
+  它只做三件事（注册探针、把事实推给 agent、开始/结束录制），
+  依赖链是"探针 → 桥接层 → agent"——**复用**已测过的转发层，不重写一套。
+  链路实测：`pin.exe -t pinbridge.dll -- pb_sample_target.exe`
+  → 入口点命中 → 事件穿过两个语言边界 → **目标进程内写出 `.pbt``** →
+  我们自己的读取器解析通过（`ctest -R pin_tool_instruments_a_target`）。
+- `native/tests/sample_target.cpp`：自写的最小靶子。测试靶子一律自写，
+  不拿系统二进制或外部样本——否则"测试失败"会同时包含"我们的工具坏了"
+  与"那个二进制有反制"，两者必须能分开归因。
+- `crates/pinbridge-agent/src/script.rs`：脚本**策略与生命周期**（M1 的执行层
+  还没做，但登记、白名单、状态机、预算记账都能测了）。静态扫描给出**行号与理由**；
+  文档与代码里都写明**它是策略过滤器而不是沙箱**（构造性绕过是可能的）。
+  顺带把"生命周期上还相关（`is_live`）"与"该不该收新事件（`receives_events`）"
+  拆成两个判断：混用会让被替换掉的旧脚本继续按老逻辑打日志。
+- **ADR 0010**：探针层用 Pin，但当作可替换件。含 AMD 上的实测结论
+  （Ryzen 7 9700X 上链路通）与备选（DynamoRIO/QBDI/TinyInst）。
+- `scripts/build-native.ps1 -WithPin`、`native/CMakeLists.txt` 的 Pin 目标
+  （参数逐条对应 kit 的官方 makefile，并注明行号）。
+
 ### 修复
+- **桥接层漏了两个 tool ABI 导出**：`pb_start_trace`/`pb_stop_trace` 头文件声明了、
+  agent 实现了，桥接层没转发——于是"让目标自己录一份轨迹"在桥接拓扑下不可达，
+  而失败信息只是"导出面不完整"，看不出缺的是哪两个。这是 Pin tool 第一次跑起来
+  才暴露的（Hub 侧加载器同样还没解析这两个符号，已记入路线图）。
+- 轨迹元数据里的键名 `abel_version` 是错别字（应为 `abi_version`）。它不会被任何
+  东西立刻报错，只会让读取方永远拿不到 ABI 版本；加了回归测试防止复发。
 - `pinbridge-agent` 的桩实现状态码与错误文本不一致：内部先用 `Error::Trace` 走通用
   映射、再把码重映射成 `not_supported`，于是 `pb_last_error()` 里留着
   "内部错误: 轨迹错误: …"。现在 `stub()` 直接以 `NotSupported` 写文本，

@@ -38,6 +38,7 @@
 | [0007](0007-trunk-based-development.md) | 主干开发，不用 Git Flow | 两人项目里 Git Flow 只有成本 |
 | [0008](0008-control-lease-with-epoch.md) | 控制权用带 epoch 的租约 | 让"AI 的在途命令失效"可证 |
 | [0009](0009-bounded-channel-drop-accounting.md) | 通道必须有界且丢弃必须计数 | 不能让"我看到的"冒充"发生过的" |
+| [0010](0010-pin-now-dynamorio-as-swappable-probe-layer.md) | 探针层用 Pin，但当作可替换件 | AMD 上"能跑但不受支持"不能变成项目级风险 |
 
 ## 什么时候需要新写一条
 

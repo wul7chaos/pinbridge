@@ -67,3 +67,50 @@ cmake -S native -B native/build -G Ninja -DPINBRIDGE_WITH_PIN=ON `
 
 在此之前，`pinbridge.dll`、`pinbridge_tool.cpp`、`flags_virtualize.cpp`
 都不参与构建；需要它们的动作在桥接层与 agent 里都是**显式的 `not_supported`**。
+
+## Pin tool（需要 Intel Pin）
+
+`native/src/pinbridge_tool.cpp` 是探针层。它**只**做三件事：注册探针、把观察到
+的事实推给 agent、开始/结束录制——权限判断与文件格式都在 Rust 侧
+（理由见 [ADR 0010](../docs/adr/0010-pin-now-dynamorio-as-swappable-probe-layer.md)）。
+因此它的依赖链是"复用"而不是"重写"：
+
+```text
+pin.exe
+  └─ pinbridge.dll（探针：目前是入口点探针）
+       └─ pinbridge_bridge.dll（转发层，已由 CTest 覆盖）
+            └─ pinbridge_agent.dll（Rust：事件、脚本宿主、录制）
+```
+
+### 构建与运行
+
+```powershell
+pwsh scripts/build-native.ps1 -WithPin -RequireAgent     # 需要 third_party/pin/ 就位
+cd native/build/dist                                     # dist 是自包含目录
+..\..\..\third_party\pin\pin.exe -t pinbridge.dll -pb_trace out.pbt -pb_events 16 -- ..\pb_sample_target.exe
+```
+
+旋钮：`-pb_trace <path>`、`-pb_bridge <path>`（默认按名字找同目录）、
+`-pb_caps all|ro`（默认 ro＝只读基线 257）、`-pb_events <n>`。
+
+### 验收
+
+```powershell
+ctest --test-dir native/build -R pin_tool_instruments_a_target --output-on-failure
+```
+
+判据不是"退出码为 0"，而是 stderr 里**必须**出现"入口点命中"——一份"安静成功"
+的 Pin tool 无法区分"探针没命中"与"事件通道断了"。
+
+### 踩过的坑（都写在 `third_party/pin/README.md` 与 CMake 注释里）
+
+* Pin 的 MSVC 参数以 `source/tools/Config/makefile.win.config` 为**唯一权威**；
+  链接需要 `/EXPORT:main /ENTRY:Ptrace_DllMainCRTStartup`，且 **`/MD`**（不是 `/MT`）；
+* `pincrt.lib` 在 `intel64/runtime/pincrt/`，XED 头在 `extras/xed-intel64/include/xed`；
+* `_WINDOWS_H_PATH_` 必须是**不带引号**的裸路径（Pin 的 `windows.h` 会拼成
+  `<.../Windows.h>`）；
+* Pin 自带部分重实现的 `minwindef.h`（含 `typedef int BOOL`），与真实 `windows.h`
+  同处一个编译单元会报"BOOL 不明确的符号"——所以探针层只用三个 Win32 入口并按
+  名字自行声明，不包含 `windows.h`；
+* Pin 的包含顺序会引入它自带的 STL，`std::vector::data()`、`std::uint64_t`
+  在这个编译单元里可能解析不到——用 Pin 自己的 `UINT64`/`UINT32`。

@@ -36,19 +36,12 @@ use sha2::{Digest, Sha256};
 pub const EVENT_QUEUE_CAPACITY: usize = 65_536;
 
 /// 已加载脚本的元信息（正文由内嵌 CPython 持有，这里只留溯源信息）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptHandle {
-    /// 脚本 ID（agent 本地单调分配）。
-    pub id: u64,
-    /// 名称。
-    pub name: String,
-    /// 源码 sha256（hex）。
-    pub source_sha256: String,
-    /// 源码字节数。
-    pub source_len: usize,
-    /// 订阅的事件类型短名。
-    pub subscribe: Vec<String>,
-}
+///
+/// 说明：脚本的登记、策略校验与生命周期在 [`crate::script`] 里实现
+/// （`ScriptHost`）。早先这里另有一套 `ScriptHandle`，与它重复且缺少
+/// 状态机——两套并存的直接后果是"卸载"在两边语义不同（一个删除记录、
+/// 一个标状态）。现在统一走 `ScriptHost`。
+pub use crate::script::Script;
 
 /// agent 状态。
 #[derive(Debug)]
@@ -60,8 +53,8 @@ pub struct AgentState {
     inbox: BoundedReceiver<Event>,
     next_sequence: u64,
     last_error: CString,
-    scripts: Vec<ScriptHandle>,
-    next_script: u64,
+    scripts: crate::script::ScriptHost,
+    budget: crate::script::ScriptBudget,
     recorder: Option<LocalRecorder>,
     /// 已采集但尚未被 Hub 取走的条数（用于背压观测）。
     drained: u64,
@@ -88,8 +81,9 @@ impl AgentState {
             inbox,
             next_sequence: 0,
             last_error: CString::new("").unwrap_or_default(),
-            scripts: Vec::new(),
-            next_script: 0,
+            scripts: crate::script::ScriptHost::new(),
+            // 单次回调预算：超了会被记账（`overruns`），M1 由运行时强制中断。
+            budget: crate::script::ScriptBudget::new(crate::script::DEFAULT_CALL_BUDGET_MS),
             recorder: None,
             drained: 0,
         }
@@ -113,10 +107,10 @@ impl AgentState {
         self.capabilities
     }
 
-    /// 已加载脚本。
+    /// 已登记的脚本（含历史版本）。
     #[must_use]
-    pub fn scripts(&self) -> &[ScriptHandle] {
-        &self.scripts
+    pub fn scripts(&self) -> &[Script] {
+        self.scripts.all()
     }
 
     /// 因队列背压丢弃的事件数。
@@ -231,30 +225,40 @@ impl AgentState {
         count
     }
 
-    /// 注册脚本。
+    /// 脚本宿主（登记、策略与生命周期）。
+    #[must_use]
+    pub const fn script_host(&self) -> &crate::script::ScriptHost {
+        &self.scripts
+    }
+
+    /// 脚本预算记账。
+    #[must_use]
+    pub const fn script_budget(&self) -> &crate::script::ScriptBudget {
+        &self.budget
+    }
+
+    /// 登记脚本：先过策略，再分配 id 与哈希。
+    ///
+    /// # Errors
+    ///
+    /// 名/正文为空或违反运行策略时返回错误（消息里带行号与原因）。
     pub fn register_script(
         &mut self,
         name: &str,
         source: &str,
-        subscribe: Vec<String>,
-    ) -> ScriptHandle {
-        self.next_script += 1;
-        let handle = ScriptHandle {
-            id: self.next_script,
-            name: name.to_owned(),
-            source_sha256: sha256_hex(source.as_bytes()),
-            source_len: source.len(),
-            subscribe,
-        };
-        self.scripts.push(handle.clone());
-        handle
+        subscribe: Vec<u8>,
+    ) -> Result<Script> {
+        self.scripts.register(name, source, subscribe)
     }
 
     /// 卸载脚本。
-    pub fn unregister_script(&mut self, id: u64) -> bool {
-        let before = self.scripts.len();
-        self.scripts.retain(|s| s.id != id);
-        self.scripts.len() != before
+    ///
+    /// # Errors
+    ///
+    /// 不存在或已卸载时返回错误（**不接受"假成功"**：那会让调用方以为
+    /// 某个已经不在的脚本还在生效）。
+    pub fn unregister_script(&mut self, id: u64) -> Result<Script> {
+        self.scripts.unregister(id)
     }
 
     /// 开始录制。
@@ -438,15 +442,22 @@ mod tests {
     #[test]
     fn script_registration_hashes_like_the_hub() {
         let mut state = AgentState::new();
-        let handle =
-            state.register_script("hook.py", "# pinbridge demo hook\nprint('hello')\n", vec![]);
+        let script = state
+            .register_script("hook.py", "# pinbridge demo hook\nprint('hello')\n", vec![])
+            .expect("登记应当成功");
+        // 与 Hub 侧的 DEMO_SHA256 常量一致（跨 crate 的哈希必须逐字节相同）
         assert_eq!(
-            handle.source_sha256,
+            script.source_sha256,
             "a98c7127446444ec31a9890062ee7f669d02b955bf07ea513f23f5f3db81671e"
         );
+        assert_eq!(script.state, crate::script::ScriptState::Registered);
         assert_eq!(state.scripts().len(), 1);
-        assert!(state.unregister_script(handle.id));
-        assert!(!state.unregister_script(handle.id));
+        assert_eq!(
+            state.unregister_script(script.id).unwrap().state,
+            crate::script::ScriptState::Unloaded
+        );
+        // 再卸载必须报错：删除式实现会在这里静默成功，从而掩盖"脚本已经不在"的事实
+        assert!(state.unregister_script(script.id).is_err());
     }
 
     #[test]
