@@ -235,6 +235,7 @@ pub fn dispatch(request: &AgentRequest) -> AgentResponse {
         },
         // 寄存器读取需要 Pin 的上下文访问，M1 落地。
         AgentRequest::ReadRegisters { .. } => not_supported("read_registers"),
+        AgentRequest::Modules {} => dispatch_modules(),
         AgentRequest::SetBreakpoint { address, label } => {
             let _ = label; // 标签只用于审计展示，不参与下发
             status_only(exports::pb_set_breakpoint(*address), "set_breakpoint")
@@ -265,6 +266,23 @@ pub fn dispatch(request: &AgentRequest) -> AgentResponse {
     }
 }
 
+/// 枚举已加载模块。
+///
+/// 失败时不返回"空列表"：空列表是有含义的（"一个模块都没有"），
+/// 平台不支持或枚举失败必须用错误表达，否则调用方会把"做不到"当成"没有"。
+fn dispatch_modules() -> AgentResponse {
+    if !crate::modules::supported() {
+        return AgentResponse::Error {
+            code: error_code::NOT_SUPPORTED.into(),
+            message: "modules: 当前平台没有 PEB，进程内模块枚举只在 Windows 上实现".into(),
+        };
+    }
+    let snapshot = crate::modules::snapshot();
+    AgentResponse::Modules {
+        modules: snapshot.modules,
+        skipped: snapshot.skipped,
+    }
+}
 fn dispatch_ping(wire_version: u16) -> AgentResponse {
     // 版本协商：不匹配时明确拒绝，而不是"能解析就继续"。
     // 一个字段含义变了但版本没变的链路，会产生最难查的那类 bug。
@@ -602,6 +620,45 @@ mod tests {
         assert!(err.contains("非法字符"), "实际: {err}");
     }
 
+    /// 这条测试在**真实进程**里跑：它枚举的是测试进程自己的加载器链。
+    /// 偏移写错的话表现是空列表或访问违例，而不是"看起来合理的一串模块"。
+    #[test]
+    fn modules_request_enumerates_this_process() {
+        let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        exports::pb_set_capabilities(Capability::read_only_baseline().bits());
+        match dispatch(&AgentRequest::Modules {}) {
+            AgentResponse::Modules { modules, skipped } => {
+                if !cfg!(windows) {
+                    assert!(modules.is_empty(), "非 Windows 平台应当没有 PEB 可读");
+                    return;
+                }
+                assert!(
+                    modules.len() >= 3,
+                    "任何 Windows 进程至少加载了主模块、ntdll、kernel32，实际 {}",
+                    modules.len()
+                );
+                for module in &modules {
+                    assert!(
+                        module.base != 0,
+                        "{} 的基址为 0（偏移读错了？）",
+                        module.name
+                    );
+                    assert!(module.size != 0, "{} 的映像大小为 0", module.name);
+                    assert!(
+                        module.name.contains('\\') || module.name.contains('/'),
+                        "模块名应当是完整路径，实际: {}",
+                        module.name
+                    );
+                }
+                println!(
+                    "✓ 通过链路枚举到 {} 个模块（跳过 {skipped}）",
+                    modules.len()
+                );
+                println!("  第一个：{}", modules[0].name);
+            }
+            other => panic!("期望 Modules，实际: {other:?}"),
+        }
+    }
     #[test]
     fn ping_negotiates_the_protocol_version() {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

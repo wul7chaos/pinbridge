@@ -66,6 +66,14 @@ pub const TOOLS: &[ToolDescriptor] = &[
         executes_in_target: false,
     },
     ToolDescriptor {
+        name: "pb_modules",
+        description: "列出目标进程已加载的模块（完整路径、基址、映像大小）。\
+用于把 RVA 换算成断点地址（pb_breakpoint_set 需要的是绝对地址）。\
+列表是快照：加载器链正在被修改时会有条目被跳过，返回里会说明跳过了多少。",
+        input_schema_json: r#"{"type":"object","properties":{"session":{"type":"integer"}},"required":["session"],"additionalProperties":false}"#,
+        requires: &[Capability::MemRead],
+        executes_in_target: true,
+    },    ToolDescriptor {
         name: "pb_memory_read",
         description: "读取目标内存切片（hex）。用于验证假设，不适合批量抽取——批量请用脚本在目标进程内完成再回传摘要。",
         input_schema_json: r#"{"type":"object","properties":{"session":{"type":"integer"},"address":{"type":"integer"},"length":{"type":"integer","maximum":65536}},"required":["session","address","length"],"additionalProperties":false}"#,
@@ -171,14 +179,23 @@ mod tests {
         }
     }
 
+    /// 哪些工具的**工作过程**发生在目标进程内。
+    ///
+    /// 这个集合必须小而明确：它意味着"这段逻辑跑在被分析的进程里"，
+    /// 于是它的崩溃就是目标的崩溃、它的权限就是目标的权限。目前两项，
+    /// 理由各不相同：
+    ///
+    /// * `pb_modules`：模块枚举读的是目标**自己的加载器链**（PEB），
+    ///   只能在目标内做——Hub 侧拿不到别人的 PEB；
+    /// * `pb_script_load`：注入的脚本本身在目标内执行。
     #[test]
-    fn only_script_load_executes_in_target() {
+    fn only_deliberate_tools_execute_in_target() {
         let in_target: Vec<&str> = TOOLS
             .iter()
             .filter(|t| t.executes_in_target)
             .map(|t| t.name)
             .collect();
-        assert_eq!(in_target, vec!["pb_script_load"]);
+        assert_eq!(in_target, vec!["pb_modules", "pb_script_load"]);
     }
 
     #[test]

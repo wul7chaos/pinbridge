@@ -36,6 +36,7 @@
 pub mod exports;
 pub mod host;
 pub mod link;
+pub mod modules;
 pub mod script;
 
 pub use host::{AgentHost, AgentState};

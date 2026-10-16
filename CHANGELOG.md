@@ -41,6 +41,33 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（M1：`pb_modules`——目标进程内的模块枚举）
+- agent 侧新增 `modules` 模块：走 **PEB 加载器链**
+  （`gs:[0x60]` → `PEB->Ldr`(+0x18) → `InLoadOrderModuleList`(+0x10)）做进程内枚举。
+  选它而不是 `EnumProcessModules`：agent 本来就活在目标进程里，走 PEB 是纯内存读，
+  不需要打开句柄、不引入 psapi 依赖。
+- **快照语义如实上报**：读加载器链不持 loader lock，所以它是一个瞬间快照
+  ——链正在被修改时会出现半初始化条目。这些条目**跳过并计数**（`skipped`），
+  一路带到 MCP 工具的输出里。一个"看起来完整"的列表比一个"标了可能不完整"的列表危险得多。
+- 协议新增 `AgentRequest::Modules` / `AgentResponse::Modules` / `ModuleInfo`
+  （名字、基址、映像大小、入口点——只放换算地址需要的四项）；能力档位 `mem_read`。
+- Hub 新增 `TargetLink::list_modules` 与 `HubService::list_modules`（校验顺序与
+  `read_memory` 一致）；MCP 的 `ClientLink` 实现适配；`pb_modules` 工具接通，
+  输出基址 + 大小 + 完整路径，并在 `skipped != 0` 时明确提示列表可能不完整。
+- 实测：agent 自己的测试进程里枚举到 **9 个模块**，主模块在首位、路径完整、跳过 0。
+
+### 修复
+- **`UNICODE_STRING` 的 `Buffer` 偏移是 8，不是 4**（`{Length, MaximumLength,
+  <4 字节填充>, Buffer}`）。第一版按 `2 * size_of::<u16>()` 读，读到的是填充区，
+  于是拿着垃圾指针解引用——测试直接 `STATUS_ACCESS_VIOLATION`。
+  这类错误只有**真的去读一次 PEB** 才会暴露，写在注释里了。
+- `only_script_load_executes_in_target` 这条断言随 `pb_modules` 落地而更新：
+  现在有**两个**工具的工作过程发生在目标内，且理由不同（一个读目标的加载器链、
+  一个在目标内执行脚本）。集合仍然必须小而明确，所以测试改名成了
+  `only_deliberate_tools_execute_in_target` 并把两条理由写在注释里。
+- 修一处 `Modules` 变体插入时把 `ReadRegisters` 的文档注释「抢走」的排版问题
+  （`missing documentation` 警告暴露了它）。
+
 ### 新增（M1：控制面到目标端的主动请求链路——`pb_memory_read` 打通）
 - Hub 增加 [`TargetLink`] trait：Hub 只声明"我需要读目标内存"，具体是 socket、
   命名管道还是假的实现由上层决定。**这是让 Hub 的闸门逻辑可测的关键**——

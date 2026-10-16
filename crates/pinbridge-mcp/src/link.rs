@@ -18,7 +18,7 @@
 use pinbridge_client::{AgentClient, Transport};
 use pinbridge_core::error::{Error, Result};
 use pinbridge_hub::TargetLink;
-use pinbridge_proto::agent_link::{AgentRequest, AgentResponse};
+use pinbridge_proto::agent_link::{AgentRequest, AgentResponse, ModuleInfo};
 
 /// 把 `AgentClient` 包装成 Hub 能用的链路。
 #[derive(Debug)]
@@ -110,6 +110,21 @@ impl<T: Transport> TargetLink for ClientLink<T> {
         decode_memory_response(length, &response)
     }
 
+    fn list_modules(&mut self) -> Result<(Vec<ModuleInfo>, u32)> {
+        let response = self
+            .client
+            .call(&AgentRequest::Modules {})
+            .map_err(|error| Error::TargetUnavailable(format!("列模块请求失败：{error}")))?;
+        match response {
+            AgentResponse::Modules { modules, skipped } => Ok((modules, skipped)),
+            AgentResponse::Error { code, message } => Err(Error::TargetUnavailable(format!(
+                "agent 拒绝列模块（{code}）：{message}"
+            ))),
+            other => Err(Error::Protocol(format!(
+                "agent 对 modules 回了意外类型：{other:?}"
+            ))),
+        }
+    }
     fn describe(&self) -> String {
         format!("agent 链路（{}）", self.client.transport_description())
     }
@@ -213,6 +228,37 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("MemRead"), "错误信息要点出缺哪个能力：{text}");
         println!("✓ 客户端闸门先拦住：{text}");
+    }
+
+    #[test]
+    fn list_modules_passes_through_the_skip_count() {
+        // skipped 必须原样带出来：它是"这份列表可能不完整"的唯一线索。
+        let mut link = link_with(AgentResponse::Modules {
+            modules: vec![ModuleInfo {
+                name: "TARGET.exe".into(),
+                base: 0x1_4000_0000,
+                size: 0x2000,
+                entry_point: 0x1_4000_1000,
+            }],
+            skipped: 3,
+        });
+        let (modules, skipped) = link.list_modules().expect("应当成功");
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].base, 0x1_4000_0000);
+        assert_eq!(skipped, 3, "跳过计数不能被吞掉");
+    }
+
+    #[test]
+    fn list_modules_maps_agent_error_to_target_unavailable() {
+        let mut link = link_with(AgentResponse::Error {
+            code: "not_supported".into(),
+            message: "modules: 当前平台没有 PEB".into(),
+        });
+        let error = link.list_modules().expect_err("agent 报错时不该成功");
+        assert!(
+            error.to_string().contains("当前平台没有 PEB"),
+            "实际: {error}"
+        );
     }
 
     #[test]

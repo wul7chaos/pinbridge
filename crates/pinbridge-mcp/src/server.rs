@@ -409,6 +409,41 @@ impl McpServer {
                     granted.iter().map(Capability::name).collect::<Vec<_>>()
                 ))
             }
+            "pb_modules" => {
+                let session = self.session_arg(args)?;
+                let (modules, skipped) = self
+                    .hub
+                    .list_modules(&self.actor.clone(), session)
+                    .map_err(describe)?;
+                if modules.is_empty() {
+                    // 空列表是有含义的（"一个模块都没有"）。但更常见的原因是
+                    // 链路到了却拿不到加载器链——这时必须让调用方看见 skipped
+                    // 与这条提示，而不是把空列表当成结论。
+                    return Ok(format!(
+                        "没有列出任何模块（跳过 {skipped} 个条目）。\
+                         目标可能尚未完成加载，或加载器链不可读；\
+                         不要据此认为目标没有加载模块。"
+                    ));
+                }
+                let mut text = String::from("模块（加载顺序，基址 + 大小）：\n");
+                for module in &modules {
+                    text.push_str(&format!(
+                        "  {:#018x} +{:#010x}  {}\n",
+                        module.base,
+                        u64::from(module.size),
+                        module.name
+                    ));
+                }
+                if skipped != 0 {
+                    // 不完整必须说出来：这份列表是**快照**，
+                    // 加载器链正在被修改时会出现半初始化条目。
+                    text.push_str(&format!(
+                        "注意：跳过 {skipped} 个不合法条目，列表可能不完整\
+                         （快照读法不持 loader lock）。"
+                    ));
+                }
+                Ok(text)
+            }
             "pb_memory_read" => {
                 let session = self.session_arg(args)?;
                 let address = arg_u64(args, "address")?;
@@ -586,11 +621,60 @@ mod tests {
             Ok(out)
         }
 
+        fn list_modules(
+            &mut self,
+        ) -> pinbridge_core::error::Result<(Vec<pinbridge_proto::agent_link::ModuleInfo>, u32)>
+        {
+            Ok((
+                vec![pinbridge_proto::agent_link::ModuleInfo {
+                    name: "TARGET.exe".into(),
+                    base: 0x1_4000_0000,
+                    size: 0x2000,
+                    entry_point: 0x1_4000_1000,
+                }],
+                0,
+            ))
+        }
+
         fn describe(&self) -> String {
             "测试用假链路".into()
         }
     }
 
+    #[test]
+    fn modules_tool_prints_base_and_path_after_link_attach() {
+        let mut server = server();
+        call(
+            &mut server,
+            "initialize",
+            json!({"clientInfo": {"name": "alice"}}),
+        );
+        let human = Principal::human("operator");
+        let id = server
+            .hub
+            .create_session(&human, TargetSpec::launch("TARGET.exe", "x86_64"))
+            .expect("人类建会话应当成功");
+        server
+            .hub
+            .attach(&human, id, 4242, "TARGET.exe --demo")
+            .expect("附加应当成功");
+        server
+            .hub
+            .attach_link(&human, id, Box::new(FakeLink(vec![0x90])))
+            .expect("挂链路应当成功");
+
+        let response = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_modules", "arguments": {"session": id.get()}}),
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("0x0000000140000000"), "应当带出基址：{text}");
+        assert!(text.contains("TARGET.exe"), "应当带出模块路径：{text}");
+        println!("✓ 模块列表：{}", text.replace('\n', " | "));
+    }
     #[test]
     fn memory_read_returns_hex_once_a_link_is_attached() {
         let mut server = server();

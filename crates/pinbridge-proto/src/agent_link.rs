@@ -46,6 +46,12 @@ pub enum AgentRequest {
         /// hex 字节。
         hex_bytes: String,
     },
+    /// 枚举目标进程已加载的模块。
+    ///
+    /// 为什么需要它：断点地址是"模块基址 + RVA"，而基址每次运行都不同。
+    /// 让 AI 自己去猜基址等于让它猜；把它作为一等请求发出去，
+    /// 上层就能拿到一份**带可信度标注**的列表（见 agent 侧的 `ModuleSnapshot`）。
+    Modules {},
     /// 读寄存器。
     ReadRegisters {
         /// 线程 ID。
@@ -127,6 +133,7 @@ impl AgentRequest {
             Self::Ping { .. }
             | Self::ReadMemory { .. }
             | Self::ReadRegisters { .. }
+            | Self::Modules { .. }
             | Self::DrainEvents { .. } => Capability::MemRead,
             Self::WriteMemory { .. } => Capability::MemWrite,
             Self::SetBreakpoint { .. } | Self::ClearBreakpoint { .. } => Capability::Breakpoint,
@@ -145,6 +152,7 @@ impl AgentRequest {
             Self::ReadMemory { .. } => "read_memory",
             Self::WriteMemory { .. } => "write_memory",
             Self::ReadRegisters { .. } => "read_registers",
+            Self::Modules { .. } => "modules",
             Self::SetBreakpoint { .. } => "set_breakpoint",
             Self::ClearBreakpoint { .. } => "clear_breakpoint",
             Self::SingleStep { .. } => "single_step",
@@ -158,6 +166,23 @@ impl AgentRequest {
             Self::StopTrace => "stop_trace",
         }
     }
+}
+
+/// 一个已加载模块。
+///
+/// 字段刻意只有四项：名字、基址、映像大小、入口点。
+/// 想要节表、导入表、版本信息的东西应当去读模块本体（`read_memory`），
+/// 而不是让这条列表接口无限膨胀——它是给"换算地址"用的，不是给"分析模块"用的。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleInfo {
+    /// 完整路径（加载器给的 `FullDllName`）。
+    pub name: String,
+    /// 映像基址。
+    pub base: u64,
+    /// 映像大小（字节）。
+    pub size: u32,
+    /// 入口点地址（可能为 0，例如某些纯资源模块）。
+    pub entry_point: u64,
 }
 
 /// agent 返回的响应。
@@ -179,6 +204,13 @@ pub enum AgentResponse {
         address: u64,
         /// hex 字节。
         hex_bytes: String,
+    },
+    /// 模块列表。
+    Modules {
+        /// 模块。
+        modules: Vec<ModuleInfo>,
+        /// 因为条目不合法而跳过的数量（加载器链可能正在被修改）。
+        skipped: u32,
     },
     /// 寄存器内容。
     Registers {

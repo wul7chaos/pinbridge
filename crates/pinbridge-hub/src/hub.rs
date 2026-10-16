@@ -727,6 +727,37 @@ impl HubService {
         }
         Ok(bytes)
     }
+    /// 列出目标进程已加载的模块。
+    ///
+    /// 校验顺序与 [`Self::read_memory`] 一致（参数 → 能力 → 状态 → 链路），
+    /// 不重复判断链路是否为空是为了让两个入口的错误信息保持同一套说法。
+    ///
+    /// # Errors
+    ///
+    /// - `CapabilityDenied`：没有 `mem_read`（列模块是只读操作，走同一档能力）；
+    /// - `TargetUnavailable`：会话不存在、已终结、或没有挂链路。
+    pub fn list_modules(
+        &mut self,
+        actor: &Principal,
+        session: SessionId,
+    ) -> Result<(Vec<pinbridge_proto::agent_link::ModuleInfo>, u32)> {
+        self.ensure(actor, Capability::MemRead)?;
+        let Some(entry) = self.sessions.get_mut(&session.get()) else {
+            return Err(Error::TargetUnavailable(format!("会话 {session} 不存在")));
+        };
+        if !entry.session.state.accepts_control() {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 状态 {:?} 不接受列模块请求",
+                entry.session.state
+            )));
+        }
+        let Some(link) = entry.link.as_mut() else {
+            return Err(Error::TargetUnavailable(format!(
+                "会话 {session} 没有挂载到目标端的链路（列模块需要先 attach_link）"
+            )));
+        };
+        link.list_modules()
+    }
     // ---------------------------------------------------------------- 轨迹
 
     /// 开始录制，返回 `.pbt` 路径。
@@ -943,6 +974,18 @@ mod tests {
             Ok(out)
         }
 
+        fn list_modules(&mut self) -> Result<(Vec<pinbridge_proto::agent_link::ModuleInfo>, u32)> {
+            Ok((
+                vec![pinbridge_proto::agent_link::ModuleInfo {
+                    name: "TARGET.exe".into(),
+                    base: 0x1_4000_0000,
+                    size: 0x1000,
+                    entry_point: 0x1_4000_1000,
+                }],
+                0,
+            ))
+        }
+
         fn describe(&self) -> String {
             "测试用假链路".into()
         }
@@ -955,6 +998,10 @@ mod tests {
     impl crate::link::TargetLink for ShortLink {
         fn read_memory(&mut self, _address: u64, _length: u32) -> Result<Vec<u8>> {
             Ok(vec![0x90])
+        }
+
+        fn list_modules(&mut self) -> Result<(Vec<pinbridge_proto::agent_link::ModuleInfo>, u32)> {
+            Ok((Vec::new(), 0))
         }
 
         fn describe(&self) -> String {
