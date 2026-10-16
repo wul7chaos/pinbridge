@@ -12,12 +12,30 @@
 //
 // 靶子一律自写：不拿系统二进制或外部样本。否则一次"测试失败"会同时包含
 // "我们的工具坏了"与"那个二进制有反制"，两者必须能分开归因。
+//
+//   --agent-check <agent.dll> [<script.py>]
+//                 在**进程内**直接驱动 agent：加载 DLL → 设能力 → 加载脚本
+//                 → 推一条系统调用事件 → 取事件（脚本应当产出 script_output）
+//                 → 下断点 → 触发 → 取事件（应当产出 breakpoint_hit）
+//                 → 打印一行 `PB_AGENT_CHECK ...` 供 ctest 断言。
+//
+//                 这条模式把 roadmap 里"真实内存读写/断点/脚本在目标内跑通"
+//                 从**手工验证清单**变成一条机器可判定的用例：整个进程是
+//                 **被 Pin 插装着**跑的，所以验证的是"在真实插装环境里 agent
+//                 仍然工作"，而不只是"agent 单独跑得通"。
+//
+//                 没装 Python 时打印 `PB_AGENT_CHECK SKIP no-python` 并以 77 退出
+//                 （ctest 侧按 SKIP_RETURN_CODE 处理）：**跳过要说清原因**，
+//                 不能和"实现坏了"混成一个失败。
 
 #include <cstdio>
 #include <cstdlib>
 #include <intrin.h>
 #include <windows.h>
 #include <cstring>
+#include <string>
+
+#include "pinbridge.h"
 
 #ifdef _WIN32
 // 只声明用到的两个 Win32 入口，不引入 windows.h：
@@ -148,6 +166,196 @@ __declspec(noinline) unsigned long tf_experiment(unsigned long iterations,
   return reads_with_tf;
 }
 
+// ---------------------------------------------------------------- agent 检查
+//
+// 在被插装的进程里直接驱动 agent。刻意用**运行期加载 + 取符号**而不是链接导入库：
+// 靶子必须在"没有 agent DLL"的环境里也能编出来、跑起来（否则这条用例会把
+// 构建配置本身变成前提）。也没链接任何 Rust 侧静态库——跨语言边界只过 C ABI。
+
+struct AgentApi {
+  HMODULE dll = nullptr;
+  int32_t(__cdecl* attach)(uint32_t) = nullptr;
+  int32_t(__cdecl* set_caps)(uint32_t) = nullptr;
+  int32_t(__cdecl* load_script)(const char*, const char*) = nullptr;
+  uint64_t(__cdecl* allocate_sequence)() = nullptr;
+  int32_t(__cdecl* push_event)(const pb_event_raw*) = nullptr;
+  int32_t(__cdecl* drain_events)(pb_event_raw*, uint32_t, uint32_t*) = nullptr;
+  int32_t(__cdecl* memory_read)(uint64_t, uint32_t, uint8_t*, uint32_t, uint32_t*) = nullptr;
+  int32_t(__cdecl* memory_write)(uint64_t, const uint8_t*, uint32_t) = nullptr;
+  int32_t(__cdecl* set_breakpoint)(uint64_t) = nullptr;
+  int32_t(__cdecl* clear_breakpoint)(uint64_t) = nullptr;
+  const char* (__cdecl* last_error)() = nullptr;
+};
+
+/// 取一个导出符号；缺失时打印**是哪个**并返回 false。
+template <typename T>
+bool resolve(HMODULE dll, const char* name, T* out) {
+  *out = reinterpret_cast<T>(GetProcAddress(dll, name));
+  if (*out == nullptr) {
+    std::printf("PB_AGENT_CHECK FAIL missing-export %s\n", name);
+    return false;
+  }
+  return true;
+}
+
+/// 会被下断点的函数（`--agent-check` 用）。
+/// `volatile` 让编译器不能把它优化成常量返回，否则"这个函数的第一个字节"就不存在了。
+volatile int g_agent_check_sink = 0;
+int __declspec(noinline) agent_check_target(int value) {
+  g_agent_check_sink = value * 3 + 1;
+  return g_agent_check_sink;
+}
+
+int agent_check(const char* dll_path, const char* script_path) {
+  AgentApi api;
+  api.dll = LoadLibraryA(dll_path);
+  if (api.dll == nullptr) {
+    std::printf("PB_AGENT_CHECK FAIL load-agent %s\n", dll_path);
+    return 1;
+  }
+  if (!resolve(api.dll, "pb_attach", &api.attach) ||
+      !resolve(api.dll, "pb_set_capabilities", &api.set_caps) ||
+      !resolve(api.dll, "pb_load_script", &api.load_script) ||
+      !resolve(api.dll, "pb_allocate_sequence", &api.allocate_sequence) ||
+      !resolve(api.dll, "pb_push_event", &api.push_event) ||
+      !resolve(api.dll, "pb_drain_events", &api.drain_events) ||
+      !resolve(api.dll, "pb_memory_read", &api.memory_read) ||
+      !resolve(api.dll, "pb_memory_write", &api.memory_write) ||
+      !resolve(api.dll, "pb_set_breakpoint", &api.set_breakpoint) ||
+      !resolve(api.dll, "pb_clear_breakpoint", &api.clear_breakpoint) ||
+      !resolve(api.dll, "pb_last_error", &api.last_error)) {
+    return 1;
+  }
+
+  // 1) 附加 + 给足能力（`0xFFF` = 12 位全开，见 capability.rs）
+  if (api.attach(GetCurrentProcessId()) != PB_STATUS_OK) {
+    std::printf("PB_AGENT_CHECK FAIL attach %s\n", api.last_error());
+    return 1;
+  }
+  if (api.set_caps(0xFFFu) != PB_STATUS_OK) {
+    std::printf("PB_AGENT_CHECK FAIL set-caps %s\n", api.last_error());
+    return 1;
+  }
+
+  // 2) 加载脚本。没有 Python 的环境要给**明确的跳过**，不是失败。
+  std::FILE* file = std::fopen(script_path, "rb");
+  if (file == nullptr) {
+    std::printf("PB_AGENT_CHECK FAIL open-script %s\n", script_path);
+    return 1;
+  }
+  std::fseek(file, 0, SEEK_END);
+  const long size = std::ftell(file);
+  std::fseek(file, 0, SEEK_SET);
+  std::string source;
+  source.resize(static_cast<size_t>(size));
+  if (size > 0) {
+    std::fread(&source[0], 1, static_cast<size_t>(size), file);
+  }
+  std::fclose(file);
+
+  const int32_t loaded = api.load_script("agent-check", source.c_str());
+  if (loaded == PB_STATUS_NOT_SUPPORTED) {
+    // 原因必须带出来：跳过与"实现坏了"是两件事。
+    std::printf("PB_AGENT_CHECK SKIP no-python %s\n", api.last_error());
+    return 77;
+  }
+  if (loaded != PB_STATUS_OK) {
+    std::printf("PB_AGENT_CHECK FAIL load-script %s\n", api.last_error());
+    return 1;
+  }
+
+  // 3) 推一条系统调用进入事件；脚本应当把它变成一条 script_output
+  pb_event_raw event = {};
+  event.sequence = api.allocate_sequence();
+  event.kind = PB_EV_SYSCALL_ENTER;
+  event.thread_id = GetCurrentThreadId();
+  event.address = 0x1000;
+  event.args[0] = 0x50;  // 约定的系统调用号
+  if (api.push_event(&event) != PB_STATUS_OK) {
+    std::printf("PB_AGENT_CHECK FAIL push %s\n", api.last_error());
+    return 1;
+  }
+
+  // 4) 真实内存读写：写进去、读回来、逐字节核对。
+  //    在插装环境里做这一步是有意义的——它与"我们的内存读走到了
+  //    ReadProcessMemory、而不是解引用"是同一件事的验证。
+  unsigned memory_round_trip = 0;
+  {
+    static const unsigned char kMagic[8] = {0x50, 0x42, 0x4D, 0x45, 0x4D, 0x58,
+                                            0x59, 0x5A};  // "PBMEMXYZ"
+    static unsigned char buffer[16] = {};
+    const uint64_t address = reinterpret_cast<uint64_t>(buffer);
+    if (api.memory_write(address, kMagic, sizeof(kMagic)) != PB_STATUS_OK) {
+      std::printf("PB_AGENT_CHECK FAIL memory-write %s\n", api.last_error());
+      return 1;
+    }
+    unsigned char read_back[8] = {};
+    uint32_t written = 0;
+    if (api.memory_read(address, sizeof(read_back), read_back, sizeof(read_back),
+                        &written) != PB_STATUS_OK) {
+      std::printf("PB_AGENT_CHECK FAIL memory-read %s\n", api.last_error());
+      return 1;
+    }
+    if (written != sizeof(read_back) || std::memcmp(read_back, kMagic, sizeof(kMagic)) != 0) {
+      std::printf("PB_AGENT_CHECK FAIL memory-mismatch written=%u\n", written);
+      return 1;
+    }
+    memory_round_trip = 1;
+  }
+
+  // 5) 下断点 → 触发 → 应当产出 breakpoint_hit
+  const uint64_t target =
+      reinterpret_cast<uint64_t>(reinterpret_cast<void*>(&agent_check_target));
+  if (api.set_breakpoint(target) != PB_STATUS_OK) {
+    std::printf("PB_AGENT_CHECK FAIL set-breakpoint %s\n", api.last_error());
+    return 1;
+  }
+  const int value = agent_check_target(7);
+  if (value != 22) {
+    // 命中之后函数**必须仍然正常执行完**（原字节要写回去）。
+    std::printf("PB_AGENT_CHECK FAIL target-after-hit value=%d\n", value);
+    return 1;
+  }
+
+  // 6) 取事件，统计两类派生事件
+  unsigned script_outputs = 0;
+  unsigned breakpoint_hits = 0;
+  unsigned script_marked_ssn = 0;
+  for (int round = 0; round < 8; ++round) {
+    pb_event_raw batch[32];
+    uint32_t written = 0;
+    if (api.drain_events(batch, 32, &written) != PB_STATUS_OK) {
+      std::printf("PB_AGENT_CHECK FAIL drain %s\n", api.last_error());
+      return 1;
+    }
+    for (uint32_t i = 0; i < written; ++i) {
+      if (batch[i].kind == PB_EV_SCRIPT_OUTPUT) {
+        ++script_outputs;
+        // 脚本用 `pb.mark("seen", ev.args[0])` 报回来的值：类别 2 = mark
+        if (batch[i].args[0] == 2 && batch[i].args[1] == 0x50) {
+          ++script_marked_ssn;
+        }
+      } else if (batch[i].kind == PB_EV_BREAKPOINT_HIT && batch[i].address == target) {
+        ++breakpoint_hits;
+      }
+    }
+    if (written == 0) {
+      break;
+    }
+  }
+  api.clear_breakpoint(target);
+
+  // 一行摘要，供 ctest 用正则断言。数字都打印出来，失败时不用再猜。
+  std::printf(
+      "PB_AGENT_CHECK script_output=%u ssn_mark=%u breakpoint_hit=%u memory=%u target_value=%d\n",
+      script_outputs, script_marked_ssn, breakpoint_hits, memory_round_trip, value);
+  if (script_outputs == 0 || script_marked_ssn == 0 || breakpoint_hits == 0 ||
+      memory_round_trip == 0) {
+    std::printf("PB_AGENT_CHECK FAIL incomplete\n");
+    return 1;
+  }
+  return 0;
+}
 /// 把缓冲区地址打印出来：脚本据此构造 `-pb_mem_range`。
 void print_touch_buffer() {
   std::printf("PB_TOUCH_BUFFER=0x%p size=0x%lX\n",
@@ -163,6 +371,8 @@ int main(int argc, char** argv) {
   unsigned long pattern_hits = 0;
   unsigned long tf_sets = 0;
   bool print_buffer = false;
+  const char* agent_dll = nullptr;
+  const char* agent_script = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--syscalls") == 0 && i + 1 < argc) {
       syscalls = std::strtoul(argv[++i], nullptr, 10);
@@ -176,9 +386,15 @@ int main(int argc, char** argv) {
       tf_sets = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--print-buffer") == 0) {
       print_buffer = true;
+    } else if (std::strcmp(argv[i], "--agent-check") == 0 && i + 2 < argc) {
+      agent_dll = argv[++i];
+      agent_script = argv[++i];
     }
   }
 
+  if (agent_dll != nullptr) {
+    return agent_check(agent_dll, agent_script);
+  }
   if (syscalls != 0) {
     syscall_loop(syscalls);
   }

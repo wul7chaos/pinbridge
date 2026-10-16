@@ -1,4 +1,30 @@
 # 测试策略
+## 已自动化：被插装进程内的 agent 端到端
+
+```
+pwsh scripts/build-native.ps1 -WithPin -RequireAgent
+ctest --test-dir native/build-pin -R pin_tool_agent_end_to_end -V
+```
+
+期望看到：
+
+```
+PB_AGENT_CHECK script_output=1 ssn_mark=1 breakpoint_hit=1 memory=1 target_value=22
+```
+
+这条用例在**被 Pin 插装着的进程**里做四件事（`native/tests/sample_target.cpp`
+的 `--agent-check` 模式）：加载 agent DLL → 加载 `native/tests/agent_check_script.py`
+→ 推一条系统调用事件（脚本应当把 SSN 报回来）→ 下断点并触发（函数命中后仍要
+正常返回 22）→ 真实内存写入后读回核对。
+
+没装 Python 时打印 `PB_AGENT_CHECK SKIP no-python` 并以 77 退出
+（ctest 的 `SKIP_RETURN_CODE`）：**跳过要说清原因**，不能和"实现坏了"混成一个失败。
+
+### 仍未自动化（手工清单）
+
+* 单步 / 继续 / 暂停——语义尚未落地，见 [design/script-runtime.md](../design/script-runtime.md)；
+* `pb_registers`——真实实现属于 Pin 工具侧（agent 拿不到别的线程上下文）。
+
 
 ## 我们的测试在防什么
 

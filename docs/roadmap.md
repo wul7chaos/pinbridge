@@ -116,12 +116,13 @@
 
 | 验收标准 | 判据 |
 |----------|------|
-| `pin -t pinbridge.dll -- TARGET.exe` 能跑起来并产出事件 | 手工验证 |
+| ~~`pin -t pinbridge.dll -- TARGET.exe` 能跑起来并产出事件~~ | ✅ 自动化：`ctest -R pin_tool_*`（入口探针 / 系统调用 / 内存访问 / 模板命中 / TF 三档） |
 | 一段脚本能被加载、被回调、产生 `script_output` 事件 | 用例 |
 | 尝试 `import os` 被拒且留下审计 | 用例 |
 | ~~死循环脚本在预算内被终止，目标仍可继续~~ | ✅ 用例（`a_dead_loop_script_is_stopped_inside_its_budget_and_the_target_keeps_working`） |
 | ~~尝试 `import os` 被拒且留下审计~~ | ✅ 用例（拒绝与超时都写 `.pbt` 的 AUDIT 块） |
-| 真实内存读写/断点/单步/继续/暂停 | 手工验证清单 |
+| ~~被插装进程内驱动 agent~~（脚本被事件驱动、断点命中、内存读写） | ✅ 自动化：`ctest -R pin_tool_agent_end_to_end`，断言摘要行 `PB_AGENT_CHECK script_output=1 ssn_mark=1 breakpoint_hit=1 memory=1` |
+| 单步 / 继续 / 暂停 | ⏳ 仍未落地（语义先定清楚，不做"看起来像调试器"的假实现） |
 
 **M1 的关键风险**：
 

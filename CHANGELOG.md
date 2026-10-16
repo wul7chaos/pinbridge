@@ -41,6 +41,26 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（M1 端到端：被 Pin 插装的进程里驱动 agent —— 手工清单变机器可判定）
+- 新增 ctest 用例 `pin_tool_agent_end_to_end`：`pin.exe -t pinbridge.dll --
+  pb_sample_target.exe --agent-check <agent.dll> <script.py>`，断言一行摘要：
+  `PB_AGENT_CHECK script_output=1 ssn_mark=1 breakpoint_hit=1 memory=1 target_value=22`。
+- 这条用例在**被插装着的目标进程**里做四件事，全部通过 C ABI（运行期
+  `LoadLibraryA` + `GetProcAddress`，靶子**不链接**任何 Rust 侧库，于是在
+  "没有 agent DLL"的环境里也能编出来、跑起来）：
+  1. 加载 agent、附加、给足能力（`0xFFF`）；
+  2. 加载 `native/tests/agent_check_script.py`，推一条 `syscall_enter` 事件——
+     脚本必须把事件里的 SSN（`0x50`）用 `pb.mark` 报回来；
+  3. 下软件断点并触发它——命中之后**函数仍要正常返回 22**（原字节写回去了）；
+  4. 真实内存写入后读回并逐字节核对。
+- 没装 Python 时打印 `PB_AGENT_CHECK SKIP no-python <原因>` 并以 77 退出
+  （`SKIP_RETURN_CODE`）：**跳过要说清原因**，不能和"实现坏了"混成一个失败。
+- roadmap 的两条验收从"手工验证"改为自动化：`pin -t … 能跑起来并产出事件`
+  （已由 `ctest -R pin_tool_*` 覆盖）与被插装进程内的内存读写/断点/脚本驱动。
+  仍未自动化的只剩**单步/继续/暂停**（语义未落地）与 `pb_registers`（属于 Pin 工具侧）。
+- 踩到的坑记一笔：第一版脚本**忘了 `import pb`**（`pb` 是 agent 注入到
+  `sys.modules` 的模块）。靶子把 CPython 的堆栈原样打了出来，所以一眼能看出是
+  脚本的问题而不是工具的问题——这也是"错误必须带原文"这条约定的价值。
 ### 新增（M1：`pb.defer` 与 `pb.snapshot` —— 脚本面最后两个能力）
 - **`pb.defer`**：回调里只排队，宿主在**回调返回之后**执行。规则来自 M1 的风险清单：
   回调跑在目标线程上、必须极快返回，在里面做重活会拖慢目标，而"目标变慢了"与

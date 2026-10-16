@@ -256,8 +256,27 @@ if(BUILD_TESTING)
     # 无法解释的失败（"平台不适用"与"实现坏了"必须能区分）。
     if(PINBRIDGE_WITH_PIN AND EXISTS "${PIN_ROOT}/pin.exe")
       add_executable(pb_sample_target tests/sample_target.cpp)
+      # 靶子要读 ABI 头（`--agent-check` 模式用），但**不链接**任何 Rust 侧库：
+      # 它在运行期 `LoadLibraryA` + `GetProcAddress`，于是在"没有 agent DLL"的
+      # 环境里也能编出来、跑起来。
+      target_include_directories(pb_sample_target PRIVATE include)
       set_target_properties(pb_sample_target PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+      # 端到端：**被 Pin 插装**的进程里驱动 agent —— 脚本被事件驱动、断点命中、
+      # 内存读可用。这条把 roadmap 的"手工验证清单"变成机器可判定的用例。
+      add_test(NAME pin_tool_agent_end_to_end
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_syscalls 1
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --agent-check
+                "${PINBRIDGE_AGENT_DLL}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_check_script.py")
+      set_tests_properties(pin_tool_agent_end_to_end PROPERTIES
+        PASS_REGULAR_EXPRESSION "PB_AGENT_CHECK script_output=[1-9][0-9]* ssn_mark=[1-9][0-9]* breakpoint_hit=[1-9][0-9]* memory=1"
+        SKIP_RETURN_CODE 77)
 
       add_test(NAME pin_tool_instruments_a_target
         COMMAND "${PIN_ROOT}/pin.exe"
