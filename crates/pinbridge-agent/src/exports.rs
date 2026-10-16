@@ -1213,6 +1213,28 @@ pb.subscribe("syscall_enter", on_syscall)
         let byte = unsafe { std::ptr::read_volatile(address as *const u8) };
         assert_ne!(byte, 0xCC, "解除之后不能留下 int3");
     }
+    /// 把事件队列取空。
+    ///
+    /// 用例要断言"队列里**只有**什么"时必须先调它：队列是全进程共享的，
+    /// 前面用例推的事件还留在里面（附加不会清队列）。在 Windows 上本地跑
+    /// 恰好没留下残余，于是这条断言过了；Linux CI 上前一条用例多推了几条，
+    /// 断言就以"暂停期间的事件不该出现在队列里"的形式失败——**现场和原因
+    /// 完全无关**。要么断言"包含"，要么先把环境清干净。
+    fn drain_all_events() {
+        let mut guard = 0;
+        loop {
+            let mut buffer = [PbEventRaw::EMPTY; 64];
+            let mut written = 0u32;
+            // SAFETY: 缓冲区与计数都指向本栈变量
+            let code = unsafe { pb_drain_events(buffer.as_mut_ptr(), 64, &mut written) };
+            assert_eq!(code, Status::Ok.code(), "取事件失败");
+            if written == 0 {
+                return;
+            }
+            guard += 1;
+            assert!(guard < 1024, "队列一直取不空，说明有东西在往里推");
+        }
+    }
     /// 暂停/继续的语义：事件被**计数后跳过**，状态变化自己留痕。
     #[test]
     fn pause_stops_collection_counts_it_and_continue_resumes() {
@@ -1220,7 +1242,6 @@ pb.subscribe("syscall_enter", on_syscall)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(pb_attach(1), Status::Ok.code());
-
         // 1) 能力闸门
         assert_eq!(
             pb_set_capabilities(Capability::MemRead.bit()),
@@ -1233,8 +1254,10 @@ pb.subscribe("syscall_enter", on_syscall)
         );
         assert_eq!(pb_set_capabilities(0xFFF), Status::Ok.code());
 
-        // 从"非暂停"开始（别的用例可能留下状态）
+        // 从"非暂停"开始（别的用例可能留下状态），并把队列取空：
+        // 下面的断言是"队列里**只有**状态变化事件"，前提是队列原本是空的。
         let _ = pb_continue();
+        drain_all_events();
         let baseline = pb_stats(3);
         assert_eq!(pb_stats(4), 0, "此时应当是采集状态");
 
@@ -1267,7 +1290,8 @@ pb.subscribe("syscall_enter", on_syscall)
             .collect();
         let pushes: Vec<&PbEventRaw> = buffer[..written as usize]
             .iter()
-            .filter(|raw| raw.kind == EventKind::SyscallEnter.code())
+            // 只看我们推的那三条（address 0..2）：即使有残余也不误判
+            .filter(|raw| raw.kind == EventKind::SyscallEnter.code() && raw.address < 3)
             .collect();
         assert!(pushes.is_empty(), "暂停期间的事件不该出现在队列里");
         assert_eq!(states.len(), 1, "暂停这件事本身要留下一条状态变化事件");
