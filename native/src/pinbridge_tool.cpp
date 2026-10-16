@@ -96,6 +96,9 @@ struct BridgeApi {
   INT32 (*set_capabilities)(UINT32) = nullptr;
   INT32 (*allocate_sequence)() = nullptr;
   INT32 (*push_event)(const PbEventRaw*) = nullptr;
+  /// 交线程的寄存器快照。**可选**符号：旧版转发层没有它只是拿不到寄存器，
+  /// 不该让整个采集起不来（见 agent_bridge.cpp 里的同名说明）。
+  INT32 (*set_thread_registers)(UINT32, const UINT64*, UINT32) = nullptr;
   INT32 (*drain_events)(PbEventRaw*, UINT32, UINT32*) = nullptr;
   INT32 (*start_trace)(const char*, UINT32) = nullptr;
   INT32 (*stop_trace)(UINT64*, UINT64*) = nullptr;
@@ -277,6 +280,9 @@ bool load_bridge() {
   g_api.set_capabilities = resolve<INT32 (*)(UINT32)>(module, "pb_set_capabilities");
   g_api.allocate_sequence = resolve<INT32 (*)()>(module, "pb_allocate_sequence");
   g_api.push_event = resolve<INT32 (*)(const PbEventRaw*)>(module, "pb_push_event");
+  // 可选符号：解析失败只是"拿不到寄存器"，不算导出面不全（不参与下面的检查）。
+  g_api.set_thread_registers =
+      resolve<INT32 (*)(UINT32, const UINT64*, UINT32)>(module, "pb_set_thread_registers");
   g_api.drain_events = resolve<INT32 (*)(PbEventRaw*, UINT32, UINT32*)>(module, "pb_drain_events");
   g_api.start_trace = resolve<INT32 (*)(const char*, UINT32)>(module, "pb_start_trace");
   g_api.stop_trace = resolve<INT32 (*)(UINT64*, UINT64*)>(module, "pb_stop_trace");
@@ -324,6 +330,18 @@ void pin_loaded_modules() {
 // ══════════════════════════════════════════════════════════════════ 探针
 volatile bool g_entry_hit = false;
 ADDRINT g_entry_address = 0;
+
+/// 最近一次抓到的寄存器快照，以及它属于哪条线程。
+///
+/// 为什么放在文件级的这一片（而不是 `ThreadStats` 里）：入口探针就在下面几十行，
+/// 那时 `ThreadStats` 还是**不完整类型**（它的定义在几百行之后），只能声明指针、
+/// 不能解引用成员——硬写会得到 `C2027: 使用了未定义类型`。
+///
+/// 消费者（`flush_ring`）只在**线程号对得上**时才用它：对不上就是别条线程的快照，
+/// 张冠李戴比"没有"更糟。
+UINT64 g_last_registers[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+UINT32 g_last_registers_thread = 0;
+volatile bool g_last_registers_valid = false;
 
 
 // 系统调用探针的开关、上限与观测计数（定义见下方"系统调用探针"一节）
@@ -389,12 +407,38 @@ bool is_syscall_return(ADDRINT address) {
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
 /// 转发层 → agent → 事件队列 → 轨迹文件 → Hub 侧加载器。
-void OnEntryPointHit(THREADID thread_id, const CONTEXT* ctxt, ADDRINT address) {
-  (void)ctxt;
+///
+/// 参数与插桩点的 `IARG_` 顺序**必须逐一对齐**（见下面的 `INS_InsertCall`）。
+///
+/// 寄存器写在**文件级**的"最近一次快照"里，而不是直接写 `ThreadStats`：
+/// `ThreadStats` 的定义在文件下面（线程槽位那一片），在这里它还是**不完整类型**
+/// （只能声明指针，不能解引用成员）。硬要写它会得到 `C2027: 使用了未定义类型`。
+void OnEntryPointHit(THREADID thread_id, ADDRINT address, ADDRINT rsp, ADDRINT rax,
+                     ADDRINT rbx, ADDRINT rcx, ADDRINT rdx, ADDRINT rsi, ADDRINT rdi) {
   if (g_entry_hit) {
     return;
   }
   g_entry_hit = true;
+  // 寄存器快照，顺序与 `pinbridge_trace::REGISTER_NAMES` 一致：
+  // rip 在前（由 `IARG_INST_PTR` 取；`IARG_REG_VALUE` 不支持指令指针寄存器），
+  // 其余七个由 `IARG_REG_VALUE` 取。
+  //
+  // **顺序错了不会报错，只会读到错位的寄存器**——上一轮就是这么踩的：插桩点
+  // 已经按新顺序传了 9 个参数，回调签名还是旧的，于是 `address` 收到的是栈指针，
+  // 「入口点命中 0x…」打出来的是一个栈地址（编译通过、运行不崩）。
+  // 现在由两处钉住它：agent 侧的快照往返用例，以及这条端到端用例里
+  // 「RIP 必须落在本进程主模块内」的断言。
+  g_last_registers[0] = static_cast<UINT64>(address);
+  g_last_registers[1] = static_cast<UINT64>(rsp);
+  g_last_registers[2] = static_cast<UINT64>(rax);
+  g_last_registers[3] = static_cast<UINT64>(rbx);
+  g_last_registers[4] = static_cast<UINT64>(rcx);
+  g_last_registers[5] = static_cast<UINT64>(rdx);
+  g_last_registers[6] = static_cast<UINT64>(rsi);
+  g_last_registers[7] = static_cast<UINT64>(rdi);
+  g_last_registers_thread = static_cast<UINT32>(thread_id);
+  // 顺序不能反：先写数组与线程号，最后才置"有效"——冲刷线程可能在任何一刻读它。
+  g_last_registers_valid = true;
   PbEventRaw raw;
   std::memset(&raw, 0, sizeof(raw));
   raw.sequence = static_cast<UINT64>(g_api.allocate_sequence());
@@ -863,6 +907,13 @@ struct ThreadStats {
   bool in_hook;
   /// 本线程的事件暂存环。回调只写这里（见 push_probe_event）。
   EventRing ring;
+  /// 本线程**最近一次**探针命中时的寄存器快照，顺序与
+  /// `pinbridge_trace::REGISTER_NAMES` 一致（rip/rsp/rax/rbx/rcx/rdx/rsi/rdi）。
+  ///
+  /// 为什么是"最近一次"而不是逐事件保存：这是**每线程**的字段，回调直接写
+  /// （不分配、不加锁），冲刷线程读。语义与 agent 侧的存储完全一致。
+  /// 全零表示"还没有过有效快照"——交付前会判 `registers[0] != 0`。
+  UINT64 registers[8];
   /// 内存探针的计数。
   UINT64 mem_writes;
   UINT64 mem_reads;
@@ -901,6 +952,12 @@ volatile long g_syscall_captured = 0;
 volatile UINT64 g_flushed_total = 0;
 /// 跨边界推事件失败的次数（必须报出来，不允许静默丢弃）。
 volatile UINT64 g_push_failures = 0;
+/// 成功交给 agent 的寄存器快照次数。
+volatile UINT64 g_register_deliveries = 0;
+/// 交寄存器快照失败的次数（旧版转发层没有该符号时不算失败）。
+volatile UINT64 g_register_failures = 0;
+/// 因为"这份快照无效"（全零）而被跳过的次数。
+volatile UINT64 g_register_skipped = 0;
 bool g_syscall_instrumentation_removed = false;
 
 /// 达到上限后的**软停止**标志。
@@ -988,7 +1045,10 @@ void push_probe_event(ThreadStats* stats, UINT8 kind, THREADID tid, ADDRINT addr
 }
 
 /// 冲刷一个环。**只在内部线程或 Fini 里调用**（这两处可以安全跨边界）。
-UINT64 flush_ring(EventRing* ring) {
+///
+/// `stats` 是本环所属线程的统计块（寄存器快照就在里面）。溢出槽也走同一条路，
+/// 但它的 `registers` 永远是全零——见下面的交付判定。
+UINT64 flush_ring(EventRing* ring, const ThreadStats* stats) {
   UINT64 flushed = 0;
   while (ring->tail != ring->head) {
     const EventEntry& slot = ring->slots[ring->tail % kRingCapacity];
@@ -1009,6 +1069,34 @@ UINT64 flush_ring(EventRing* ring) {
       // 报日志是安全的，但为了不刷屏只累加，收尾统一报。
       ++g_push_failures;
     }
+    // 寄存器快照：交的是**该线程最近一次**命中的快照（回调直接写进 ThreadStats）。
+    //
+    // 只在 `registers[0] != 0` 时交付——**全零不是快照，是"没有"**：
+    // agent 侧是"每线程最近一次"的**覆盖式**存储，把零值交上去会把同一线程
+    // 先前那份好快照冲掉。实测过一次：工具报"交付 3419 次"，agent 里 5 条线程
+    // 全有快照，却全是 0。"有快照"与"快照有用"是两件事。
+    //
+    // RIP（顺序里的第一个）为 0 在真实执行流里不可能出现，拿它当有效判据。
+    //
+    // 快照来源：优先本线程 `stats->registers`；为空时退到文件级的"最近一次"，
+    // 但**必须线程号对得上**——对不上就是别条线程的快照，张冠李戴比没有更糟。
+    const UINT64* snapshot = nullptr;
+    if (stats->registers[0] != 0) {
+      snapshot = stats->registers;
+    } else if (g_last_registers_valid && g_last_registers_thread == slot.thread_id &&
+               g_last_registers[0] != 0) {
+      snapshot = g_last_registers;
+    }
+    if (g_api.set_thread_registers != nullptr && snapshot != nullptr) {
+      if (g_api.set_thread_registers(slot.thread_id, snapshot, 8) != PB_OK) {
+        // 失败也计数：静默丢弃会让调用方以为"从来没命中过"。
+        ++g_register_failures;
+      } else {
+        ++g_register_deliveries;
+      }
+    } else if (g_api.set_thread_registers != nullptr) {
+      ++g_register_skipped;
+    }
     ring->tail = ring->tail + 1;
     ++flushed;
   }
@@ -1019,9 +1107,9 @@ UINT64 flush_ring(EventRing* ring) {
 UINT64 flush_all_rings() {
   UINT64 flushed = 0;
   for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
-    flushed += flush_ring(&g_thread_slots[i].ring);
+    flushed += flush_ring(&g_thread_slots[i].ring, &g_thread_slots[i]);
   }
-  flushed += flush_ring(&g_overflow_slot.ring);
+  flushed += flush_ring(&g_overflow_slot.ring, &g_overflow_slot);
   return flushed;
 }
 
@@ -1314,8 +1402,15 @@ void OnInstruction(INS ins, VOID* v) {
 
   // ── 入口点探针（只关心主模块入口那一条指令）──
   if (!g_entry_hit && g_entry_address != 0 && address == g_entry_address) {
+    // 参数顺序与 `OnEntryPointHit` 的签名逐一对齐：tid、rip（`IARG_INST_PTR`）、
+    // 然后 rsp/rax/rbx/rcx/rdx/rsi/rdi（与 `REGISTER_NAMES` 同序）。
+    // 不用 `IARG_CONTEXT` + `PIN_GetContextReg`：那条路实测会 `RECEIVED_ACCESS_FAULT`。
     INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnEntryPointHit),
-                   IARG_THREAD_ID, IARG_CONTEXT, IARG_INST_PTR, IARG_END);
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_STACK_PTR,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_GAX, IARG_REG_VALUE, LEVEL_BASE::REG_GBX,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_GCX, IARG_REG_VALUE, LEVEL_BASE::REG_GDX,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_GSI, IARG_REG_VALUE, LEVEL_BASE::REG_GDI,
+                   IARG_END);
   }
 
   // ── 退出信号：入口函数的返回指令 ──
@@ -1692,6 +1787,14 @@ void OnFini(INT32 code, VOID* v) {
     ring_dropped += g_thread_slots[i].ring.dropped;
   }
   ring_dropped += g_overflow_slot.ring.dropped;
+  // 寄存器快照的账：**"没交上去"与"从来没命中过"是两件事**——
+  // 前者是缺陷，后者是事实。少了这一行，调用方问"为什么 pb_registers
+  // 读不到寄存器"时只能靠猜。
+  report("  寄存器快照：%s（交付 %llu 次，失败 %llu 次，跳过 %llu 次无效）",
+         g_api.set_thread_registers != nullptr ? "转发层支持" : "转发层没有该符号",
+         static_cast<unsigned long long>(g_register_deliveries),
+         static_cast<unsigned long long>(g_register_failures),
+         static_cast<unsigned long long>(g_register_skipped));
   report("  环形缓冲：已送出 %llu 条（含收尾兜底 %llu 条），溢出丢弃 %llu 条",
          static_cast<unsigned long long>(g_flushed_total + flushed_at_fini),
          static_cast<unsigned long long>(flushed_at_fini),

@@ -357,11 +357,9 @@ int agent_check(const char* dll_path, const char* script_path) {
 
   // 7) 寄存器快照：Pin 工具侧在探针命中时捕获，agent 存下来。
   //
-  //    这一步目前是**诊断**而不是断言：捕获段（工具侧）尚未接通，
-  //    `registers` 会是 0。把它当诊断打印出来的价值在于——**把最后一公里
-  //    量化**：一旦捕获接通，这一行的数字会自己变成非零，而"0 条快照"
-  //    与"快照全是零"在摘要里是两种不同的证据（见 docs/design/script-runtime.md）。
-  //    RIP 落在**本进程主模块**里才计数（只有真抓到才可能成立）。
+  //    断言的是"RIP 落在**本进程主模块**里"——这条只有**真抓到**才可能成立：
+  //    抓错线程、读到全零、或参数顺序错位（把 RSP 当 RIP）都会失败。
+  //    这正是上一轮挖出问题的那条断言，现在它从诊断升级成要求。
   unsigned registers_ok = 0;
   uint64_t first_rip = 0;
   {
@@ -372,13 +370,13 @@ int agent_check(const char* dll_path, const char* script_path) {
       return 1;
     }
     const uintptr_t module = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
-    // 诊断：直接问 thread 0（Pin 的入口探针就在这条线程上）并打印 agent 的说法
-    {
+    // 一条都没有时把 agent 的说法打出来：**"没捕获到"与"读的方式不对"
+    // 是两件事**，而只有 agent 知道是哪种。
+    if (thread_count == 0) {
       uint64_t probe[8] = {};
       uint32_t probe_written = 0;
       const int32_t code = api.read_registers(0, probe, 8, &probe_written);
-      std::printf("PB_AGENT_CHECK DIAG thread_count=%u read0=%d rip0=0x%llX err=%s\n",
-                  thread_count, code, static_cast<unsigned long long>(probe[0]),
+      std::printf("PB_AGENT_CHECK DIAG thread_count=0 read0=%d err=%s\n", code,
                   code == PB_STATUS_OK ? "" : api.last_error());
     }
     for (uint32_t i = 0; i < thread_count; ++i) {
@@ -408,7 +406,7 @@ int agent_check(const char* dll_path, const char* script_path) {
       script_outputs, script_marked_ssn, breakpoint_hits, memory_round_trip, registers_ok,
       static_cast<unsigned long long>(first_rip), value);
   if (script_outputs == 0 || script_marked_ssn == 0 || breakpoint_hits == 0 ||
-      memory_round_trip == 0) {
+      memory_round_trip == 0 || registers_ok == 0) {
     std::printf("PB_AGENT_CHECK FAIL incomplete\n");
     return 1;
   }

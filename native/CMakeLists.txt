@@ -280,7 +280,7 @@ if(BUILD_TESTING)
       # 快照，靶子这边读到 0 条"——这条用例的寄存器断言把这个缺陷挖了出来。
       set_tests_properties(pin_tool_agent_end_to_end PROPERTIES
         ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}"
-        PASS_REGULAR_EXPRESSION "PB_AGENT_CHECK script_output=[1-9][0-9]* ssn_mark=[1-9][0-9]* breakpoint_hit=[1-9][0-9]* memory=1"
+        PASS_REGULAR_EXPRESSION "PB_AGENT_CHECK script_output=[1-9][0-9]* ssn_mark=[1-9][0-9]* breakpoint_hit=[1-9][0-9]* memory=1 registers=[1-9][0-9]* rip=0x[1-9A-Fa-f]"
         SKIP_RETURN_CODE 77)
 
       add_test(NAME pin_tool_instruments_a_target

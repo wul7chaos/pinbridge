@@ -161,7 +161,10 @@ if (Test-Path $cacheFile) {
     & $cmake @configArgs 2>&1 | Select-String -Pattern 'agent DLL|WARNING|Error|error' | Select-Object -First 5
 
     Info '构建中…'
-    & $cmake --build $BuildDir 2>&1 | Select-String -Pattern 'error|FAILED|Linking' | Select-Object -Last 6
+    # 错误要显示**开头**而不是结尾：编译器会把一个真实错误级联成上百条，
+    # -Last 6 看到的是级联的尾巴（例如"stats 未声明"），而真正的错处
+    # （少一个类型声明）在上面。实测被这一点耽误过一整轮。
+    & $cmake --build $BuildDir 2>&1 | Select-String -Pattern 'error|FAILED|Linking' | Select-Object -First 8
     if ($LASTEXITCODE -ne 0) { Die "cmake --build 失败（exit=$LASTEXITCODE）" }
     Ok "产物目录：$BuildDir"
 

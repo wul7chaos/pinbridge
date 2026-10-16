@@ -136,7 +136,60 @@ Hub / MCP `pb_registers`                            问
 
 三段里已完成两段（agent 存与取 + 链路），**捕获段尚未落地**，原因见下。
 
-### 捕获段的最后一公里：这一轮查清的三件事
+### 捕获段：已接通（`IARG_REG_VALUE`），端到端有断言
+
+```
+Pin 工具回调（唯一能拿到探针线程寄存器的地方）      抓
+        ↓ pb_set_thread_registers(thread, values, 8)   跨边界，在冲刷线程上
+agent（pb_register_name / pb_read_registers / pb_thread_ids_with_registers）  存与取
+        ↓ 链路 ReadRegisters
+Hub / MCP `pb_registers`                             问（MCP 工具接线是下一步）
+```
+
+端到端证据（`ctest -R pin_tool_agent_end_to_end`），摘要末尾两段就是它：
+
+```
+PB_AGENT_CHECK script_output=22 ssn_mark=1 breakpoint_hit=1 memory=1 registers=1 rip=0x7FF7A5B32580
+[pinbridge]   寄存器快照：转发层支持（交付 2700 次，失败 90 次，跳过 620 次无效）
+```
+
+`registers=1` 的含义是**严格**的：靶子枚举"有快照的线程"、逐个读回 8 个值，
+只有当 `RIP` 落在**它自己主模块的地址范围**里才计数。抓错线程、读到全零、
+参数顺序错位（把 RSP 当 RIP）都会让这一格是 0。
+
+实现上的三个决定：
+
+1. **取寄存器用 `IARG_REG_VALUE`，不是 `IARG_CONTEXT` + `PIN_GetContextReg`。**
+   后者在这个工具的回调里稳定 `RECEIVED_ACCESS_FAULT`（排除过程见下一节）。
+   RIP 用 `IARG_INST_PTR`——`IARG_REG_VALUE` 不支持指令指针寄存器。
+2. **入口探针把快照写在文件级的"最近一次快照 + 它属于哪条线程"里**，而不是直接写
+   `ThreadStats`：入口探针在文件里靠前，那时 `ThreadStats` 还是**不完整类型**
+   （定义在几百行之后），解引用成员会得到 `C2027: 使用了未定义类型`。
+3. **交付时要求线程号对得上**（`flush_ring` 里 `g_last_registers_thread == slot.thread_id`）：
+   对不上就是别条线程的快照，**张冠李戴比"没有"更糟**。
+
+### 为什么"全零的快照"必须被拦住
+
+agent 侧是"每线程最近一次"的**覆盖式**存储，所以把 8 个零交上去会把同一线程
+先前那份**有效**快照冲掉。实测过一次：工具报"交付 3419 次"，agent 里 5 条线程
+全有快照，读出来却全是 0 —— 于是"RIP 必须落在主模块内"这条断言失败，
+而错误信息里没有任何线索指向"被零覆盖"。
+
+现在交付前判 `RIP != 0`（真实执行流里 RIP 为 0 不可能出现），并且把跳过次数
+报出来：**"有快照"与"快照有用"是两件事**，只断言前者会把这种缺陷放过去。
+
+### 三条工程教训（都写进代码注释了）
+
+* **读编译器的第一条错误，不要读尾巴**：一个真实错误（类型未声明）会级联出
+  上百条"`stats` 未声明"，而构建脚本当时只显示 `-Last 6` —— 看到的是级联的尾巴，
+  真正的错处在上面。这一点耽误了整整一轮，脚本已改成显示 `-First 8`。
+* **参数顺序错了不会报错，只会读到错位的寄存器**：插桩点按新顺序传了 9 个参数、
+  回调签名还是旧的，"入口点命中 0x…"打出来的是**栈地址**，编译通过、运行不崩。
+  只有"断言语义"的用例能抓它。
+* **两个 agent 实例**：靶子自己 `LoadLibraryA` 一份、桥接层也加载一份，路径不同时
+  Windows 给出两个独立模块（导出面是进程级单例），于是工具侧报"交付 3419 次"、
+  靶子这边读到 0 条。修法是两边加载**同一条路径**（`PINBRIDGE_AGENT_DLL`）。
+
 
 **一、`IARG_REG_VALUE` 是可行的替代（已验证不崩）。** 把入口探针改成
 `IARG_INST_PTR` + 七个 `IARG_REG_VALUE`（RIP 用前者——`IARG_REG_VALUE` 不支持
