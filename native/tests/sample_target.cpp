@@ -184,6 +184,8 @@ struct AgentApi {
   int32_t(__cdecl* memory_write)(uint64_t, const uint8_t*, uint32_t) = nullptr;
   int32_t(__cdecl* set_breakpoint)(uint64_t) = nullptr;
   int32_t(__cdecl* clear_breakpoint)(uint64_t) = nullptr;
+  int32_t(__cdecl* read_registers)(uint32_t, uint64_t*, uint32_t, uint32_t*) = nullptr;
+  int32_t(__cdecl* thread_ids_with_registers)(uint32_t*, uint32_t, uint32_t*) = nullptr;
   const char* (__cdecl* last_error)() = nullptr;
 };
 
@@ -223,6 +225,8 @@ int agent_check(const char* dll_path, const char* script_path) {
       !resolve(api.dll, "pb_memory_write", &api.memory_write) ||
       !resolve(api.dll, "pb_set_breakpoint", &api.set_breakpoint) ||
       !resolve(api.dll, "pb_clear_breakpoint", &api.clear_breakpoint) ||
+      !resolve(api.dll, "pb_read_registers", &api.read_registers) ||
+      !resolve(api.dll, "pb_thread_ids_with_registers", &api.thread_ids_with_registers) ||
       !resolve(api.dll, "pb_last_error", &api.last_error)) {
     return 1;
   }
@@ -321,10 +325,16 @@ int agent_check(const char* dll_path, const char* script_path) {
   unsigned script_outputs = 0;
   unsigned breakpoint_hits = 0;
   unsigned script_marked_ssn = 0;
-  for (int round = 0; round < 8; ++round) {
-    pb_event_raw batch[32];
+  // 取事件直到**看见自己的那几条**为止。
+  //
+  // 队列是进程级共享的：Pin 工具侧的探针也在往同一个 agent 实例里推事件
+  // （这条用例现在共享一个实例，见 CMakeLists 里的 PINBRIDGE_AGENT_DLL），
+  // 所以"取 8 批"这种固定循环会被海量探针事件淹没，断言会以"什么都没取到"
+  // 的形式失败——而真正的原因只是"排在我们前面的还有几千条"。
+  for (int round = 0; round < 4096; ++round) {
+    pb_event_raw batch[64];
     uint32_t written = 0;
-    if (api.drain_events(batch, 32, &written) != PB_STATUS_OK) {
+    if (api.drain_events(batch, 64, &written) != PB_STATUS_OK) {
       std::printf("PB_AGENT_CHECK FAIL drain %s\n", api.last_error());
       return 1;
     }
@@ -345,10 +355,58 @@ int agent_check(const char* dll_path, const char* script_path) {
   }
   api.clear_breakpoint(target);
 
+  // 7) 寄存器快照：Pin 工具侧在探针命中时捕获，agent 存下来。
+  //
+  //    这一步目前是**诊断**而不是断言：捕获段（工具侧）尚未接通，
+  //    `registers` 会是 0。把它当诊断打印出来的价值在于——**把最后一公里
+  //    量化**：一旦捕获接通，这一行的数字会自己变成非零，而"0 条快照"
+  //    与"快照全是零"在摘要里是两种不同的证据（见 docs/design/script-runtime.md）。
+  //    RIP 落在**本进程主模块**里才计数（只有真抓到才可能成立）。
+  unsigned registers_ok = 0;
+  uint64_t first_rip = 0;
+  {
+    uint32_t threads[16];
+    uint32_t thread_count = 0;
+    if (api.thread_ids_with_registers(threads, 16, &thread_count) != PB_STATUS_OK) {
+      std::printf("PB_AGENT_CHECK FAIL thread-ids %s\n", api.last_error());
+      return 1;
+    }
+    const uintptr_t module = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    // 诊断：直接问 thread 0（Pin 的入口探针就在这条线程上）并打印 agent 的说法
+    {
+      uint64_t probe[8] = {};
+      uint32_t probe_written = 0;
+      const int32_t code = api.read_registers(0, probe, 8, &probe_written);
+      std::printf("PB_AGENT_CHECK DIAG thread_count=%u read0=%d rip0=0x%llX err=%s\n",
+                  thread_count, code, static_cast<unsigned long long>(probe[0]),
+                  code == PB_STATUS_OK ? "" : api.last_error());
+    }
+    for (uint32_t i = 0; i < thread_count; ++i) {
+      uint64_t values[8] = {};
+      uint32_t written = 0;
+      if (api.read_registers(threads[i], values, 8, &written) != PB_STATUS_OK) {
+        std::printf("PB_AGENT_CHECK FAIL read-registers %s\n", api.last_error());
+        return 1;
+      }
+      if (written != 8) {
+        std::printf("PB_AGENT_CHECK FAIL register-width written=%u\n", written);
+        return 1;
+      }
+      // 主模块镜像只有几个页；RIP 落在里面说明"这是本进程、且在目标代码里"。
+      const uintptr_t rip = static_cast<uintptr_t>(values[0]);
+      if (rip >= module && rip < module + 0x100000u) {
+        ++registers_ok;
+        first_rip = values[0];
+      }
+    }
+  }
+
   // 一行摘要，供 ctest 用正则断言。数字都打印出来，失败时不用再猜。
   std::printf(
-      "PB_AGENT_CHECK script_output=%u ssn_mark=%u breakpoint_hit=%u memory=%u target_value=%d\n",
-      script_outputs, script_marked_ssn, breakpoint_hits, memory_round_trip, value);
+      "PB_AGENT_CHECK script_output=%u ssn_mark=%u breakpoint_hit=%u memory=%u registers=%u "
+      "rip=0x%llX target_value=%d\n",
+      script_outputs, script_marked_ssn, breakpoint_hits, memory_round_trip, registers_ok,
+      static_cast<unsigned long long>(first_rip), value);
   if (script_outputs == 0 || script_marked_ssn == 0 || breakpoint_hits == 0 ||
       memory_round_trip == 0) {
     std::printf("PB_AGENT_CHECK FAIL incomplete\n");

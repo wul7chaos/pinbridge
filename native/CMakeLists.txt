@@ -274,7 +274,12 @@ if(BUILD_TESTING)
                 "$<TARGET_FILE:pb_sample_target>" --agent-check
                 "${PINBRIDGE_AGENT_DLL}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_check_script.py")
+      # `PINBRIDGE_AGENT_DLL` 必须给**同一条路径**：靶子自己 `LoadLibrary` 一份，
+      # 而桥接层也加载一份。路径不同时 Windows 会给出**两个独立的 agent 实例**
+      # （导出面是进程级单例，于是"两份单例"），表现为"工具侧说交付了 3419 次
+      # 快照，靶子这边读到 0 条"——这条用例的寄存器断言把这个缺陷挖了出来。
       set_tests_properties(pin_tool_agent_end_to_end PROPERTIES
+        ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}"
         PASS_REGULAR_EXPRESSION "PB_AGENT_CHECK script_output=[1-9][0-9]* ssn_mark=[1-9][0-9]* breakpoint_hit=[1-9][0-9]* memory=1"
         SKIP_RETURN_CODE 77)
 
