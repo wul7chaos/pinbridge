@@ -241,11 +241,27 @@ impl<W: Write> PbtWriter<W> {
     /// # Errors
     ///
     /// 底层写入失败时透传。
+    /// 冲刷缓冲区，**并写下一个提交标记**。
+    ///
+    /// 提交标记（`SUMMARY` chunk）的语义是：
+    /// **"在这个位置之前，记录是完整的；截至 `last_sequence` 的记录已经落盘"**。
+    ///
+    /// 顺序不能反：先写事件块、**再**写标记。反过来会让读者把标记之后、
+    /// 尚未落盘的记录当成"已完整"，那正是流式读取最危险的一种错——
+    /// 读到的数据**看起来完全正常**，只是少了一截，而且没有任何迹象。
+    ///
+    /// 一份轨迹里因此会有**多个** `SUMMARY`：运行中每个提交标记一个，
+    /// `finish` 写的那个是最后（也是权威）的一个。读端规则：**最后一个胜出**。
+    ///
+    /// 底层写入失败时透传。
     pub fn flush(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
         }
         self.flush_event_chunk()?;
+        let summary = self.summary.clone();
+        let json = summary.to_json()?;
+        self.write_chunk(CHUNK_SUMMARY, json.as_bytes())?;
         self.inner.flush()?;
         Ok(())
     }
@@ -322,11 +338,49 @@ pub struct PbtReader<R: Read> {
     last_address: u64,
     last_args: [u64; MAX_ARGS],
     records_read: u64,
+    /// 流式模式：**容忍被截断的尾部**（写入方还在写）。
+    ///
+    /// 非流式时，读到半个 chunk 就是损坏（一份写完的轨迹不该是这样）；
+    /// 流式时它是**预期**状态——"还没写到这里"与"文件坏了"必须分开，
+    /// 否则边录边读就永远只能靠猜。
+    streaming: bool,
+    /// 上次没能读完、**留到下次**的原始字节。
+    ///
+    /// 为什么必须留着：底层是"一次性"读取器（文件句柄），已经消费掉的字节
+    /// 拿不回来。不缓存就等于把"半个 chunk"当成丢失的字节，下次读到的头会错位——
+    /// 而错位之后解析出的记录**看起来仍然像记录**（有 kind、有地址），
+    /// 这是最难发现的一类错误。有它就能做到"这次读到哪、下次从哪接着读"。
+    pending: Vec<u8>,
 }
 
 impl<R: Read> PbtReader<R> {
     /// 读取并校验文件头。
-    pub fn open(mut inner: R) -> Result<Self> {
+    pub fn open(inner: R) -> Result<Self> {
+        Self::open_with(inner, false)
+    }
+
+    /// 以**流式**模式打开：读取方还在写的时候读。
+    ///
+    /// 与非流式（[`PbtReader::open`]）的区别只有一处，但很关键：
+    ///
+    /// * 非流式：读到半个 chunk ⇒ **损坏**，报错。一份写完的轨迹不该是这样，
+    ///   把它当"暂时没有"会掩盖真正的文件损坏。
+    /// * 流式：读到半个 chunk ⇒ **正常**，停在能读到的最后一个完整位置，
+    ///   把零头留着，下次调用接着读。
+    ///
+    /// 两种模式都不能接受的是"错位"：所以流式模式不会丢掉任何字节，
+    /// 未读完的部分原样缓存在 `pending` 里。
+    ///
+    /// 用法：反复调用 [`PbtReader::next_record`]，`Ok(None)` 表示
+    /// "当前还没有更多完整记录"（不代表结束）——写入方继续写之后**再调用一次**
+    /// 就能读到新的。想知道"已经完整到哪里"，用 [`PbtReader::summary`]：
+    /// 它返回**最后一个提交标记**（`flush` 写的），其 `last_sequence`
+    /// 就是"已完整"的边界。
+    pub fn open_streaming(inner: R) -> Result<Self> {
+        Self::open_with(inner, true)
+    }
+
+    fn open_with(mut inner: R, streaming: bool) -> Result<Self> {
         let mut header = [0u8; HEADER_LEN];
         if !read_full(&mut inner, &mut header)? {
             return Err(Error::Trace("文件为空，不是有效的 .pbt".into()));
@@ -356,6 +410,8 @@ impl<R: Read> PbtReader<R> {
             last_address: 0,
             last_args: [0; MAX_ARGS],
             records_read: 0,
+            streaming,
+            pending: Vec::new(),
         })
     }
 
@@ -510,9 +566,21 @@ impl<R: Read> PbtReader<R> {
         }
         loop {
             let mut head = [0u8; 5];
-            if !read_full(&mut self.inner, &mut head)? {
-                self.eof = true;
-                return Ok(false);
+            let head_got = self.read_or_pending(&mut head)?;
+            if head_got < head.len() {
+                if self.streaming {
+                    // 流式：把这一小段**原样留着**，下次接着读。
+                    // 一个字节都不能丢——丢了下次就会把错位后的字节当 chunk 头解析，
+                    // 而错位后解析出来的"记录"看起来仍然像记录（有 kind、有地址），
+                    // 这是这类实现里最难发现的一类错误。
+                    self.pending.splice(0..0, head[..head_got].iter().copied());
+                    return Ok(false);
+                }
+                if head_got == 0 {
+                    self.eof = true;
+                    return Ok(false);
+                }
+                return Err(Error::Trace("轨迹在 chunk 头中途结束".into()));
             }
             let tag = head[0];
             let length = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
@@ -520,10 +588,19 @@ impl<R: Read> PbtReader<R> {
                 return Err(Error::Trace(format!("chunk 长度 {length} 超出上限")));
             }
             let mut payload = vec![0u8; length];
-            // 注意：`length == 0` 的 chunk（例如 END 段）不能走 read_full ——
+            // 注意：`length == 0` 的 chunk（例如 END 段）不能走读取 ——
             // 零长度缓冲会让它返回"一个字节也没读到"，从而被误判成负载被截断。
-            if length > 0 && !read_full(&mut self.inner, &mut payload)? {
-                return Err(Error::Trace("轨迹在 chunk 负载中途结束".into()));
+            if length > 0 {
+                let payload_got = self.read_or_pending(&mut payload)?;
+                if payload_got < length {
+                    if self.streaming {
+                        // 还原成"head ++ 已读到的负载"，顺序不能反。
+                        self.pending.splice(0..0, head.iter().copied());
+                        self.pending.extend_from_slice(&payload[..payload_got]);
+                        return Ok(false);
+                    }
+                    return Err(Error::Trace("轨迹在 chunk 负载中途结束".into()));
+                }
             }
             match tag {
                 CHUNK_EVENT => {
@@ -532,9 +609,14 @@ impl<R: Read> PbtReader<R> {
                 }
                 CHUNK_META => self.meta.push_str(&String::from_utf8_lossy(&payload)),
                 CHUNK_AUDIT => self.audit.push_str(&String::from_utf8_lossy(&payload)),
-                CHUNK_SUMMARY => self
-                    .summary_text
-                    .push_str(&String::from_utf8_lossy(&payload)),
+                CHUNK_SUMMARY => {
+                    // 一份轨迹会有**多个**提交标记（`flush` 每个都写一个，见那里的注释）。
+                    // **最后一个胜出**——不能拼接：拼出来是 `{...}{...}`，
+                    // JSON 解析会失败，而失败的位置离真正的原因（这里）很远。
+                    self.summary_text.clear();
+                    self.summary_text
+                        .push_str(&String::from_utf8_lossy(&payload));
+                }
                 CHUNK_END => {
                     self.end_seen = true;
                     return Ok(false);
@@ -543,6 +625,29 @@ impl<R: Read> PbtReader<R> {
                 _ => {}
             }
         }
+    }
+
+    /// 读满 `buf`：**先消费 `pending` 里留着的字节**，再从底层读。
+    ///
+    /// 返回实际读到的字节数；小于 `buf.len()` 表示底层暂时没有更多数据
+    /// （流式模式下这是常态，不是错误）。
+    fn read_or_pending(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut filled = 0usize;
+        if !self.pending.is_empty() {
+            let take = self.pending.len().min(buf.len());
+            buf[..take].copy_from_slice(&self.pending[..take]);
+            self.pending.drain(..take);
+            filled = take;
+        }
+        while filled < buf.len() {
+            match self.inner.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(filled)
     }
 }
 
@@ -570,6 +675,104 @@ fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::fold::{expand_records, RepeatFolder};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// 共享字节缓冲的读取器：模拟"写入方在另一个线程/进程里继续写"。
+    ///
+    /// 用共享缓冲而不是文件，是为了让"写入方推进"与"读端继续读"在同一个测试里
+    /// 可控地交替——文件也能做，但会出现"读到哪了"依赖操作系统缓冲的时序不确定性，
+    /// 而这条用例要判定的是**语义**（零头有没有丢），不该被时序搅进来。
+    #[derive(Clone)]
+    struct SharedRead {
+        data: Rc<RefCell<Vec<u8>>>,
+        pos: usize,
+    }
+
+    impl std::io::Read for SharedRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let data = self.data.borrow();
+            if self.pos >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(data.len() - self.pos);
+            buf[..n].copy_from_slice(&data[self.pos..self.pos + n]);
+            self.pos += n;
+            drop(data);
+            Ok(n)
+        }
+    }
+
+    /// 造一份**只有提交标记、没有收尾**的字节流：模拟"录制还在进行"。
+    ///
+    /// 与 `complete_trace_bytes` 的区别很重要：完整轨迹里有**两个**
+    /// SUMMARY（flush 一个、finish 一个）。用它测截断，砍掉的可能是
+    /// "最后一个"，而前一个仍然是完整有效的标记——那样就测不出"写到一半的
+    /// 标记不该被采信"。只有 flush 的字节流里，唯一的标记就是被砍的那个。
+    fn flushed_trace_bytes(records: u64) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = PbtWriter::create(&mut buffer, 0).expect("建立写入器");
+            writer.meta("{\"target\":\"stream\"}").expect("写 meta");
+            for i in 1..=records {
+                writer
+                    .write_record(&Event::new(i, EventKind::SyscallEnter, 7, 0x1400_0000 + i))
+                    .expect("写记录");
+            }
+            writer.flush().expect("提交标记");
+        }
+        buffer
+    }
+
+    /// **截断的尾部**：流式模式容忍它，非流式模式必须报损坏。
+    ///
+    /// 这条用例的重点是"两种模式的判定必须不同"：如果流式模式也报错，
+    /// 边录边读就没法用；如果非流式也容忍，真正的文件损坏就会被静默地当成
+    /// "还没写完"，那是更糟的结果。
+    ///
+    /// 另一半是**零头不丢**：读到半个 chunk 之后把剩下的字节补上，
+    /// 同一个读端实例必须能接着读出来。丢了那半个 chunk 的头，后面所有字节
+    /// 都会错位，而错位后的记录**看起来仍然正常**。
+    #[test]
+    fn a_streaming_reader_tolerates_a_truncated_tail_and_loses_no_bytes() {
+        let full = flushed_trace_bytes(4);
+        // 末尾是那个提交标记。砍掉最后 3 字节 ⇒ 标记的负载写到一半。
+        let cut = full.len() - 3;
+        assert!(cut > 0 && cut < full.len());
+
+        // 流式：不报错，读到能读到的部分
+        let shared = Rc::new(RefCell::new(full[..cut].to_vec()));
+        let mut reader = PbtReader::open_streaming(SharedRead {
+            data: Rc::clone(&shared),
+            pos: 0,
+        })
+        .expect("流式打开");
+        let events = reader.read_all().expect("流式读不该报错");
+        assert_eq!(events.len(), 4, "完整记录应当全部读到");
+        assert!(
+            reader.summary().expect("读汇总").is_none(),
+            "写到一半的提交标记不能被当成有效标记——它覆盖到哪里还不知道"
+        );
+
+        // 非流式：同一个字节流必须被判定成损坏
+        let mut strict = PbtReader::open(std::io::Cursor::new(full[..cut].to_vec()))
+            .expect("打开应当成功（头是完整的）");
+        assert!(
+            strict.read_all().is_err(),
+            "非流式模式遇到截断必须报损坏，不能被静默当成\"还没写完\""
+        );
+
+        // 把缺的字节补上：同一个读端实例接着读，不能错位
+        shared.borrow_mut().extend_from_slice(&full[cut..]);
+        assert!(reader.read_all().expect("补上之后继续读").is_empty());
+        let marker = reader
+            .summary()
+            .expect("读汇总")
+            .expect("补全之后提交标记应当可解析");
+        assert_eq!(marker.last_sequence, 4, "零头没丢才能解析出正确的边界");
+        assert_eq!(marker.records, 4);
+        assert!(!marker.truncated, "整段录制没有丢事件");
+    }
 
     fn fixture_events() -> Vec<Event> {
         let mut events = Vec::new();
