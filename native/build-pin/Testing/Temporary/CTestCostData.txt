@@ -1,5 +1,0 @@
-abi_selfcheck 15 0.00041646
-bridge_roundtrip 15 0.000502547
-bridge_missing_agent 15 0.00050112
-pin_tool_instruments_a_target 11 0.0343118
----
