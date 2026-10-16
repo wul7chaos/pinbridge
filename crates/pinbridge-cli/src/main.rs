@@ -24,7 +24,7 @@ use pinbridge_trace::diff::{attach_warnings, diff_traces, diff_warnings, DiffOpt
 use pinbridge_trace::event::EventKind;
 use pinbridge_trace::fold::expand_records;
 use pinbridge_trace::pbt::{PbtReader, Summary};
-use pinbridge_trace::slice::reverse_slice;
+use pinbridge_trace::slice::{parse_coverage_audit, reverse_slice};
 
 /// 报告里最多列出几处分岔（总数仍然准确）。
 const MAX_DIFFERENCES: usize = 8;
@@ -287,7 +287,17 @@ fn calls(path: &str, top: usize) -> Result<(), String> {
 /// `pinbridge slice A.pbt --at 0x… [--len N]`：地址级反向切片（见 ADR 0013）。
 fn slice_command(path: &str, target: u64, len: u64) -> Result<(), String> {
     let (events, _summary) = load_trace(path)?;
-    let slice = reverse_slice(&events, target, len);
+    let mut slice = reverse_slice(&events, target, len);
+    // **主通道**：覆盖信息由 agent 写进 AUDIT 文本（事件通道在环形缓冲满时会丢）。
+    // 这里如果读到了，就让它覆盖事件通道里那份（更权威）。
+    if let Ok(mut reader) =
+        pinbridge_trace::pbt::PbtReader::open(std::fs::File::open(path).map_err(|e| e.to_string())?)
+    {
+        let _ = reader.read_all();
+        if let Some(gap) = parse_coverage_audit(reader.audit_log()) {
+            slice.coverage_gap = Some(gap);
+        }
+    }
     println!("文件: {path}（{len} 字节的窗口）");
     print!("{}", slice.render(SLICE_LIMIT));
     Ok(())

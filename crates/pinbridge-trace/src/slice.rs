@@ -43,6 +43,72 @@ pub struct ReadRecord {
     pub index: usize,
 }
 
+/// 采集缺口（工具在收尾前经 agent 写进 `AUDIT` 通道的一行，见 ADR 与 CHANGELOG）。
+///
+/// **为什么它必须离线可读**：轨迹会被拷走，"某个地址没有被写过"这类结论在
+/// **采集本身有缺口**时不能成立——而缺口信息只有录制方知道。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoverageGap {
+    /// 插装的内存事件点数量。
+    pub sites: u64,
+    /// 因无法插 `AFTER` 点而整点跳过的写入点数量。
+    pub skipped: u64,
+    /// 值读不出的条数。
+    pub unreadable: u64,
+    /// 被地址范围过滤掉的条数（**有意**过滤，不算缺口）。
+    pub filtered: u64,
+    /// 探针是否因达到上限而**软停**：上限之后的事件**不存在**，但不等于没发生。
+    pub capped: bool,
+}
+
+/// 从审计文本里解析覆盖行：`pb_coverage mem_write_sites=… skipped_no_after=… …`。
+///
+/// 解析失败返回 `None`（老轨迹、或者录制方没有这套元信息），**不猜**。
+#[must_use]
+pub fn parse_coverage_audit(audit: &str) -> Option<CoverageGap> {
+    let line = audit
+        .lines()
+        .find(|line| line.starts_with("pb_coverage "))?;
+    let mut gap = CoverageGap::default();
+    let mut seen_any = false;
+    for field in line.split_whitespace().skip(1) {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        let parsed = value.parse::<u64>().ok();
+        match (key, parsed) {
+            ("mem_write_sites", Some(v)) => {
+                gap.sites = v;
+                seen_any = true;
+            }
+            ("skipped_no_after", Some(v)) => {
+                gap.skipped = v;
+                seen_any = true;
+            }
+            ("unreadable", Some(v)) => {
+                gap.unreadable = v;
+                seen_any = true;
+            }
+            ("filtered", Some(v)) => {
+                gap.filtered = v;
+                seen_any = true;
+            }
+            ("capped", Some(v)) => {
+                gap.capped = v != 0;
+                seen_any = true;
+            }
+            // 认不出的键**忽略但不报错**：格式以后可能加字段，老读端不该因此
+            // 丢掉整行信息（向前兼容的唯一做法）。
+            _ => {}
+        }
+    }
+    if seen_any {
+        Some(gap)
+    } else {
+        None
+    }
+}
+
 /// 切片结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Slice {
@@ -63,13 +129,13 @@ pub struct Slice {
     pub total_writes_in_trace: u64,
     /// 轨迹里是否出现过内存写入事件。
     pub memory_probe_on: bool,
-    /// 录制时工具自报的**采集缺口**：`(跳过的写入点, 读不出的值, 被范围过滤掉的条数)`。
+    /// 录制时工具自报的**采集缺口**（由 agent 写进轨迹的 `AUDIT` 文本通道）。
     ///
     /// 工具把这条记录作为 `state_change` 事件写进轨迹（`args[0] = 1`）。
     /// 为什么离线侧必须看它：轨迹会被拷走做分析，"这个地址没有被写过"这种结论
     /// 在**采集本身有缺口**时是不能成立的——第 33 轮就踩过：靶子的写入循环确实
     /// 跑了 2000 次，而轨迹里一条都没有（探针没覆盖那段代码）。
-    pub coverage_gap: Option<(u64, u64, u64)>,
+    pub coverage_gap: Option<CoverageGap>,
 }
 
 impl Slice {
@@ -98,8 +164,16 @@ impl Slice {
             self.executions,
             first_exec,
             u8::from(self.memory_probe_on),
-            self.coverage_gap
-                .map_or_else(|| "none".to_owned(), |(a, b, c)| format!("{a}/{b}/{c}")),
+            self.coverage_gap.map_or_else(
+                || "none".to_owned(),
+                |gap| format!(
+                    "{}/{}/{}/capped{}",
+                    gap.skipped,
+                    gap.unreadable,
+                    gap.filtered,
+                    u8::from(gap.capped)
+                ),
+            ),
         )
     }
 
@@ -115,13 +189,21 @@ impl Slice {
         ));
 
         // ── 采集缺口优先说：它会推翻下面所有结论 ──
-        if let Some((skipped, unreadable, filtered)) = self.coverage_gap {
-            if skipped != 0 || unreadable != 0 {
+        if let Some(gap) = self.coverage_gap {
+            if gap.capped {
+                out.push_str(
+                    "⚠ 录制时**探针达到事件上限并停止采集**：从此之后的事件在轨迹里\n\
+                     \x20 **不存在**——但那只表示「没采到」，**不表示「没发生」**。\n\
+                     \x20 下面任何「没有观察到…」的结论在这条轨迹上都不成立。\n",
+                );
+            }
+            if gap.skipped != 0 || gap.unreadable != 0 {
                 out.push_str(&format!(
-                    "⚠ 录制时工具自报采集缺口：跳过的写入点 {skipped} 个、读不出的值 {unreadable} 条\n\
-                     \x20 （被地址范围过滤 {filtered} 条是**有意**的，不算缺口）。\n\
+                    "⚠ 录制时工具自报采集缺口：跳过的写入点 {} 个、读不出的值 {} 条\n\
+                     \x20 （被地址范围过滤 {} 条是**有意**的，不算缺口）。\n\
                      \x20 有缺口时下面的「没有观察到写入」**不能**当作「没被写过」——\n\
-                     \x20 缺口可能正好落在这段代码上。\n"
+                     \x20 缺口可能正好落在这段代码上。\n",
+                    gap.skipped, gap.unreadable, gap.filtered
                 ));
             }
         }
@@ -239,9 +321,19 @@ pub fn reverse_slice(events: &[Event], target: u64, len: u64) -> Slice {
             }
             // 覆盖子码 1（见 native 侧「采集覆盖写进轨迹」的注释）。写成 `match` 上的
             // 守卫而不是嵌套 `if`：clippy 的 `collapsible_match` 会把嵌套形式挑出来，
-            // 而守卫形式语义相同、也让"这条记录只在子码为 1 时才解释"更显眼。
+            // 而守卫形式语义相同、也让「这条记录只在子码为 1 时才解释」更显眼。
+            //
+            // 事件通道是**尽力而为**：环形缓冲满时它自己就会被丢掉（实测过）。
+            // 主要通道是 `AUDIT` 文本，调用方读完文件后用
+            // `parse_coverage_audit` 覆盖一次即可。
             EventKind::StateChange if event.args[0] == 1 => {
-                slice.coverage_gap = Some((event.args[2], event.args[3], event.args[4]));
+                slice.coverage_gap = Some(CoverageGap {
+                    sites: event.args[1],
+                    skipped: event.args[2],
+                    unreadable: event.args[3],
+                    filtered: event.args[4],
+                    capped: event.args[5] != 0,
+                });
             }
             _ => {}
         }
@@ -437,7 +529,16 @@ mod tests {
             .with_arg(3, 0)
             .with_arg(4, 0);
         let slice = reverse_slice(&[coverage], 0x1000, 16);
-        assert_eq!(slice.coverage_gap, Some((245, 0, 0)));
+        assert_eq!(
+            slice.coverage_gap,
+            Some(CoverageGap {
+                sites: 1452,
+                skipped: 245,
+                unreadable: 0,
+                filtered: 0,
+                capped: false,
+            })
+        );
         let text = slice.render(8);
         assert!(text.contains("采集缺口"), "{text}");
         assert!(text.contains("跳过的写入点 245 个"), "{text}");
@@ -449,7 +550,9 @@ mod tests {
             text.find("采集缺口").unwrap() < text.find("没有观察到写入").unwrap(),
             "缺口必须排在结论前面"
         );
-        assert!(slice.machine_line().contains("coverage_gap=245/0/0"));
+        assert!(slice
+            .machine_line()
+            .contains("coverage_gap=245/0/0/capped0"));
     }
 
     /// 没有缺口记录时不能凭空造一个（老轨迹没有这条记录）。
@@ -459,5 +562,51 @@ mod tests {
         let slice = reverse_slice(&events, 0x1000, 8);
         assert_eq!(slice.coverage_gap, None);
         assert!(slice.machine_line().contains("coverage_gap=none"));
+    }
+
+    /// 审计行解析：主通道必须能读出来，且**认不出的键不致命**。
+    ///
+    /// 为什么解析要容忍未知键：这套元信息以后会加字段，老读端不该因为多了一个
+    /// `key=value` 就把整行丢掉——那会让"升级录制方"变成"旧工具全瞎"。
+    #[test]
+    fn the_coverage_audit_line_is_parsed_and_unknown_keys_are_ignored() {
+        let gap = parse_coverage_audit(
+            "启动完成\npb_coverage mem_write_sites=1452 skipped_no_after=245 unreadable=3 filtered=7 capped=1 future_field=99\n结束",
+        )
+        .expect("应当解析出覆盖");
+        assert_eq!(gap.sites, 1452);
+        assert_eq!(gap.skipped, 245);
+        assert_eq!(gap.unreadable, 3);
+        assert_eq!(gap.filtered, 7);
+        assert!(gap.capped);
+
+        assert!(parse_coverage_audit("无关的一行\n").is_none(), "没有就不猜");
+        assert!(
+            parse_coverage_audit("pb_coverage\n").is_none(),
+            "只有前缀、没有任何字段时不算有效记录"
+        );
+    }
+
+    /// `capped` 的告警必须**排在结论前面**，而且要写明"不是没发生"。
+    #[test]
+    fn a_capped_probe_warning_precedes_any_conclusion() {
+        let events = vec![write(1, 0x1000, 8, 0xAA)];
+        let mut slice = reverse_slice(&events, 0x2000, 8);
+        slice.coverage_gap = Some(CoverageGap {
+            sites: 100,
+            skipped: 0,
+            unreadable: 0,
+            filtered: 0,
+            capped: true,
+        });
+        let text = slice.render(8);
+        assert!(text.contains("达到事件上限"), "{text}");
+        assert!(
+            text.contains("不表示「没发生」"),
+            "必须点明这条区别: {text}"
+        );
+        let capped_at = text.find("达到事件上限").unwrap();
+        let conclusion_at = text.find("没有观察到写入").unwrap();
+        assert!(capped_at < conclusion_at, "告警要在结论之前");
     }
 }
