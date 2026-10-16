@@ -1750,6 +1750,14 @@ void OnInstruction(INS ins, VOID* v) {
       // 不能在这里改成 BEFORE 采集：那会把**写入前**的值当成"新值"送出去，
       // 而调用方无法分辨。跳过并计数，宁可少一条。
       ++g_mem_skipped_no_after;
+      // 报出**前几个**被跳过的地址：只报一个总数时，无法回答"到底哪一段没被覆盖"，
+      // 而这正是"某个地址没被写过"这类结论能不能信的前提（第 33 轮踩过：
+      // 靶子写 `g_touch_buffer` 2000 次，切片却报"没有观察到写入"）。
+      // 有界（前 8 个）是为了不让日志被刷爆。
+      if (g_mem_skipped_no_after <= 8) {
+        report("  写入点无法插 AFTER 点（跳过整个点）：指令地址 0x%llX",
+               static_cast<unsigned long long>(address));
+      }
     }
   }
   if (g_mem.reads && INS_IsMemoryRead(ins)) {
@@ -2166,7 +2174,37 @@ void OnFini(INT32 code, VOID* v) {
       }
     }
   }
-  // ── 转移的账（调用图的数据来源，见 ADR 0012）───────────────────────────
+  // ── 采集覆盖的自我说明（**写进轨迹**，不只是打在日志里）────────────────
+  //
+  // 为什么必须进轨迹：日志活在当时那台机器上，轨迹却会被拷走做离线分析。
+  // 离线工具（切片、差分）只看到事件，不知道"有些事件**根本没被采集**"——
+  // 于是"这个地址没有被写过"这类结论会在数据缺口上被当成事实。
+  // 第 33 轮就是这种情况：靶子写缓冲区 2000 次，切片报"没有观察到写入"，
+  // 而真实原因是那 245 个写入点插不上 AFTER 点。
+  //
+  // 怎么送：工具侧没有把文本写进轨迹的通道（文本是脚本经链路回传的）。
+  // 所以用 `StateChange`（kind 10）在**此前未使用的 arg 槽**里带数字——
+  // 与转移码（ADR 0012 用 `RegWrite` 的 `args[2]`）同一个做法，
+  // **格式不变**：args[0] = 覆盖子码 1，args[1..4] = 各计数。
+  if (g_mem.enabled) {
+    ThreadStats* stats = stats_for(0);
+    if (stats != nullptr) {
+      const UINT64 coverage_args[5] = {
+          1,
+          static_cast<UINT64>(g_mem_sites),
+          g_mem_skipped_no_after,
+          g_mem_unreadable,
+          g_mem_filtered,
+      };
+      push_probe_event(stats, 10 /* PB_EV_STATE_CHANGE */, 0, 0, coverage_args, 5);
+      report("已把采集覆盖写进轨迹（mem_write_sites=%ld skipped_no_after=%llu "
+             "unreadable=%llu filtered=%llu）",
+             static_cast<long>(g_mem_sites),
+             static_cast<unsigned long long>(g_mem_skipped_no_after),
+             static_cast<unsigned long long>(g_mem_unreadable),
+             static_cast<unsigned long long>(g_mem_filtered));
+    }
+  }  // ── 转移的账（调用图的数据来源，见 ADR 0012）───────────────────────────
   if (g_transfers_enabled) {
     report("转移事件：插装 %llu 个点，观察到 call %llu 次 / ret %llu 次",
            static_cast<unsigned long long>(g_transfer_sites),

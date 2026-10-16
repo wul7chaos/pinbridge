@@ -95,6 +95,14 @@ void touch_loop(unsigned long iterations) {
     checksum += g_touch_buffer[(index + 7) % kTouchBufferBytes];
   }
   g_sink = static_cast<int>(checksum & 0x7FFFFFFF);
+  // 自报一声：确认这个循环**真的跑了**。
+  //
+  // 为什么需要它：轨迹里"没有这个缓冲区上的写入"有两种截然不同的成因 ——
+  // ① 循环没跑；② 跑了但探针没覆盖到那段代码。分不开这两种，"探针漏了"
+  // 这类结论就无从证实。第 34 轮在这一点上猜了好几轮，原因是我上一次的补丁
+  // **根本没落进文件**（字符串替换静默失败）——所以这条自报是补齐后的版本。
+  std::printf("PB_TOUCH_DONE iterations=%lu checksum=%lu buffer=0x%p\n", iterations,
+              checksum, static_cast<const void*>(g_touch_buffer));
 }
 
 /// 一个**签名可寻址**的函数。
@@ -644,6 +652,9 @@ int agent_check(const char* dll_path, const char* script_path) {
 void print_touch_buffer() {
   std::printf("PB_TOUCH_BUFFER=0x%p size=0x%lX\n",
               static_cast<const void*>(g_touch_buffer), kTouchBufferBytes);
+  // 报出写入循环本身的地址：用来回答"探针到底覆盖了哪个点"
+  // （第 34 轮：靶子写缓冲区 2000 次，轨迹里却一条都没有 ⇒ 必须有办法定位）。
+  std::printf("PB_TOUCH_LOOP=0x%p\n", reinterpret_cast<const void*>(&touch_loop));
 }
 
 }  // namespace

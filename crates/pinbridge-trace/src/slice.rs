@@ -63,6 +63,13 @@ pub struct Slice {
     pub total_writes_in_trace: u64,
     /// 轨迹里是否出现过内存写入事件。
     pub memory_probe_on: bool,
+    /// 录制时工具自报的**采集缺口**：`(跳过的写入点, 读不出的值, 被范围过滤掉的条数)`。
+    ///
+    /// 工具把这条记录作为 `state_change` 事件写进轨迹（`args[0] = 1`）。
+    /// 为什么离线侧必须看它：轨迹会被拷走做分析，"这个地址没有被写过"这种结论
+    /// 在**采集本身有缺口**时是不能成立的——第 33 轮就踩过：靶子的写入循环确实
+    /// 跑了 2000 次，而轨迹里一条都没有（探针没覆盖那段代码）。
+    pub coverage_gap: Option<(u64, u64, u64)>,
 }
 
 impl Slice {
@@ -82,7 +89,7 @@ impl Slice {
             .first_execution
             .map_or_else(|| "-".to_owned(), |s| s.to_string());
         format!(
-            "PB_SLICE target={:#x} len={} writers={} readers={} overwritten={} executions={} first_execution={} memory_probe={}",
+            "PB_SLICE target={:#x} len={} writers={} readers={} overwritten={} executions={} first_execution={} memory_probe={} coverage_gap={}",
             self.target,
             self.len,
             self.writers.len(),
@@ -91,6 +98,8 @@ impl Slice {
             self.executions,
             first_exec,
             u8::from(self.memory_probe_on),
+            self.coverage_gap
+                .map_or_else(|| "none".to_owned(), |(a, b, c)| format!("{a}/{b}/{c}")),
         )
     }
 
@@ -105,6 +114,17 @@ impl Slice {
             self.len
         ));
 
+        // ── 采集缺口优先说：它会推翻下面所有结论 ──
+        if let Some((skipped, unreadable, filtered)) = self.coverage_gap {
+            if skipped != 0 || unreadable != 0 {
+                out.push_str(&format!(
+                    "⚠ 录制时工具自报采集缺口：跳过的写入点 {skipped} 个、读不出的值 {unreadable} 条\n\
+                     \x20 （被地址范围过滤 {filtered} 条是**有意**的，不算缺口）。\n\
+                     \x20 有缺口时下面的「没有观察到写入」**不能**当作「没被写过」——\n\
+                     \x20 缺口可能正好落在这段代码上。\n"
+                ));
+            }
+        }
         // ── 结论的第一句必须能站住 ──
         if !self.memory_probe_on {
             out.push_str(
@@ -216,6 +236,12 @@ pub fn reverse_slice(events: &[Event], target: u64, len: u64) -> Slice {
                         index,
                     });
                 }
+            }
+            // 覆盖子码 1（见 native 侧「采集覆盖写进轨迹」的注释）。写成 `match` 上的
+            // 守卫而不是嵌套 `if`：clippy 的 `collapsible_match` 会把嵌套形式挑出来，
+            // 而守卫形式语义相同、也让"这条记录只在子码为 1 时才解释"更显眼。
+            EventKind::StateChange if event.args[0] == 1 => {
+                slice.coverage_gap = Some((event.args[2], event.args[3], event.args[4]));
             }
             _ => {}
         }
@@ -395,5 +421,43 @@ mod tests {
         assert_eq!(slice.executions, 1);
         assert_eq!(slice.first_execution, Some(1));
         assert_eq!(slice.writers.len(), 0, "写到 0x2000，与范围不重叠");
+    }
+
+    /// 采集缺口必须**优先于**结论被说出来。
+    ///
+    /// 这条守的是第 33 轮的实际教训：靶子的写入循环确实跑了 2000 次，
+    /// 轨迹里一条都没有（探针没覆盖那段代码），而切片当时报的是
+    /// 「范围内没有观察到写入」——技术上没说谎，但读者会当成「没被写过」。
+    #[test]
+    fn a_reported_coverage_gap_is_surfaced_before_the_conclusion() {
+        let coverage = Event::new(1, EventKind::StateChange, 0, 0)
+            .with_arg(0, 1)
+            .with_arg(1, 1452)
+            .with_arg(2, 245)
+            .with_arg(3, 0)
+            .with_arg(4, 0);
+        let slice = reverse_slice(&[coverage], 0x1000, 16);
+        assert_eq!(slice.coverage_gap, Some((245, 0, 0)));
+        let text = slice.render(8);
+        assert!(text.contains("采集缺口"), "{text}");
+        assert!(text.contains("跳过的写入点 245 个"), "{text}");
+        assert!(
+            text.contains("不能**当作「没被写过」"),
+            "要说清后果: {text}"
+        );
+        assert!(
+            text.find("采集缺口").unwrap() < text.find("没有观察到写入").unwrap(),
+            "缺口必须排在结论前面"
+        );
+        assert!(slice.machine_line().contains("coverage_gap=245/0/0"));
+    }
+
+    /// 没有缺口记录时不能凭空造一个（老轨迹没有这条记录）。
+    #[test]
+    fn a_trace_without_a_coverage_record_reports_none() {
+        let events = vec![write(1, 0x1000, 8, 0xAA)];
+        let slice = reverse_slice(&events, 0x1000, 8);
+        assert_eq!(slice.coverage_gap, None);
+        assert!(slice.machine_line().contains("coverage_gap=none"));
     }
 }
