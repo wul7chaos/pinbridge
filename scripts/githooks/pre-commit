@@ -20,14 +20,24 @@ if [ -n "$staged_rs" ]; then
 fi
 
 if [ -n "$staged_py" ]; then
-  # 有 ruff 就跑，没有就提示而不是失败（不强制每个贡献者装 Python 工具链）
+  # ruff 可能没装在 PATH 里（常见做法是用 uv 临时拉起）。
+  # 先找直接可用的，再退到 uv——否则这个检查在大多数机器上会被静默跳过，
+  # 而它恰恰是"本地能拦、CI 才炸"的那一类问题里最容易漏的一条。
   if command -v ruff >/dev/null 2>&1; then
-    if ! (cd python && ruff check . >/dev/null 2>&1); then
-      echo "✗ Python 侧 ruff 检查未通过（在 python/ 下运行 \`ruff check .\` 查看）" >&2
+    ruff_cmd="ruff"
+  elif command -v uv >/dev/null 2>&1; then
+    ruff_cmd="uv run --no-project --with ruff --quiet ruff"
+  else
+    ruff_cmd=""
+  fi
+
+  if [ -n "$ruff_cmd" ]; then
+    if ! (cd python && $ruff_cmd check . >/dev/null 2>&1); then
+      echo "✗ Python 侧 ruff 检查未通过（在 python/ 下运行 ruff check . 查看）" >&2
       exit 1
     fi
   else
-    echo "· 未安装 ruff，跳过 Python 静态检查（CI 会跑）"
+    echo "· 未找到 ruff 或 uv，跳过 Python 静态检查（CI 会跑）"
   fi
 fi
 
