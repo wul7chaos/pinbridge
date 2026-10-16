@@ -192,17 +192,31 @@ impl Status {
     }
 
     /// 映射到项目统一错误类型，便于在上层用同一种方式处理。
+    ///
+    /// `needed` 是**本次调用真正需要的能力**。C 状态码里只有一个整数 -3，
+    /// 光靠它无法还原"到底缺哪一项"；早期实现固定填 `MemRead`，
+    /// 于是 AI 会读到"需要 mem_read"而它当时真正需要的是 process_control——
+    /// 一个**错误的**错误信息会把排查方向直接带偏，因此这里改为调用方显式传入。
     #[must_use]
-    pub fn to_error(self, context: &str, held: CapabilitySet) -> Option<Error> {
+    pub fn to_error(
+        self,
+        context: &str,
+        needed: pinbridge_core::Capability,
+        held: CapabilitySet,
+    ) -> Option<Error> {
         match self {
             Self::Ok => None,
             Self::NotAttached | Self::Busy | Self::Timeout => Some(Error::TargetUnavailable(
                 format!("{context}: {}", self.message()),
             )),
-            Self::CapabilityDenied => Some(Error::CapabilityDenied {
-                needed: pinbridge_core::Capability::MemRead,
-                held,
-            }),
+            Self::CapabilityDenied => Some(Error::CapabilityDenied { needed, held }),
+            // "不支持"不是协议错误、更不是轨迹错误：它是"当前环境（平台/Pin 版本/
+            // M0 的桩）做不了这件事"。映射到 Trace 会让读日志的人去查轨迹文件，
+            // 而去查"到底哪一层没实现"才是正确方向。
+            Self::NotSupported => Some(Error::TargetUnavailable(format!(
+                "{context}: {}（该能力尚未实现或当前平台不具备；M0 的桩会显式走到这里）",
+                self.message()
+            ))),
             Self::AbiMismatch | Self::InvalidArgument => {
                 Some(Error::Protocol(format!("{context}: {}", self.message())))
             }
@@ -213,13 +227,18 @@ impl Status {
 
 /// 把 C 状态码转成 `Result`，非零时附带上下文。
 ///
-/// `held` 用于把"能力不足"还原成可读的能力集（`Status::CapabilityDenied`
-/// 在 ABI 上只是一个整数，上层需要自己补上上下文）。
-pub fn check(code: i32, context: &str, held: CapabilitySet) -> Result<()> {
+/// `needed` / `held` 用于把"能力不足"还原成可读的能力集
+/// （`Status::CapabilityDenied` 在 ABI 上只是一个整数，上层需要自己补上上下文）。
+pub fn check(
+    code: i32,
+    context: &str,
+    needed: pinbridge_core::Capability,
+    held: CapabilitySet,
+) -> Result<()> {
     match Status::from_code(code) {
         Some(Status::Ok) => Ok(()),
         Some(status) => Err(status
-            .to_error(context, held)
+            .to_error(context, needed, held)
             .unwrap_or_else(|| Error::Trace(format!("{context}: 未知状态码 {code}")))),
         None => Err(Error::Protocol(format!("{context}: 未知状态码 {code}"))),
     }
@@ -249,6 +268,7 @@ pub unsafe fn cstr_to_string(ptr: *const c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pinbridge_core::capability::Capability;
 
     #[test]
     fn event_layout_is_explicit_and_stable() {
@@ -295,9 +315,35 @@ mod tests {
             assert_eq!(status.code(), PbStatus::from_rust(status) as i32);
         }
         assert_eq!(Status::from_code(12345), None);
-        assert!(check(0, "ctx", CapabilitySet::empty()).is_ok());
-        assert!(check(-3, "ctx", CapabilitySet::empty()).is_err());
-        assert!(check(77, "ctx", CapabilitySet::empty()).is_err());
+        assert!(check(0, "ctx", Capability::MemRead, CapabilitySet::empty()).is_ok());
+        assert!(check(-3, "ctx", Capability::MemRead, CapabilitySet::empty()).is_err());
+        assert!(check(77, "ctx", Capability::MemRead, CapabilitySet::empty()).is_err());
+    }
+
+    #[test]
+    fn error_mapping_keeps_the_real_gap_visible() {
+        // 能力不足必须回答"缺哪一项"，而不是固定填一个占位能力：
+        // 错误的错误信息会把排查方向带偏。
+        let held = Capability::read_only_baseline();
+        let err = check(-3, "pause", Capability::ProcessControl, held).unwrap_err();
+        match err {
+            Error::CapabilityDenied {
+                needed,
+                held: actual,
+            } => {
+                assert_eq!(needed, Capability::ProcessControl, "缺的能力必须如实回报");
+                assert_eq!(actual, held, "持有的能力集必须原样回报");
+            }
+            other => panic!("能力不足应映射为 CapabilityDenied，实际: {other:?}"),
+        }
+
+        // "不支持"不是轨迹错误：它必须指向"实现/平台不具备"，否则读日志的人
+        // 会去翻轨迹文件，而真正该查的是哪一层没实现。
+        let err = check(-4, "pause", Capability::ProcessControl, held).unwrap_err();
+        assert!(
+            matches!(err, Error::TargetUnavailable(_)),
+            "不支持应映射为 TargetUnavailable，实际: {err:?}"
+        );
     }
 
     #[test]

@@ -12,9 +12,11 @@
 //! 一个错位的函数指针在插装场景下会直接把目标进程打崩，
 //! 而崩因会指向目标程序本身，排查代价极高。
 
-use std::ffi::c_void;
+use std::cell::Cell;
+use std::ffi::{c_void, CString};
 use std::os::raw::{c_char, c_int, c_uint};
 
+use pinbridge_core::capability::Capability;
 use pinbridge_core::error::{Error, Result};
 
 use crate::abi::{PbEventRaw, PbSet, Status};
@@ -29,10 +31,25 @@ use crate::abi::PB_ABI_VERSION;
 ///
 /// 所有函数都必须在这里列出；新增函数要同步改 `native/include/pinbridge.h`
 /// 与 `docs/specs/c-abi.md`。
-#[derive(Debug, Clone, Copy)]
+///
+/// 注意**刻意不是 `Copy`**：它持有"我们下发过的能力集"这一可变状态，
+/// 静默复制会让两份记录分叉（于是错误里的 `held` 开始说谎）。
+/// `Clone` 保留，但用它的地方应当先想清楚"谁拥有这条链路的状态"。
+#[derive(Debug, Clone)]
 pub struct Api {
     /// DLL 句柄（`HMODULE`）。**不实现 `Send`/`Sync`**：Pin 的会话是有线程归属的。
     handle: *mut c_void,
+    /// 最近一次成功下发的能力集。
+    ///
+    /// 为什么要记它：DLL 的能力不足只回报一个整数 -3，`Error::CapabilityDenied`
+    /// 却需要"需要什么/持有什么"。如果这里填一个空集或占位值，
+    /// 读错误的人（很可能是 AI）就会得到**错误的**上下文，
+    /// 进而去申请一个它其实已经有的能力。保存真实下发过的集合，
+    /// 才能让"能力不足"这条错误自洽。
+    ///
+    /// `Cell` 而不是 `Mutex`：`Api` 本来就刻意不是 `Send`/`Sync`（见上），
+    /// 加锁只会把一个"线程归属"问题变成一个"死锁"问题。
+    applied_bits: Cell<u32>,
     /// `uint32_t pb_abi_version(void)`
     pub abi_version: unsafe extern "C" fn() -> u32,
     /// `int32_t pb_start(const char* image_path, const char* args)`
@@ -99,6 +116,9 @@ pub fn load(name: &str) -> Result<Api> {
     let api = unsafe {
         Api {
             handle,
+            // 加载时 DLL 尚未被告知任何能力：真相来源是"还没下发过"，
+            // 因此初始值就是空集（fail-closed：没下发就什么都做不了）。
+            applied_bits: Cell::new(0),
             abi_version: resolve(handle, name, "pb_abi_version")?,
             start: resolve(handle, name, "pb_start")?,
             attach: resolve(handle, name, "pb_attach")?,
@@ -136,6 +156,16 @@ impl Api {
         self.handle
     }
 
+    /// 本侧记录的"目标端当前持有的能力集"。
+    ///
+    /// 它只反映**我们下发过**的内容——目标端才是真相来源。
+    /// 作用是让 `CapabilityDenied` 这类错误能自洽地报出"持有的是什么"，
+    /// 而不是填一个占位值把读错误的人（很可能是 AI）带偏。
+    #[must_use]
+    pub fn held_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::from_bits(self.applied_bits.get())
+    }
+
     /// 读取 `pb_last_error()` 的文本。
     ///
     /// # Safety
@@ -154,7 +184,7 @@ impl Api {
     pub fn drain(&self, buffer: &mut [PbEventRaw]) -> Result<usize> {
         if buffer.is_empty() {
             return Err(Status::InvalidArgument
-                .to_error("drain_events", Default::default())
+                .to_error("drain_events", Capability::MemRead, Default::default())
                 .unwrap());
         }
         let mut written: c_uint = 0;
@@ -162,7 +192,12 @@ impl Api {
             c_uint::try_from(buffer.len()).map_err(|_| Error::Protocol("事件缓冲区过大".into()))?;
         // SAFETY: buffer 是有效可写切片，容量与传入的 capacity 一致
         let code = unsafe { (self.drain_events)(buffer.as_mut_ptr(), capacity, &mut written) };
-        crate::abi::check(code, "drain_events", pinbridge_core::CapabilitySet::empty())?;
+        crate::abi::check(
+            code,
+            "drain_events",
+            Capability::MemRead,
+            self.held_capabilities(),
+        )?;
         Ok(written as usize)
     }
 
@@ -170,8 +205,86 @@ impl Api {
     pub fn apply_capabilities(&self, capabilities: PbSet) -> Result<()> {
         // SAFETY: 函数指针已在加载时校验
         let code = unsafe { (self.set_capabilities)(capabilities.0) };
-        crate::abi::check(code, "set_capabilities", CapabilitySet::from(capabilities))
+        crate::abi::check(
+            code,
+            "set_capabilities",
+            Capability::CapabilityGrant,
+            self.held_capabilities(),
+        )?;
+        // 只有真的成功了才更新本地记录：失败时 DLL 的能力集没变，
+        // 我们记的也必须没变（否则后续错误里的 held 会说谎）。
+        self.applied_bits.set(capabilities.0);
+        Ok(())
     }
+
+    /// 读回 DLL 自报的 ABI 版本（加载时已经校验过一致性，这里用于日志与断言）。
+    #[must_use]
+    pub fn abi_version(&self) -> u32 {
+        // SAFETY: 函数指针已在加载时校验
+        unsafe { (self.abi_version)() }
+    }
+
+    /// 启动目标并插装。
+    ///
+    /// 需要 Pin 的 JIT 注入：无 Pin 的实现（含 `agent_bridge.dll` 与 M0 的桩）
+    /// 会返回 `NotSupported`，本方法把它映射成 `TargetUnavailable` 并带上原因。
+    pub fn start(&self, image_path: &str, args: &str) -> Result<()> {
+        let image = c_string("start", image_path)?;
+        let args = c_string("start", args)?;
+        // SAFETY: 两个指针都指向本次调用期间存活的 CString 缓冲区
+        let code = unsafe { (self.start)(image.as_ptr(), args.as_ptr()) };
+        crate::abi::check(
+            code,
+            "start",
+            Capability::ProcessControl,
+            self.held_capabilities(),
+        )
+    }
+
+    /// 附加到已运行进程。
+    pub fn attach(&self, pid: u32) -> Result<()> {
+        // SAFETY: 函数指针已在加载时校验
+        let code = unsafe { (self.attach)(pid) };
+        crate::abi::check(
+            code,
+            "attach",
+            Capability::ProcessControl,
+            self.held_capabilities(),
+        )
+    }
+
+    /// 继续执行（`pb_continue`）。
+    pub fn resume(&self) -> Result<()> {
+        // SAFETY: 函数指针已在加载时校验
+        let code = unsafe { (self.resume)() };
+        crate::abi::check(
+            code,
+            "continue",
+            Capability::ProcessControl,
+            self.held_capabilities(),
+        )
+    }
+
+    /// 暂停执行（`pb_pause`）。
+    pub fn pause(&self) -> Result<()> {
+        // SAFETY: 函数指针已在加载时校验
+        let code = unsafe { (self.pause)() };
+        crate::abi::check(
+            code,
+            "pause",
+            Capability::ProcessControl,
+            self.held_capabilities(),
+        )
+    }
+}
+
+/// 把 `&str` 转成 ABI 需要的 NUL 结尾 C 串。
+///
+/// 含内嵌 NUL 的字符串无法表达成 C 串——这是**调用方的 bug**，
+/// 因此报 `Protocol` 而不是悄悄截断（截断会让目标上出现"半条路径"）。
+fn c_string(context: &str, text: &str) -> Result<CString> {
+    CString::new(text)
+        .map_err(|_| Error::Protocol(format!("{context}: 字符串含内嵌 NUL，无法作为 C 串传递")))
 }
 
 use pinbridge_core::capability::CapabilitySet;
@@ -197,7 +310,7 @@ mod tests {
     fn zero_length_drain_buffer_is_rejected_before_any_call() {
         // 用一个伪造的 Api 无法安全构造，这里只验证状态码映射的语义
         let err = Status::InvalidArgument
-            .to_error("drain_events", CapabilitySet::empty())
+            .to_error("drain_events", Capability::MemRead, CapabilitySet::empty())
             .unwrap();
         assert!(matches!(err, Error::Protocol(_)));
     }
