@@ -139,6 +139,11 @@ KNOB<std::string> KnobSyscallMax(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_max
 // ② 采样按**线程**独立计数，两条线程不会互相吃掉对方的样本起点。
 KNOB<std::string> KnobSyscallSample(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_sample", "1",
                                     "系统调用事件每 N 条保留 1 条（1 = 全部保留；在入队前过滤）");
+// 脱壳场景验收用：**要求这些系统调用号必须出现过**（逗号分隔的十六进制）。
+// 号由测试脚本从靶子那里问来（靶子自己读 ntdll 的桩），所以这里不需要一张
+// 会随 Windows 版本过期的 SSN ↔ 名字表。
+KNOB<std::string> KnobRequireSsn(KNOB_MODE_WRITEONCE, "pintool", "pb_require_ssn", "",
+                                 "要求观察到的系统调用号（如 0x50,0x8；空 = 不检查）");
 // 自动化判据用：捕获数低于这个值时工具**自己以非零退出**。
 // 为什么放在工具里而不是靠测试脚本数日志行：退出码是机器可判定的，
 // 而"数日志里出现了几次"既脆弱又会被日志格式改动打断。
@@ -260,6 +265,79 @@ T resolve(ModuleHandle module, const char* name) {
   return reinterpret_cast<T>(reinterpret_cast<void*>(::GetProcAddress(module, name)));
 }
 
+/// 必须出现过的系统调用号（`-pb_require_ssn`，逗号分隔的十六进制）。
+///
+/// 为什么按**号**要求而不是按名字：工具侧没有 SSN ↔ 名字的映射，而那张映射表
+/// 随 Windows 版本变化。测试脚本先从靶子（它自己读 ntdll 的桩）拿到号，再把它
+/// 传进来，于是"要求"这件事不依赖工具有一张会过期的表。
+///
+/// 用裸数组而不是 `std::vector`：Pin 的包含顺序会先引入它自带的 STL 头，
+/// 实测 `std::vector` 在这个编译单元里不好用（见下面 buffer 处的同款注释）。
+constexpr UINT32 kMaxRequiredSsns = 8;
+UINT64 g_required_ssns[kMaxRequiredSsns] = {0, 0, 0, 0, 0, 0, 0, 0};
+UINT32 g_required_ssn_count = 0;
+/// 见过的系统调用号（按号索引的位图）。8192 够 Windows 现在用（实际几百个），
+/// 超出范围的号**不记**——不是丢数据，是"这个工具不假装认识它"。
+constexpr UINT32 kSsnSlots = 8192;
+bool g_ssn_seen[kSsnSlots] = {};
+/// 解析逗号分隔的十六进制系统调用号表（`-pb_require_ssn "0x50,0x8"`）。
+///
+/// 解析不了的条目**明确报出来并跳过**：静默跳过会让"我要求了它，但表里其实没有"
+/// 变成一条永远不会失败的要求——那是比报错更糟的结果。
+UINT32 parse_ssn_list(const char* text, UINT64* out, UINT32 capacity) {
+  if (text == nullptr || *text == '\0') {
+    return 0;
+  }
+  UINT32 count = 0;
+  const char* cursor = text;
+  while (*cursor != '\0' && count < capacity) {
+    while (*cursor == ' ' || *cursor == ',') {
+      ++cursor;
+    }
+    if (*cursor == '\0') {
+      break;
+    }
+    UINT64 value = 0;
+    UINT32 digits = 0;
+    if (cursor[0] == '0' && (cursor[1] == 'x' || cursor[1] == 'X')) {
+      cursor += 2;
+      while ((*cursor >= '0' && *cursor <= '9') || (*cursor >= 'a' && *cursor <= 'f') ||
+             (*cursor >= 'A' && *cursor <= 'F')) {
+        const UINT64 digit = static_cast<UINT64>(
+            *cursor <= '9' ? *cursor - '0' : ((*cursor | 0x20) - 'a' + 10));
+        value = value * 16 + digit;
+        ++cursor;
+        ++digits;
+      }
+    } else {
+      while (*cursor >= '0' && *cursor <= '9') {
+        value = value * 10 + static_cast<UINT64>(*cursor - '0');
+        ++cursor;
+        ++digits;
+      }
+    }
+    if (digits == 0) {
+      report("系统调用号列表里有解析不了的片段（从 \"%s\" 起），已跳过", cursor);
+      ++cursor;
+      continue;
+    }
+    if (value >= kSsnSlots) {
+      report("要求观察的系统调用号 0x%llX 超出可记录范围（< 0x%X），已忽略",
+             static_cast<unsigned long long>(value), kSsnSlots);
+      continue;
+    }
+    out[count] = value;
+    ++count;
+    while (*cursor != '\0' && *cursor != ',') {
+      ++cursor;
+    }
+  }
+  if (*cursor != '\0') {
+    report("要求的系统调用号超过 %u 个，多余的已忽略", capacity);
+  }
+  return count;
+}
+
 /// 加载并校验转发层。**先校验 ABI 版本，再解析其余符号**：
 /// 反过来的话，版本不匹配的 DLL 里同名函数会被按错误的签名调用。
 bool load_bridge() {
@@ -369,6 +447,7 @@ UINT64 g_required_syscall_exits = 0;
 UINT64 g_required_mem = 0;
 UINT64 g_required_pattern_hits = 0;
 UINT64 g_required_tf_sets = 0;
+
 volatile long g_syscall_sites = 0;
 /// 返回点插装数（挂在 `syscall` 的下一条指令上）。
 volatile long g_syscall_exit_sites = 0;
@@ -1210,6 +1289,11 @@ void OnSyscallEnter(THREADID tid, ADDRINT address, ADDRINT ssn, ADDRINT arg0,
   const UINT64 args[5] = {static_cast<UINT64>(ssn), static_cast<UINT64>(arg0),
                           static_cast<UINT64>(arg1), static_cast<UINT64>(arg2),
                           static_cast<UINT64>(arg3)};
+  // 先记"见过这个号"，**再**过采样：前置过滤是为了少产生事件，不是为了
+  // 让"这个系统调用到底发生过没有"变得不可知。
+  if (static_cast<UINT64>(ssn) < kSsnSlots) {
+    g_ssn_seen[static_cast<UINT64>(ssn)] = true;
+  }
   if (syscall_event_kept(stats)) {
     push_probe_event(stats, 3 /* PB_EV_SYSCALL_ENTER */, tid, address, args, 5);
   }
@@ -1932,6 +2016,28 @@ void OnFini(INT32 code, VOID* v) {
       }
     }
   }
+  // ── 系统调用号的账（脱壳场景验收）─────────────────────────────────────
+  //
+  // 判据是"这些号**出现过**"，而不是"出现了多少次"：脱壳器有没有做"改内存属性"
+  // 与"写盘"是**定性**问题——次数受负载与版本影响，定性不受。
+  if (g_required_ssn_count != 0) {
+    UINT32 missing = 0;
+    for (UINT32 i = 0; i < g_required_ssn_count; ++i) {
+      const UINT64 ssn = g_required_ssns[i];
+      if (ssn < kSsnSlots && g_ssn_seen[ssn]) {
+        report("✓ 观察到系统调用号 0x%llX", static_cast<unsigned long long>(ssn));
+      } else {
+        ++missing;
+        // 措辞与既有 `-pb_require_*` 一致（`失败：要求…`），于是 ctest 的
+        // FAIL_REGULAR_EXPRESSION 能直接用它——这是本文件"要求类"判据的既有约定。
+        report("失败：要求观察到系统调用号 0x%llX，但整个运行里一次都没出现",
+               static_cast<unsigned long long>(ssn));
+      }
+    }
+    if (missing == 0) {
+      report("✓ 要求观察的系统调用号全部出现（%u 个）", g_required_ssn_count);
+    }
+  }
   // ── TF 单步的账 ───────────────────────────────────────────────────────
   if (g_tf_enabled) {
     report("TF 单步：置位意图 %llu 次、清除意图 %llu 次，真实单步异常 %llu 次",
@@ -2143,6 +2249,8 @@ int main(int argc, char** argv) {
     }
     g_tf_enabled = g_tf_mode != TfMode::Off;
     g_required_tf_sets = parse_u64(KnobRequireTfSets.Value().c_str(), 0);
+  g_required_ssn_count =
+      parse_ssn_list(KnobRequireSsn.Value().c_str(), g_required_ssns, kMaxRequiredSsns);
     report("TF 单步：%s%s", tf_mode.c_str(),
            g_tf_mode == TfMode::Virtualize
                ? "（**会改变目标行为**：真实 TF 会被剥掉，目标读到的仍是置位的）"

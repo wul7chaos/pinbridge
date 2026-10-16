@@ -262,6 +262,96 @@ int tf_threads_experiment(unsigned long rounds) {
   return 0;
 }
 
+// ------------------------------------------------- 脱壳场景（M2 验收靶子）
+//
+// 脱壳器在真实场景里做两件最容易识别的事：
+//   1. **改内存属性**：把刚解压出来的代码页从 RW 改成 RX/RWX
+//      （`VirtualProtect` → `NtProtectVirtualMemory`）；
+//   2. **写盘**：把 dump / payload 落到文件
+//      （`CreateFile` + `WriteFile` → `NtCreateFile` / `NtWriteFile`）。
+//
+// 靶子把这两件事**真做一遍**（自写靶子，不拿外部样本），并把自己要用到的系统调用号
+// **从 ntdll 的桩里读出来**报给测试脚本——系统调用号随 Windows 版本变化，
+// 写死一个数字会让用例在别的机器上变成"工具坏了"这种假失败。
+//
+// 读法：x64 的 ntdll 桩是
+//     mov r10, rcx ; mov eax, <SSN> ; test ... ; syscall ; ret
+// 第 4 个字节起是 4 字节小端 SSN。
+
+/// 从 `ntdll` 的某个导出桩里读出系统调用号；读不到返回 0。
+unsigned long read_ssn(const char* export_name) {
+  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  if (ntdll == nullptr) {
+    return 0;
+  }
+  const unsigned char* stub =
+      reinterpret_cast<const unsigned char*>(GetProcAddress(ntdll, export_name));
+  if (stub == nullptr) {
+    return 0;
+  }
+  // 前两条指令是 `4C 8B D1`(mov r10,rcx) 与 `B8 xx xx xx xx`(mov eax,imm32)。
+  // 校验这两个字节：导出的若是个跳板（被 hook / forwarder），原样读会得到一个
+  // **看起来合理**的垃圾值——那比读不到危险得多。
+  if (stub[0] != 0x4C || stub[1] != 0x8B || stub[2] != 0xD1 || stub[3] != 0xB8) {
+    return 0;
+  }
+  unsigned long ssn = 0;
+  std::memcpy(&ssn, stub + 4, sizeof(ssn));
+  return ssn;
+}
+
+/// `--print-ssns`：报出脱壳场景要用到的两个系统调用号。
+void print_unpack_ssns() {
+  std::printf("PB_SSN protect=0x%lX write=0x%lX\n", read_ssn("NtProtectVirtualMemory"),
+              read_ssn("NtWriteFile"));
+}
+
+/// `--unpack-scenario`：改内存属性 + 写盘，各做一次（真实调用，不是模拟）。
+int unpack_scenario() {
+  // 1) 申请一块可读写内存，往里放一段"解压出来的代码"（这里用数据代替：
+  //    验收看的是**系统调用时机**，不是那段代码本身能不能跑）。
+  void* region = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (region == nullptr) {
+    std::printf("PB_UNPACK FAIL alloc\n");
+    return 1;
+  }
+  std::memcpy(region, "PBRIDGE-UNPACKED-PAYLOAD", 24);
+
+  // 2) 改属性：RW → RWX（脱壳器的这一步就是给刚写好的代码页开执行权）
+  DWORD previous = 0;
+  if (!VirtualProtect(region, 4096, PAGE_EXECUTE_READWRITE, &previous)) {
+    std::printf("PB_UNPACK FAIL protect\n");
+    return 1;
+  }
+
+  // 3) 写盘：把这段 payload 落到临时文件（脱壳器落 dump 的形状）
+  char path[MAX_PATH] = {};
+  const DWORD used = GetTempPathA(MAX_PATH, path);
+  if (used == 0 || used + 32 >= MAX_PATH) {
+    std::printf("PB_UNPACK FAIL temp-path\n");
+    return 1;
+  }
+  std::strcat(path, "pinbridge-unpack-dump.bin");
+  HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    std::printf("PB_UNPACK FAIL create-file\n");
+    return 1;
+  }
+  DWORD written = 0;
+  const BOOL ok = WriteFile(file, region, 24, &written, nullptr);
+  CloseHandle(file);
+  if (!ok || written != 24) {
+    std::printf("PB_UNPACK FAIL write-file\n");
+    return 1;
+  }
+  DeleteFileA(path);
+
+  std::printf("PB_UNPACK ok region=0x%p previous=0x%lX bytes=%lu\n", region, previous,
+              written);
+  return 0;
+}
+
 // ---------------------------------------------------------------- agent 检查
 //
 // 在被插装的进程里直接驱动 agent。刻意用**运行期加载 + 取符号**而不是链接导入库：
@@ -523,6 +613,8 @@ int main(int argc, char** argv) {
   unsigned long pattern_hits = 0;
   unsigned long tf_sets = 0;
   unsigned long tf_thread_rounds = 0;
+  bool print_ssns = false;
+  bool unpack = false;
   bool print_buffer = false;
   const char* agent_dll = nullptr;
   const char* agent_script = nullptr;
@@ -539,6 +631,10 @@ int main(int argc, char** argv) {
       tf_sets = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--tf-threads") == 0 && i + 1 < argc) {
       tf_thread_rounds = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--print-ssns") == 0) {
+      print_ssns = true;
+    } else if (std::strcmp(argv[i], "--unpack-scenario") == 0) {
+      unpack = true;
     } else if (std::strcmp(argv[i], "--print-buffer") == 0) {
       print_buffer = true;
     } else if (std::strcmp(argv[i], "--agent-check") == 0 && i + 2 < argc) {
@@ -547,6 +643,13 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (print_ssns) {
+    print_unpack_ssns();
+    return 0;
+  }
+  if (unpack) {
+    return unpack_scenario();
+  }
   if (tf_thread_rounds != 0) {
     return tf_threads_experiment(tf_thread_rounds);
   }

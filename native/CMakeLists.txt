@@ -461,6 +461,20 @@ if(BUILD_TESTING)
         FAIL_REGULAR_EXPRESSION "溢出丢弃 [1-9]"
         SKIP_RETURN_CODE 77)
 
+      # ── 脱壳场景验收（M2）：改内存属性 + 写盘能被系统调用时机观察到 ──────
+      #
+      # 判据是"某两个系统调用号必须出现过"，而号随 Windows 版本变化，
+      # 所以脚本先问靶子（它自己读 ntdll 的桩）再去跑工具。
+      # 脚本里还有一条**反向对照**：要求一个不存在的号必须失败——
+      # 否则"正向通过"可能只是因为这条检查根本没生效。
+      if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-unpack-scenario.ps1")
+        add_test(NAME pin_tool_unpack_scenario
+          COMMAND pwsh -NoProfile -File
+                  "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-unpack-scenario.ps1"
+                  -PinRoot "third_party/pin" -BuildDir "native/build-pin")
+        set_tests_properties(pin_tool_unpack_scenario PROPERTIES SKIP_RETURN_CODE 77)
+      endif()
+
       add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-mem-probe.ps1"
