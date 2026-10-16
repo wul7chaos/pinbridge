@@ -20,6 +20,7 @@ pub mod event;
 pub mod fold;
 pub mod pbt;
 pub mod slice;
+pub mod taint;
 pub mod varint;
 
 pub use callgraph::{

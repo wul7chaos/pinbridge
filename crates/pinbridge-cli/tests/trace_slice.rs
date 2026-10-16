@@ -156,3 +156,61 @@ fn the_coverage_gap_from_the_audit_channel_precedes_the_conclusion() {
         "记录本身仍然照常统计: {stdout}"
     );
 }
+
+/// 污点传播的 CLI 端到端判据（ADR 0014 的验收）：`--compare` 必须显示
+/// **字节级比近似粒度少报**，且差值等于被连坐的字节数。
+///
+/// 造数据：一次 8 字节写入里只有低 4 字节来自此前读到的值。
+#[test]
+fn the_taint_command_shows_byte_granularity_beating_the_region_approximation() {
+    let path = temp_path("taint");
+    let file = std::fs::File::create(&path).expect("建立轨迹文件");
+    let mut writer = PbtWriter::create(file, 0).expect("建立写入器");
+    writer.meta("{\"target\":\"taint\"}").expect("写 meta");
+    let mut reader_event = Event::new(1, EventKind::MemRead, 7, 0x1000)
+        .with_arg(0, 0x5000)
+        .with_arg(1, 8)
+        .with_arg(2, 0xDEAD_BEEF_4433_2211);
+    reader_event.sequence = 1;
+    writer.write_record(&reader_event).expect("写读事件");
+    let mut write_event = Event::new(2, EventKind::MemWrite, 7, 0x2000)
+        .with_arg(0, 0x6000)
+        .with_arg(1, 8)
+        .with_arg(2, 0xAABB_CCDD_4433_2211);
+    write_event.sequence = 2;
+    writer.write_record(&write_event).expect("写写事件");
+    writer.finish().expect("收尾");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pinbridge"))
+        .args([
+            "taint",
+            &path.to_string_lossy(),
+            "--at",
+            "0x6000",
+            "--len",
+            "8",
+            "--compare",
+        ])
+        .output()
+        .expect("运行 pinbridge taint");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "命令失败: {stdout}");
+    assert!(stdout.contains("PB_TAINT"), "要有机器行: {stdout}");
+    assert!(stdout.contains("granularity=byte"), "默认字节级: {stdout}");
+    assert!(
+        stdout.contains("candidates=4"),
+        "只有 4 字节来自源: {stdout}"
+    );
+    assert!(
+        stdout.contains("unresolved=4"),
+        "其余 4 字节追溯不到: {stdout}"
+    );
+    assert!(
+        stdout.contains("region : 候选 8"),
+        "近似会把整块算上: {stdout}"
+    );
+    assert!(
+        stdout.contains("多报 4 个候选"),
+        "差值就是误报字节数: {stdout}"
+    );
+}

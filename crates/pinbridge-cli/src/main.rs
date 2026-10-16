@@ -25,6 +25,7 @@ use pinbridge_trace::event::EventKind;
 use pinbridge_trace::fold::expand_records;
 use pinbridge_trace::pbt::{PbtReader, Summary};
 use pinbridge_trace::slice::{parse_coverage_audit, reverse_slice};
+use pinbridge_trace::taint::{propagate, Granularity};
 
 /// 报告里最多列出几处分岔（总数仍然准确）。
 const MAX_DIFFERENCES: usize = 8;
@@ -115,6 +116,28 @@ fn main() -> ExitCode {
             }
             None => {
                 eprintln!("用法: pinbridge calls <FILE.pbt> [--top N]");
+                ExitCode::FAILURE
+            }
+        },
+        "taint" => match args.get(1) {
+            Some(path) => match parse_at(&args) {
+                Some(target) => match taint_command(path, target, parse_len(&args), &args) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("污点传播失败: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "用法：pinbridge taint <轨迹> --at <地址> [--len <长度>] \
+                         [--granularity byte|region] [--compare]"
+                    );
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("用法：pinbridge taint <轨迹> --at <地址> [--len <长度>]");
                 ExitCode::FAILURE
             }
         },
@@ -285,6 +308,58 @@ fn calls(path: &str, top: usize) -> Result<(), String> {
     Ok(())
 }
 /// `pinbridge slice A.pbt --at 0x… [--len N]`：地址级反向切片（见 ADR 0013）。
+/// 污点传播：`pinbridge taint <轨迹> --at <地址> [--len N] [--granularity byte|region] [--compare]`
+///
+/// `--compare` 会在**同一份事件流**上跑两个粒度并给出候选数之差——ADR 0014 的验收
+/// 判据就是它（"误报显著减少"必须能被测出来，否则这句话没有意义）。
+fn taint_command(path: &str, target: u64, len: u64, args: &[String]) -> Result<(), String> {
+    let (events, _summary) = load_trace(path)?;
+    let mut gap = None;
+    if let Ok(mut reader) =
+        pinbridge_trace::pbt::PbtReader::open(std::fs::File::open(path).map_err(|e| e.to_string())?)
+    {
+        let _ = reader.read_all();
+        gap = parse_coverage_audit(reader.audit_log());
+    }
+    let requested = args
+        .iter()
+        .position(|arg| arg == "--granularity")
+        .and_then(|index| args.get(index + 1))
+        .map_or(Some(Granularity::Byte), |text| Granularity::parse(text));
+    let Some(requested) = requested else {
+        return Err("--granularity 只能是 byte 或 region".to_owned());
+    };
+
+    let mut report = propagate(&events, target, len, requested);
+    report.coverage_gap = gap;
+    println!("文件: {path}（{len} 字节的窗口）");
+    print!("{}", report.render());
+    println!("{}", report.machine_line());
+
+    if args.iter().any(|arg| arg == "--compare") {
+        // 同一份事件流、同一遍回放，只有匹配那一步不同 —— 差别只可能来自粒度。
+        let rough = propagate(&events, target, len, Granularity::Region);
+        println!("\n粒度对比（同一份事件流）：");
+        println!(
+            "  byte   : 候选 {} 个、唯一来源 {} 字节、追溯不到 {} 字节",
+            report.candidates, report.exact_bytes, report.unresolved
+        );
+        println!(
+            "  region : 候选 {} 个、唯一来源 {} 字节、追溯不到 {} 字节",
+            rough.candidates, rough.exact_bytes, rough.unresolved
+        );
+        let extra = rough.candidates.saturating_sub(report.candidates);
+        println!(
+            "  ⇒ 近似粒度多报 {extra} 个候选（占近似总数的 {}%），这就是字节级相对它的增益。",
+            (extra * 100).checked_div(rough.candidates).unwrap_or(0)
+        );
+        if extra == 0 {
+            println!("  （本例两个粒度结果相同：写入的值整体来自某次读取，没有部分匹配。）");
+        }
+    }
+    Ok(())
+}
+
 fn slice_command(path: &str, target: u64, len: u64) -> Result<(), String> {
     let (events, _summary) = load_trace(path)?;
     let mut slice = reverse_slice(&events, target, len);
