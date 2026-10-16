@@ -35,6 +35,7 @@ use pinbridge_core::capability::Capability;
 use pinbridge_sys::abi::{cstr_to_string, PbEventRaw, Status, PB_ABI_VERSION};
 
 use crate::host::{kind_name, AgentHost};
+use pinbridge_trace::event::EventKind;
 
 /// 探测 ABI 版本。**加载器必须先调它**，版本不符时拒绝加载。
 #[unsafe(no_mangle)]
@@ -107,7 +108,143 @@ pub unsafe extern "C" fn pb_push_event(raw: *const PbEventRaw) -> c_int {
     }
     // SAFETY: 上面已判空；调用方保证指针在本次调用期间有效
     let event = unsafe { *raw };
+    // ── 先分发，再入队 ──
+    //
+    // 顺序是刻意的：脚本可能在回调里 `pb.mark`/`pb.log`，那些输出会产生
+    // **新的** ScriptOutput 事件。先分发再入队，能让这些输出紧跟在
+    // "触发它的事件"之后出现在事件流里；反过来会让因果顺序看起来是反的。
+    dispatch_to_scripts(&event);
     AgentHost::call(|state| state.push(&event).map(|_| ()))
+}
+
+/// 把一条入站事件交给脚本的订阅者，并把脚本产生的输出转成事件。
+///
+/// 这里是"探针 → 脚本 → 轨迹"这条链的中间一环。三个约束：
+///
+/// 1. **没有脚本时不碰解释器**：绝大多数运行里没有脚本，这条路径必须近乎零成本；
+/// 2. 事件名用 `EventKind::name()`（`syscall_enter` 这种），与脚本里
+///    `pb.subscribe("syscall_enter", ...)` 的写法一致——两处名字不一致的话，
+///    脚本会"注册成功但永远不被调用"，那是最难查的一类问题；
+/// 3. 脚本抛异常不能把探针打死：错误只记录，不让 `pb_push_event` 失败。
+fn dispatch_to_scripts(event: &PbEventRaw) {
+    let Some(kind) = EventKind::from_code(event.kind) else {
+        return; // 未知类型：不是脚本要关心的东西
+    };
+    let has_script =
+        AgentHost::with(|state| !state.script_host().subscribers(event.kind).is_empty());
+    if !has_script {
+        return;
+    }
+    let payload = serde_json::json!({
+        "sequence": event.sequence,
+        "thread": event.thread_id,
+        "address": event.address,
+        "args": event.args,
+    })
+    .to_string();
+    let outcome = crate::python_host::dispatch(kind.name(), &payload);
+    match outcome {
+        Ok(called) => {
+            if called != 0 {
+                let (outputs, _) = collect_script_outputs();
+                emit_script_outputs(&outputs);
+            }
+        }
+        // 脚本出错**不能让探针失败**：记录到 last_error 里就够了。
+        // 否则一个写错的脚本会把整条插装链路带崩，而那与"探针是否工作"无关。
+        Err(error) => {
+            AgentHost::with(|state| {
+                // `Status` 里没有"脚本错误"这一档（它是 ABI 的固定集合），
+                // 用 `Internal` 并在文本里说清影响面——调用方最需要知道的是
+                // **探针没有受影响**，而不是错误被归到哪个码。
+                state.fail(
+                    Status::Internal,
+                    &format!("脚本分发失败（探针不受影响）：{error}"),
+                )
+            });
+        }
+    }
+}
+
+/// 取走脚本输出，返回（输出条目，订阅的事件类型码）。
+///
+/// 队列项的编码是 `[kind, value, text]`：1 = log、2 = mark、3 = subscribe。
+/// 订阅项在这里被翻译成**事件类型码**（分发侧按码查找）。
+fn collect_script_outputs() -> (Vec<(u64, u64, String)>, Vec<u8>) {
+    let mut outputs = Vec::new();
+    let mut subscribed = Vec::new();
+    let Ok(text) = crate::python_host::drain_outputs() else {
+        return (outputs, subscribed);
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+        return (outputs, subscribed);
+    };
+    for entry in entries {
+        let Some(items) = entry.as_array() else {
+            continue;
+        };
+        let kind = items
+            .first()
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let value = items
+            .get(1)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let text = items
+            .get(2)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if kind == 3 {
+            // 订阅：把名字翻译成类型码。翻不出来要说出来——"订阅了一个
+            // 拼错的事件名"必须能被看见，否则脚本会静默地收不到事件。
+            match event_kind_by_name(&text) {
+                Some(code) => {
+                    if !subscribed.contains(&code) {
+                        subscribed.push(code);
+                    }
+                }
+                None => {
+                    AgentHost::with(|state| {
+                        let _ = state.fail(
+                            Status::InvalidArgument,
+                            &format!("脚本订阅了未知事件名 \"{text}\"（见 EventKind 的名字表）"),
+                        );
+                    });
+                }
+            }
+            continue;
+        }
+        outputs.push((kind, value, text));
+    }
+    (outputs, subscribed)
+}
+
+/// 事件名 → 类型码。名字表来自 `EventKind::name()`，与文档里的写法一致。
+fn event_kind_by_name(name: &str) -> Option<u8> {
+    // 覆盖全部类型：少一个名字就意味着那个事件"订阅了但收不到"。
+    (0u8..=13)
+        .filter_map(EventKind::from_code)
+        .find(|kind| kind.name() == name)
+        .map(EventKind::code)
+}
+
+/// 把 `log` / `mark` 输出转成 `ScriptOutput` 事件。
+fn emit_script_outputs(outputs: &[(u64, u64, String)]) {
+    for (kind, value, _text) in outputs {
+        let mut raw = PbEventRaw::EMPTY;
+        raw.kind = EventKind::ScriptOutput.code();
+        raw.thread_id = 0;
+        // 事件的 args 是**数字**（`.pbt` 的模型就是这样）：类别与数值在这里，
+        // 文本目前只留在脚本侧的输出里（审计通道见 docs/design/script-runtime.md）。
+        raw.address = *value;
+        raw.args[0] = *kind;
+        raw.args[1] = *value;
+        // `push` 返回状态码（不是 Result）：输出推不进去（例如队列满）不该让
+        // 调用方以为脚本执行失败；丢弃由事件队列自己的 dropped 计数记录。
+        let _ = AgentHost::with(|state| state.push(&raw).is_ok());
+    }
 }
 
 /// 取走事件批次。
@@ -334,27 +471,75 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
         });
     }
     // 到这里才碰解释器。三种结局，都**明确**说清：
-    //   1. 没有解释器          → not_supported + "装 Python 或指定 PINBRIDGE_PYTHON_DLL"
-    //   2. 有解释器、模块未实现 → not_supported + "解释器已就绪（xxx），pb 模块与回调分发待实现"
-    //   3. 解释器能跑脚本       → 下一步：注册脚本并分发回调
-    match crate::python_host::library_description() {
-        Ok(described) => AgentHost::with(|state| {
-            state.fail(
-                Status::NotSupported,
-                &format!(
-                    "pb_load_script: 脚本已通过策略检查，解释器已就绪（{described}）；\
-                     但 `pb` 模块（subscribe/log/mark/read）与探针回调分发尚未实现，\
-                     因此脚本不会被注册。见 docs/design/script-runtime.md 的落地顺序。"
-                ),
-            )
-        }),
-        Err(error) => AgentHost::with(|state| {
+    //   1. 没有解释器 → not_supported + "装 Python 或指定 PINBRIDGE_PYTHON_DLL"
+    //   2. 引导失败   → internal + 原因（解释器在，但 `pb` 模块装不上）
+    //   3. 脚本出错   → internal + CPython 已经打印的堆栈（`PyErr_Print`）
+    if let Err(error) = crate::python_host::bootstrap() {
+        return AgentHost::with(|state| {
             state.fail(
                 Status::NotSupported,
                 &format!("pb_load_script: 策略检查已通过，但解释器不可用——{error}"),
             )
-        }),
+        });
     }
+    // 跑脚本：这一步之后脚本里的 `pb.subscribe(...)` 才真正注册上。
+    let described = crate::python_host::library_description().unwrap_or_default();
+    let run = {
+        // 用 `dispatch` 之外的一条窄路径：这里需要"执行这段源码"，
+        // 所以走宿主自己的 run（同样持 GIL）。
+        crate::python_host::run_source(&script_source)
+    };
+    if let Err(error) = run {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::Internal,
+                &format!("pb_load_script: 脚本执行失败——{error}"),
+            )
+        });
+    }
+    // 登记脚本（名称 + 源码哈希 + 状态），并把它订阅的事件类型记下来。
+    // 取回加载期输出，并从里面读出**脚本实际订阅了哪些事件**。
+    //
+    // 为什么以"脚本实际调用"为准而不是解析源码文本：`pb.subscribe` 可能写在
+    // 条件分支里、可能由变量拼出名字，文本解析会给出一个"看起来对但没生效"的
+    // 订阅列表——而分发侧只看这个列表，于是脚本会静默地永远收不到事件。
+    let (outputs, subscribed) = collect_script_outputs();
+    let registered = AgentHost::with(|state| {
+        match state
+            .script_host_mut()
+            .register(&script_name, &script_source, subscribed)
+        {
+            Ok(script) => script.id,
+            Err(error) => {
+                let _ = state.fail(Status::Internal, &error.to_string());
+                0
+            }
+        }
+    });
+    if registered != 0 {
+        // 状态机迁移（Registered → Loaded）单独一步：登记成功但迁移失败也要能
+        // 看见，而不是让"已登记但永远不会收到事件"变成沉默的事实。
+        let _ = AgentHost::with(|state| state.script_host_mut().mark_loaded(registered).is_ok());
+    }
+    if registered == 0 {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::Internal,
+                "pb_load_script: 登记脚本失败（见 last_error）",
+            )
+        });
+    }
+    // 加载期的 log / mark 也要变成事件（订阅那几条已经用掉了）。
+    emit_script_outputs(&outputs);
+    AgentHost::with(|state| {
+        state.fail(
+            Status::Ok,
+            &format!(
+                "pb_load_script: 脚本 {registered} 已加载并执行（解释器 {described}）；\
+                 订阅的回调会在对应事件到达时被调用。加载期输出已转成 script_output 事件。"
+            ),
+        )
+    })
 }
 
 /// 开始录制轨迹（M0 已可用）。
@@ -483,6 +668,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 端到端（导出面）：加载一个订阅 `syscall_enter` 的脚本 → 推送两条事件 →
+    /// 脚本把看到的 SSN 用 `pb.mark` 报回来 → 输出变成 `script_output` 事件。
+    ///
+    /// 这条是 M1 的核心能力证据：**AI 写的脚本在目标进程里被探针事件驱动**。
+    #[test]
+    fn script_is_driven_by_pushed_events() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        assert_eq!(
+            pb_set_capabilities(Capability::ScriptLoad.bit() | Capability::MemRead.bit()),
+            Status::Ok.code()
+        );
+        let name = std::ffi::CString::new("driver").unwrap();
+        let source = std::ffi::CString::new(
+            r#"
+import pb
+
+def on_syscall(ev):
+    pb.mark("seen_ssn", ev.args[0])
+
+pb.subscribe("syscall_enter", on_syscall)
+"#,
+        )
+        .unwrap();
+        // SAFETY: 两个 CString 在本调用期间存活
+        let loaded = unsafe { pb_load_script(name.as_ptr(), source.as_ptr()) };
+        if loaded == Status::NotSupported.code() {
+            // 没装 Python 的环境（例如 CI 的 ubuntu 任务）：这条用例跳过，
+            // 但**不是静默通过**——原因必须能从 last_error 读出来。
+            // SAFETY: 立刻拷贝成 String
+            let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+            assert!(text.contains("解释器"), "跳过时必须说清原因：{text}");
+            println!("跳过：{text}");
+            return;
+        }
+        assert_eq!(loaded, Status::Ok.code(), "加载脚本应当成功");
+
+        // 推一条系统调用进入事件（kind=3，args[0]=SSN=0x50）
+        let mut raw = PbEventRaw::EMPTY;
+        raw.kind = EventKind::SyscallEnter.code();
+        raw.sequence = 1;
+        raw.address = 0x7ff6_0000_2000;
+        raw.args[0] = 0x50;
+        // SAFETY: raw 指向本栈变量
+        assert_eq!(unsafe { pb_push_event(&raw) }, Status::Ok.code());
+
+        // 循环取空：事件队列是**全进程共享**的，别的用例也往里面推过东西。
+        // 只取一批（容量 16）会把本次的输出挤到批次之外——那是在测"别的用例
+        // 推了多少事件"，不是在测这条链路。上限只是防止取空失败时死循环。
+        let mut all: Vec<PbEventRaw> = Vec::new();
+        for _ in 0..64 {
+            let mut buffer = [PbEventRaw::EMPTY; 64];
+            let mut written = 0u32;
+            // SAFETY: 缓冲区与计数都指向本栈变量
+            assert_eq!(
+                unsafe { pb_drain_events(buffer.as_mut_ptr(), 64, &mut written) },
+                Status::Ok.code()
+            );
+            if written == 0 {
+                break;
+            }
+            all.extend_from_slice(&buffer[..written as usize]);
+        }
+        let ours: Vec<&PbEventRaw> = all
+            .iter()
+            .filter(|e| {
+                e.kind == EventKind::ScriptOutput.code() && e.args[0] == 2 && e.args[1] == 0x50
+            })
+            .collect();
+        assert_eq!(
+            ours.len(),
+            1,
+            "脚本应当恰好把看到的那条 SSN 报回来一次（共取到 {} 条事件）",
+            all.len()
+        );
+        assert_eq!(ours[0].args[1], 0x50, "报回来的值必须就是事件里的 args[0]");
+        println!("✓ 脚本被事件驱动，输出进了事件流：{:?}", ours[0]);
+    }
     /// 策略检查必须**先于**解释器：这条顺序让"注入前拦截"在没有 Python 的
     /// 机器上也成立，而且违规脚本的报错不会掺进"Python 没装"这种无关信息。
     #[test]
@@ -514,20 +779,26 @@ mod tests {
         );
         println!("✓ 策略先于解释器：{text}");
 
-        // 干净的脚本：这里才轮到解释器。语言/平台差异都由这一层表达，
-        // 测试只要求"状态码是 not_supported 且原因明确指向解释器"。
+        // 干净的脚本：这里才轮到解释器。两种平台差异都由这一层表达：
+        //   * 有解释器 → 真的加载成功（`Ok`），并说清脚本已登记；
+        //   * 没有解释器（例如 CI 的 ubuntu 任务）→ `not_supported`，
+        //     原因必须指向解释器，而不是含糊的"不支持"。
         let clean = std::ffi::CString::new("value = 1 + 1\nassert value == 2\n").unwrap();
         // SAFETY: 同上
         let code = unsafe { pb_load_script(name.as_ptr(), clean.as_ptr()) };
-        assert_eq!(
-            code,
-            Status::NotSupported.code(),
-            "脚本注册尚未实现，必须是 not_supported"
-        );
         // SAFETY: 同上
         let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
-        assert!(text.contains("解释器"), "原因必须指向解释器这一层：{text}");
-        println!("✓ 干净脚本走到解释器这一步：{text}");
+        if code == Status::Ok.code() {
+            assert!(
+                text.contains("解释器"),
+                "成功路径也要说清用的是哪个解释器：{text}"
+            );
+            println!("✓ 干净脚本已加载：{text}");
+        } else {
+            assert_eq!(code, Status::NotSupported.code(), "实际: {code}");
+            assert!(text.contains("解释器"), "原因必须指向解释器这一层：{text}");
+            println!("✓ 无解释器环境（明确报因）：{text}");
+        }
     }
     #[test]
     fn abi_surface_smoke() {

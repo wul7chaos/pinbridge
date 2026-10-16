@@ -86,6 +86,36 @@ mod imp {
         PyGILState_Release: unsafe extern "C" fn(c_int),
         /// `PyThreadState* PyEval_SaveThread(void)` —— 释放 GIL 并返回线程状态
         PyEval_SaveThread: unsafe extern "C" fn() -> *mut c_void,
+        // ── 构造/读取 Python 对象所需的那一组（全部来自稳定 ABI）──
+        //
+        // 刻意只用**不透明指针 + 非变参**函数：变参（`PyObject_CallFunction` 之类）
+        // 在跨语言边界上无法安全表达，而结构体布局（`PyModuleDef`）写错就是
+        // 目标进程里的随机崩溃。这一组足够构造字典/元组、调用可调用对象、
+        // 以及把 Python 字符串读回 Rust。
+        /// `PyObject* PyImport_AddModule(const char* name)`（借用引用，不要 DecRef）
+        PyImport_AddModule: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+        /// `PyObject* PyObject_GetAttrString(PyObject*, const char*)`（**新引用**）
+        PyObject_GetAttrString: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+        /// `PyObject* PyObject_Call(PyObject* callable, PyObject* args, PyObject* kwargs)`
+        PyObject_Call: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+        /// `PyObject* PyTuple_New(Py_ssize_t size)`
+        PyTuple_New: unsafe extern "C" fn(isize) -> *mut c_void,
+        /// `int PyTuple_SetItem(PyObject* tuple, Py_ssize_t index, PyObject* item)`（**偷引用**）
+        PyTuple_SetItem: unsafe extern "C" fn(*mut c_void, isize, *mut c_void) -> c_int,
+        /// `PyObject* PyUnicode_FromString(const char* text)`（**新引用**）
+        PyUnicode_FromString: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+        /// `PyObject* PyUnicode_AsUTF8String(PyObject* unicode)`（**新引用**）
+        PyUnicode_AsUTF8String: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        /// `char* PyBytes_AsString(PyObject* bytes)`（借用）
+        PyBytes_AsString: unsafe extern "C" fn(*mut c_void) -> *mut c_char,
+        /// `Py_ssize_t PyBytes_Size(PyObject* bytes)`
+        PyBytes_Size: unsafe extern "C" fn(*mut c_void) -> isize,
+        /// `void Py_DecRef(PyObject*)` —— 稳定 ABI 里它是**导出函数**（不是内联宏）
+        Py_DecRef: unsafe extern "C" fn(*mut c_void),
+        /// `void PyErr_Print(void)`
+        PyErr_Print: unsafe extern "C" fn(),
+        /// `PyObject* PyObject_Str(PyObject*)`（**新引用**）
+        PyObject_Str: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     }
 
     // SAFETY: 这些指针由 DLL 持有；它们本身不访问线程局部状态。
@@ -93,6 +123,96 @@ mod imp {
     unsafe impl Send for PyApi {}
     unsafe impl Sync for PyApi {}
 
+    /// 一个"新引用"的 RAII 持有者：离开作用域时 `Py_DecRef`。
+    ///
+    /// 为什么必须有它：CPython 的引用计数一旦漏掉就变成内存泄漏，
+    /// 多减一次就是目标进程里的随机崩溃。手写 `DecRef` 分散在十几个
+    /// early-return 路径上几乎必然会错，所以让类型来管。
+    struct Owned<'a>(&'a PyApi, *mut c_void);
+
+    impl<'a> Owned<'a> {
+        fn new(api: &'a PyApi, object: *mut c_void) -> Self {
+            Self(api, object)
+        }
+
+        /// 被持有的 Python 对象指针。
+        ///
+        /// 用具名访问器而不是 `.1`：元组字段在调用点读起来是"某个东西的第 N 项"，
+        /// 而这里要的是"那个对象"——写错过一次（把 `.0`（api 引用）当成了对象指针）。
+        fn object(&self) -> *mut c_void {
+            self.1
+        }
+
+        fn is_null(&self) -> bool {
+            self.1.is_null()
+        }
+    }
+
+    impl Drop for Owned<'_> {
+        fn drop(&mut self) {
+            if !self.1.is_null() {
+                // SAFETY: 这个对象是 `Owned` 的唯一所有者（由 new 的调用点保证）。
+                unsafe { (self.0.Py_DecRef)(self.1) };
+            }
+        }
+    }
+
+    /// 把 `&str` 变成 C 串（不带上下文名，调用点自己给更好的错误文本）。
+    fn c_string(text: &str) -> Result<CString> {
+        CString::new(text)
+            .map_err(|_| Error::Script(format!("字符串含 NUL 字节，无法传给解释器：{text}")))
+    }
+
+    /// 注入 `pb` 模块的引导脚本（纯 Python，见 `PythonHost::bootstrap` 的说明）。
+    ///
+    /// 接口与设计文档一致：`pb.subscribe(event, handler)` / `pb.log(text)` /
+    /// `pb.mark(name, address)`，事件对象用 `SimpleNamespace`（`ev.address`、
+    /// `ev.args` 这种属性访问方式与文档里的示例一致）。
+    const BOOTSTRAP: &str = r#"
+import json as _json, sys as _sys, types as _types
+
+_PB_OUTBOX = []
+_PB_SUBSCRIBERS = {}
+
+def _pb_emit(kind, value, text):
+    _PB_OUTBOX.append([kind, int(value), str(text)])
+
+def _pb_log(text):
+    _pb_emit(1, 0, text)
+
+def _pb_mark(name, address=0):
+    _pb_emit(2, int(address), str(name))
+
+def _pb_subscribe(event_name, handler=None):
+    name = str(event_name)
+    handlers = _PB_SUBSCRIBERS.setdefault(name, [])
+    if handler is not None:
+        handlers.append(handler)
+    _pb_emit(3, len(handlers), name)
+
+_pb = _types.ModuleType("pb")
+_pb.log = _pb_log
+_pb.mark = _pb_mark
+_pb.subscribe = _pb_subscribe
+_pb.__doc__ = "PinBridge 目标侧接口（由 agent 注入，不是安装到环境里的包）"
+_sys.modules["pb"] = _pb
+
+def _pb_drain_json():
+    payload = _json.dumps(_PB_OUTBOX)
+    del _PB_OUTBOX[:]
+    return payload
+
+def _pb_dispatch(combined_json):
+    combined = _json.loads(combined_json)
+    name = str(combined.get("event"))
+    handlers = _PB_SUBSCRIBERS.get(name, [])
+    if not handlers:
+        return 0
+    event = _types.SimpleNamespace(**combined.get("payload") or {})
+    for handler in handlers:
+        handler(event)
+    return len(handlers)
+"#;
     impl Drop for PyApi {
         fn drop(&mut self) {
             if !self.module.is_null() {
@@ -170,6 +290,18 @@ mod imp {
             let gil_ensure = must!("PyGILState_Ensure");
             let gil_release = must!("PyGILState_Release");
             let save_thread = must!("PyEval_SaveThread");
+            let import_add_module = must!("PyImport_AddModule");
+            let get_attr_string = must!("PyObject_GetAttrString");
+            let object_call = must!("PyObject_Call");
+            let tuple_new = must!("PyTuple_New");
+            let tuple_set_item = must!("PyTuple_SetItem");
+            let unicode_from_string = must!("PyUnicode_FromString");
+            let unicode_as_utf8 = must!("PyUnicode_AsUTF8String");
+            let bytes_as_string = must!("PyBytes_AsString");
+            let bytes_size = must!("PyBytes_Size");
+            let dec_ref = must!("Py_DecRef");
+            let object_str = must!("PyObject_Str");
+            let err_print = must!("PyErr_Print");
             // 可选：3.13 之前没有这个符号。
             let is_finalizing =
                 GetProcAddress(module, c"Py_IsFinalizing".as_ptr()).cast::<c_void>();
@@ -210,6 +342,50 @@ mod imp {
                     *mut c_void,
                     unsafe extern "C" fn() -> *mut c_void,
                 >(save_thread),
+                PyImport_AddModule: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*const c_char) -> *mut c_void,
+                >(import_add_module),
+                PyObject_GetAttrString: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+                >(get_attr_string),
+                PyObject_Call: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+                >(object_call),
+                PyTuple_New: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(isize) -> *mut c_void,
+                >(tuple_new),
+                PyTuple_SetItem: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, isize, *mut c_void) -> c_int,
+                >(tuple_set_item),
+                PyUnicode_FromString: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*const c_char) -> *mut c_void,
+                >(unicode_from_string),
+                PyUnicode_AsUTF8String: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+                >(unicode_as_utf8),
+                PyBytes_AsString: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> *mut c_char,
+                >(bytes_as_string),
+                PyBytes_Size: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> isize,
+                >(bytes_size),
+                Py_DecRef: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(
+                    dec_ref,
+                ),
+                PyErr_Print: std::mem::transmute::<*mut c_void, unsafe extern "C" fn()>(err_print),
+                PyObject_Str: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+                >(object_str),
             })
         }
     }
@@ -224,7 +400,12 @@ mod imp {
     /// 只在模块内部（以及单测）使用：对外暴露的是 [`library_description`]
     /// 与 [`probe`]，它们把平台差异与锁的细节挡在里面。
     pub(crate) struct PythonHost {
-        api: PyApi,
+        /// `None` 表示启动失败（原因在 `failure`）。
+        ///
+        /// 用 `Option` 而不是"一份全是空壳函数指针的 `PyApi`"：后者要在每新增
+        /// 一个符号时补一个假实现，而且"调用到空壳"这件事只能靠约定避免。
+        /// `Option` 让"没启动成功"在类型上就不可调用。
+        api: Option<PyApi>,
         library: String,
         /// 我们是否调用了 `Py_InitializeEx`（决定收尾时要不要 `Py_FinalizeEx`）。
         ///
@@ -300,7 +481,7 @@ mod imp {
                 saved_thread = unsafe { (api.PyEval_SaveThread)() };
             }
             Ok(Self {
-                api,
+                api: Some(api),
                 library,
                 we_initialized: !already,
                 failure: None,
@@ -343,7 +524,149 @@ mod imp {
         ///
         /// 脚本里有语法错误或未捕获异常时，CPython 打印到 stderr 并返回非 0；
         /// 这里把它翻译成一个**带原文**的错误，而不是让调用方去猜。
-        #[allow(dead_code)]
+        /// 注入 `pb` 模块并装好分发入口。
+        ///
+        /// 用**纯 Python** 实现 `pb`，而不是写一个 C 扩展模块：C 扩展要自己摆
+        /// `PyModuleDef`/`PyMethodDef` 的结构体布局，写错就是目标进程里的随机崩溃；
+        /// 而这一层需要的东西（收集输出、按事件名分发、把 payload 变成对象）
+        /// 用 Python 表达更短也更清楚。Rust 只保留两个窄入口：
+        /// `_pb_drain_json()` 与 `_pb_dispatch(name, payload_json)`。
+        ///
+        /// 幂等：重复调用只会覆盖同名入口。
+        pub(crate) fn bootstrap(&self) -> Result<()> {
+            self.run(BOOTSTRAP)
+        }
+
+        /// 调用 `__main__` 里的一个函数，可选传一个字符串参数，返回其字符串结果。
+        ///
+        /// 只支持"零参或一个字符串参数、返回字符串"——这是本层与脚本之间
+        /// **唯一的约定**，刻意保持窄：任何更复杂的数据交换都应该走 JSON。
+        ///
+        /// # Errors
+        ///
+        /// 函数不存在、调用抛异常、或结果不是可转成 UTF-8 的字符串时出错。
+        pub(crate) fn call_json(&self, function: &str, argument: Option<&str>) -> Result<String> {
+            let api = self.api()?;
+            let function_c = c_string(function)?;
+            // SAFETY: 全程持有 GIL；每一个"新引用"都由 `Owned` 负责释放。
+            let gil = unsafe { (api.PyGILState_Ensure)() };
+            let result = (|| -> Result<String> {
+                // SAFETY: `PyImport_AddModule` 返回**借用**引用（不要 DecRef）。
+                let main = unsafe { (api.PyImport_AddModule)(c"__main__".as_ptr()) };
+                if main.is_null() {
+                    return Err(Error::Script("取不到 __main__ 模块".into()));
+                }
+                // SAFETY: main 有效；返回新引用，交给 Owned。
+                let callable = Owned::new(api, unsafe {
+                    (api.PyObject_GetAttrString)(main, function_c.as_ptr())
+                });
+                if callable.is_null() {
+                    // 属性不存在：把 Python 的异常信息打出来，再报一个清楚的错。
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script(format!(
+                        "脚本没有定义 {function}（本层需要它作为入口）"
+                    )));
+                }
+                // 构造参数元组。`PyTuple_SetItem` **偷引用**，所以字符串对象不再由我们释放。
+                // SAFETY: 见上。
+                let mut tuple_size: isize = 0;
+                if argument.is_some() {
+                    tuple_size = 1;
+                }
+                let args = Owned::new(api, unsafe { (api.PyTuple_New)(tuple_size) });
+                if args.is_null() {
+                    return Err(Error::Script("构造参数元组失败".into()));
+                }
+                if let Some(text) = argument {
+                    let text_c = c_string(text)?;
+                    // SAFETY: text_c 在本调用期间存活；返回新引用。
+                    let value = unsafe { (api.PyUnicode_FromString)(text_c.as_ptr()) };
+                    if value.is_null() {
+                        return Err(Error::Script("构造字符串参数失败".into()));
+                    }
+                    // SAFETY: 元组长度是 1，索引 0 合法；SetItem 取得所有权。
+                    if unsafe { (api.PyTuple_SetItem)(args.object(), 0, value) } != 0 {
+                        return Err(Error::Script("写入参数元组失败".into()));
+                    }
+                }
+                // SAFETY: callable 与 args 都有效；kwargs 传空指针表示"没有关键字参数"。
+                let returned = Owned::new(api, unsafe {
+                    (api.PyObject_Call)(callable.object(), args.object(), std::ptr::null_mut())
+                });
+                if returned.is_null() {
+                    // 脚本里抛了异常：让 CPython 打印堆栈（带行号），再返回错误。
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script(format!("调用 {function} 时脚本抛出了异常")));
+                }
+                // 结果转文本分两步：任意对象 → `str`（`PyObject_Str`）→ UTF-8 bytes。
+                //
+                // 中间这一步是必需的：脚本返回 `int` 这类**非字符串**结果是正常用法
+                // （例如 `_pb_dispatch` 返回被调用的订阅者数量），
+                // 直接对 int 调 `PyUnicode_AsUTF8String` 会抛 TypeError，
+                // 而错误文本会变成一句与真实原因无关的"返回值不是字符串"。
+                //
+                // SAFETY: returned 是有效对象；下面每一步都检查了空。
+                let as_text = Owned::new(api, unsafe { (api.PyObject_Str)(returned.object()) });
+                if as_text.is_null() {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script(format!("{function} 的返回值无法转成文本")));
+                }
+                // SAFETY: as_text 是 str 对象。
+                let as_bytes = Owned::new(api, unsafe {
+                    (api.PyUnicode_AsUTF8String)(as_text.object())
+                });
+                if as_bytes.is_null() {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script(format!("{function} 的返回值不是字符串")));
+                }
+                // SAFETY: as_bytes 是 bytes 对象。
+                let pointer = unsafe { (api.PyBytes_AsString)(as_bytes.object()) };
+                let length = unsafe { (api.PyBytes_Size)(as_bytes.object()) };
+                if pointer.is_null() || length < 0 {
+                    return Err(Error::Script(format!("读取 {function} 的返回值失败")));
+                }
+                // SAFETY: pointer/length 来自同一个 bytes 对象，且在本作用域内有效。
+                let slice =
+                    unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length as usize) };
+                Ok(String::from_utf8_lossy(slice).into_owned())
+            })();
+            // SAFETY: gil 来自上面的 Ensure。
+            unsafe { (api.PyGILState_Release)(gil) };
+            result
+        }
+
+        /// 取走脚本产生的输出（JSON 数组），并清空脚本侧队列。
+        pub(crate) fn drain_outputs(&self) -> Result<String> {
+            self.call_json("_pb_drain_json", None)
+        }
+
+        /// 把一个事件交给脚本的订阅者，返回被调用的订阅者数量。
+        ///
+        /// 两个字符串打包成一个 JSON 再传：`call_json` 的约定是"零参或一个字符串
+        /// 参数"，把它的约定撑宽到多参数会让这一层多出一堆位置错误的机会。
+        pub(crate) fn dispatch(&self, event_name: &str, payload_json: &str) -> Result<u32> {
+            let combined = serde_json::json!({
+                "event": event_name,
+                "payload": serde_json::from_str::<serde_json::Value>(payload_json)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+            .to_string();
+            let counted = self.call_json("_pb_dispatch", Some(&combined))?;
+            counted
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::Script(format!("_pb_dispatch 返回了非数字：{counted}")))
+        }
+        /// 取函数指针表；启动失败时给出原因。
+        fn api(&self) -> Result<&PyApi> {
+            self.api.as_ref().ok_or_else(|| {
+                Error::TargetUnavailable(
+                    self.failure
+                        .clone()
+                        .unwrap_or_else(|| "解释器未启动".to_owned()),
+                )
+            })
+        }
         pub(crate) fn run(&self, source: &str) -> Result<()> {
             let code = CString::new(source).map_err(|_| {
                 Error::Protocol("脚本里含 NUL 字节，无法作为 C 串传给解释器".into())
@@ -355,12 +678,13 @@ mod imp {
             //
             // SAFETY: `PyGILState_Ensure` 返回的状态必须原样交给 Release；
             // 两者成对出现在同一作用域内，中途不返回错误（下面拿到状态码之后再释放）。
-            let gil = unsafe { (self.api.PyGILState_Ensure)() };
+            let api = self.api()?;
+            let gil = unsafe { (api.PyGILState_Ensure)() };
             // SAFETY: code 以 NUL 结尾且在本调用期间存活；解释器已初始化；
             // 当前线程已持有 GIL。
-            let status = unsafe { (self.api.PyRun_SimpleString)(code.as_ptr()) };
+            let status = unsafe { (api.PyRun_SimpleString)(code.as_ptr()) };
             // SAFETY: gil 来自上面的 Ensure。
-            unsafe { (self.api.PyGILState_Release)(gil) };
+            unsafe { (api.PyGILState_Release)(gil) };
             if status != 0 {
                 return Err(Error::Script(format!(
                     "脚本执行失败（解释器返回 {status}；具体错误已由 CPython 打印到 stderr）"
@@ -373,7 +697,11 @@ mod imp {
         #[must_use]
         #[allow(dead_code)]
         pub(crate) fn is_finalizing(&self) -> bool {
-            match self.api.Py_IsFinalizing {
+            let Some(api) = self.api.as_ref() else {
+                // 启动失败的宿主谈不上"正在收尾"。
+                return false;
+            };
+            match api.Py_IsFinalizing {
                 // SAFETY: 只查询状态。
                 Some(function) => (unsafe { function() }) != 0,
                 None => false,
@@ -390,16 +718,7 @@ mod imp {
         fn failed(cause: &pinbridge_core::error::Error) -> Self {
             // 用一个空壳 PyApi：module 为空指针，Drop 时不会 FreeLibrary。
             Self {
-                api: PyApi {
-                    module: std::ptr::null_mut(),
-                    Py_IsInitialized: never_called,
-                    Py_InitializeEx: ignore_int,
-                    Py_IsFinalizing: None,
-                    PyRun_SimpleString: fail_string,
-                    PyGILState_Ensure: never_called,
-                    PyGILState_Release: ignore_int,
-                    PyEval_SaveThread: null_thread_state,
-                },
+                api: None,
                 library: String::new(),
                 we_initialized: false,
                 failure: Some(cause.to_string()),
@@ -412,21 +731,6 @@ mod imp {
         pub(crate) fn failure(&self) -> Option<&str> {
             self.failure.as_deref()
         }
-    }
-
-    /// 空壳真正被调用时不该发生；调用即明确失败，而不是返回一个假结果。
-    unsafe extern "C" fn never_called() -> c_int {
-        0
-    }
-
-    unsafe extern "C" fn ignore_int(_: c_int) {}
-
-    unsafe extern "C" fn fail_string(_: *const c_char) -> c_int {
-        -1
-    }
-
-    unsafe extern "C" fn null_thread_state() -> *mut c_void {
-        std::ptr::null_mut()
     }
 
     impl Drop for PythonHost {
@@ -486,6 +790,57 @@ mod imp {
         })
     }
 
+    /// 注入 `pb` 模块并装好分发入口（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用时返回带原因的错误。
+    pub fn bootstrap() -> Result<()> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.bootstrap()
+    }
+
+    /// 执行一段脚本源码（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用、或脚本抛异常时出错。
+    pub fn run_source(source: &str) -> Result<()> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.run(source)
+    }
+
+    /// 取走脚本产生的输出（JSON 文本）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用或调用失败时出错。
+    pub fn drain_outputs() -> Result<String> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.drain_outputs()
+    }
+
+    /// 把一个事件交给脚本的订阅者。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用或脚本抛异常时出错。
+    pub fn dispatch(event_name: &str, payload_json: &str) -> Result<u32> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.dispatch(event_name, payload_json)
+    }
     /// 解释器是否可用；可用时返回它的描述（库名）。
     ///
     /// 这是跨平台统一的入口：`python_host` 内部在 Windows 与其它平台上的实现
@@ -542,13 +897,42 @@ mod imp {
     ///
     /// 总是返回"不支持"。
     pub fn library_description() -> Result<String> {
-        Err(Error::TargetUnavailable(
-            "当前平台未实现 CPython 动态加载（M1 只支持 Windows）".into(),
-        ))
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
     }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn bootstrap() -> Result<()> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn run_source(_source: &str) -> Result<()> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn drain_outputs() -> Result<String> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn dispatch(_event_name: &str, _payload_json: &str) -> Result<u32> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// 非 Windows 平台的统一原因文本。
+    const NOT_SUPPORTED: &str = "当前平台未实现 CPython 动态加载（M1 只支持 Windows）";
 }
 
-pub use imp::{library_description, probe};
+pub use imp::{bootstrap, dispatch, drain_outputs, library_description, probe, run_source};
 
 /// 当前平台是否实现了 CPython 宿主。
 #[must_use]
@@ -628,6 +1012,80 @@ mod tests {
         crate::python_host::imp::PythonHost::start().expect("已确认可用")
     }
 
+    /// 端到端：注入 `pb` 模块 → 脚本 `subscribe` → 分发一个事件 →
+    /// 脚本 `pb.mark` 把看到的数值报回来 → drain 读到它。
+    ///
+    /// 这条是"AI 写的脚本能在目标进程里运转"的最小闭环证据：
+    /// Rust 侧的事件 → Python 回调 → Python 的输出 → Rust 读到。
+    #[test]
+    fn pb_module_round_trips_an_event_through_a_script() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+
+        let script = r#"
+import pb
+
+def on_syscall(ev):
+    pb.log("saw syscall %d" % ev.args[0])
+    pb.mark("seen", ev.args[0])
+
+pb.subscribe("syscall_enter", on_syscall)
+pb.log("script loaded")
+"#;
+        host.run(script).expect("脚本应当成功执行");
+
+        // 1) 脚本加载时的那条 log 已经在队列里。
+        //
+        // 队列项的编码是 `[kind, value, text]`，kind 用**数字**：
+        //   1 = log（value 恒为 0）、2 = mark（value 是地址）、3 = subscribe（value 是订阅者数）。
+        // 用数字而不是字符串，是为了让 Rust 侧不必解析文本就能分类；
+        // 文本始终在第三项，需要时原样带走。
+        let first = host.drain_outputs().expect("drain 应当成功");
+        assert!(
+            first.contains("[3, 1, \"syscall_enter\"]"),
+            "应当有 subscribe 记录（kind=3，1 个订阅者）：{first}"
+        );
+        assert!(
+            first.contains("script loaded"),
+            "应当有加载时的 log：{first}"
+        );
+        println!("✓ 加载期输出：{first}");
+
+        // 2) 分发一个事件：脚本应当被调用一次
+        let payload = serde_json::json!({
+            "address": 0x7ff6_0000_1000_u64,
+            "args": [0x50, 0, 0, 0, 0, 0, 0, 0],
+        })
+        .to_string();
+        let called = host
+            .dispatch("syscall_enter", &payload)
+            .expect("分发应当成功");
+        assert_eq!(called, 1, "恰好一个订阅者应当被调用");
+
+        // 3) 脚本用 pb.mark 把 SSN 报回来了 —— 证明它真的看到了事件内容
+        let second = host.drain_outputs().expect("drain 应当成功");
+        println!("✓ 分发后输出：{second}");
+        assert!(
+            second.contains("[2, 80, \"seen\"]"),
+            "脚本应当用 mark（kind=2）把 args[0]（0x50 = 80）报回来：{second}"
+        );
+        assert!(
+            second.contains("saw syscall 80"),
+            "log 文本应当带上数值：{second}"
+        );
+
+        // 4) 没有订阅者的事件名：调用数必须是 0，而不是"装作分发过"
+        let none = host
+            .dispatch("mem_write", &payload)
+            .expect("分发到无人订阅的事件名也应当成功");
+        assert_eq!(none, 0, "没有订阅者时应当返回 0");
+        println!("✓ 未订阅事件名返回 0（不假装分发过）");
+    }
     #[test]
     fn missing_library_is_an_actionable_error_not_a_fallback() {
         let _guard = serialize();

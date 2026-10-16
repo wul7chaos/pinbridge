@@ -41,6 +41,42 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（M1：`pb` 模块 + 探针事件驱动脚本——M1 的核心能力通了）
+- 脚本现在**真的能跑并收到事件**了。完整链路：
+  `pb_load_script`（策略检查 → 注入 `pb` 模块 → 执行脚本 → 登记订阅）
+  → `pb_push_event`（**先分发再入队**）→ 脚本回调 → `pb.log`/`pb.mark`
+  → 输出转成 `script_output` 事件进事件流。
+- `pb` 模块用**纯 Python 注入**，不写 C 扩展模块：`PyModuleDef`/`PyMethodDef`
+  的结构体布局写错就是目标进程里的随机崩溃，而这一层需要的东西
+  （收集输出、按事件名分发、payload 变成带属性的对象）用 Python 更短更清楚。
+  Rust 只保留两个窄入口：`_pb_drain_json()` 与 `_pb_dispatch(combined_json)`。
+- 扩展的 FFI 只用**不透明指针 + 非变参**函数（`python3.dll` 稳定 ABI 实测可用）：
+  `PyImport_AddModule` / `PyObject_GetAttrString` / `PyObject_Call` /
+  `PyTuple_New` / `PyTuple_SetItem` / `PyUnicode_FromString` /
+  `PyUnicode_AsUTF8String` / `PyBytes_AsString` / `PyBytes_Size` / `PyObject_Str` /
+  `Py_DecRef`。`PyObject_CallOneArg` 不在 ABI 里，所以走 `PyObject_Call` + 元组。
+- 引用计数交给 **RAII 类型**（`Owned`）管：CPython 漏一次引用就是内存泄漏，
+  多减一次就是随机崩溃，而手写 `DecRef` 要分散在十几条 early-return 路径上。
+- 三条写进代码并被测试锁住的约定：
+  1. **订阅列表以脚本的实际调用为准**（不解析源码文本）——`pb.subscribe` 可能在
+     条件分支里、名字可能是拼出来的，文本解析会给出"看起来对但没生效"的列表，
+     而分发侧只看列表，脚本会**静默地**永远收不到事件；
+  2. **订阅未知事件名要报错**（`invalid_argument`），不能当没发生过；
+  3. 事件名与 `EventKind::name()` 用**同一张表**（两处不一致 = "注册成功但永远
+     不被调用"，那是最难查的一类问题）。
+- **先分发再入队**：脚本在回调里的输出会紧跟"触发它的那条事件"出现在事件流里；
+  反过来做，因果顺序在轨迹里看起来是反的。
+- **脚本出错不让探针失败**：错误记进 `last_error`，`pb_push_event` 照常成功。
+  一个写错的脚本不该把插装链路带崩。
+- 结果转换补一步 `PyObject_Str`：脚本返回 `int`（例如订阅者数量）是正常用法，
+  直接按字符串读会抛 TypeError，而错误文本会变成与真实原因无关的
+  "返回值不是字符串"——这个坑在测试里撞到过一次。
+- 新增导出面端到端用例：加载订阅 `syscall_enter` 的脚本 → 推一条事件
+  （`args[0]=0x50`）→ 断言脚本把 `0x50` 用 `mark` 报回来并变成 `script_output`
+  事件；另有一条用例覆盖"未订阅的事件名返回 0（不假装分发过）"。
+  用例**循环取空**事件队列后再断言：队列是全进程共享的，
+  只取一批会把本次输出挤到批次外，那是在测别的用例推了多少事件。
+- `pb_load_script` 的成功路径现在返回 `Ok` 并说清用的是哪个解释器、脚本号是多少。
 ### 新增（M1：agent 内嵌 CPython——解释器宿主跑起来了）
 - 设计文档决定"内嵌 CPython"，这一轮落地它的**前提部分**：解释器能在目标进程里
   定位、初始化、执行脚本、收尾。

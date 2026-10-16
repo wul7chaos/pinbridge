@@ -115,6 +115,20 @@ impl AgentState {
         self.scripts.all()
     }
 
+    /// 脚本宿主的可变访问（加载脚本时用）。
+    ///
+    /// 提供 `_mut` 而不是把 `scripts` 字段公开：脚本状态机（Registered →
+    /// Loaded → Unloaded）的迁移应当只发生在这几个方法里，公开字段会让
+    /// 任何调用点都能直接改状态，而状态机的意义就在于"不能随便改"。
+    pub fn script_host_mut(&mut self) -> &mut crate::script::ScriptHost {
+        &mut self.scripts
+    }
+
+    /// 某个事件类型是否有订阅者（分发前的快速判断）。
+    #[must_use]
+    pub fn has_subscriber(&self, kind: u8) -> bool {
+        !self.scripts.subscribers(kind).is_empty()
+    }
     /// 因队列背压丢弃的事件数。
     #[must_use]
     pub fn dropped(&self) -> u64 {
