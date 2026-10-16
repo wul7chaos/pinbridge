@@ -227,6 +227,29 @@ impl<W: Write> PbtWriter<W> {
         self.summary.dropped += dropped;
     }
 
+    /// 把已缓冲的记录立刻落盘（**不**写 SUMMARY 与 END，格式仍然合法）。
+    ///
+    /// 为什么需要它：写入器前面还有一层 `BufWriter`，而事件又先在内存里攒成
+    /// EVENT chunk，因此正常情况下要等缓冲满或 `finish()` 才真正落盘。
+    /// 但收尾**可能根本不会发生**——被分析的程序崩溃/被强杀，或者工具侧的
+    /// 收尾调用被卸载保护拒绝（本项目实测遇到过：`.pbt` 一个字节都没有）。
+    /// 那时用户最需要的东西恰好没留下。
+    ///
+    /// 多条 EVENT chunk 是格式允许的（读取器按 chunk 迭代，`FINISH` 只补
+    /// SUMMARY/END），所以提前冲刷不会产生需要特殊处理的文件。
+    ///
+    /// # Errors
+    ///
+    /// 底层写入失败时透传。
+    pub fn flush(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.flush_event_chunk()?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
     /// 收尾：冲刷缓冲、写 SUMMARY 与 END，返回底层写入器与汇总。
     pub fn finish(mut self) -> Result<(W, Summary)> {
         self.flush_event_chunk()?;

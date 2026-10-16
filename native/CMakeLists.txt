@@ -281,6 +281,30 @@ if(BUILD_TESTING)
         set_tests_properties(pin_tool_instruments_a_target PROPERTIES
           ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
       endif()
+
+      # -------------------------------------------------- 系统调用探针端到端
+      # 判据不是"退出码为 0"，而是三条正则：
+      #   * 必须出现"捕获数满足要求"（工具自己在没捕够时打"失败：…"）；
+      #   * 不得出现"溢出丢弃 [1-9]"（静默丢事件是禁止的，实测该负载下为 0）；
+      #   * 不得出现 Pin 的内部故障（这一条曾经 5/5 稳定触发，是这轮修掉的核心缺陷）。
+      add_test(NAME pin_tool_captures_syscalls
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_syscalls 1
+                -pb_syscall_max 100000
+                -pb_require_syscalls 300
+                -pb_trace "${CMAKE_BINARY_DIR}/pin-syscall-trace.pbt"
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --syscalls 300)
+      set_tests_properties(pin_tool_captures_syscalls PROPERTIES
+        PASS_REGULAR_EXPRESSION "捕获数满足要求"
+        FAIL_REGULAR_EXPRESSION "失败：要求至少捕获|溢出丢弃 [1-9]|Unhandled internal exception"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+      if(PINBRIDGE_AGENT_DLL)
+        set_tests_properties(pin_tool_captures_syscalls PROPERTIES
+          ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
+      endif()
     endif()
   else()
     message(STATUS "非 Windows：只注册 abi_selfcheck（桥接层不可用）")

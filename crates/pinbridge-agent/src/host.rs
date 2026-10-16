@@ -66,6 +66,8 @@ struct LocalRecorder {
     writer: PbtWriter<BufWriter<File>>,
     folder: RepeatFolder,
     folding: bool,
+    /// 距上次 flush 写入的记录数（增量落盘用）。
+    records_since_flush: u64,
 }
 
 impl AgentState {
@@ -276,6 +278,7 @@ impl AgentState {
         let mut writer = PbtWriter::create(BufWriter::new(file), 0)?;
         writer.meta(meta_json)?;
         self.recorder = Some(LocalRecorder {
+            records_since_flush: 0,
             writer,
             folder: RepeatFolder::new(),
             folding,
@@ -308,9 +311,23 @@ impl Default for AgentState {
 }
 
 impl LocalRecorder {
+    /// 每写入多少条记录就把缓冲刷到磁盘。
+    ///
+    /// 为什么需要它（实测）：录制器用的是 `BufWriter`，而收尾的 `stop_trace`
+    /// 发生在 Pin 的 Fini 里——**那已经晚于目标进程对 DLL 的卸载**，
+    /// 而桥接层的卸载保护会拒绝这次调用（返回 `NOT_ATTACHED`）。
+    /// 结果是：录制器一直没被 finalize，`.pbt` 文件**一个字节都没有**。
+    ///
+    /// 增量落盘把这个"全有或全无"变成"几乎全有"：即使收尾调用失败，
+    /// 磁盘上也已经有可读的记录（读取器会如实报"汇总缺失"，不会假装完整）。
+    /// 这条对真实场景同样重要——被分析的程序崩溃、被强杀、被杀软终止时，
+    /// 用户最需要的就是**已经录到的东西**。
+    const FLUSH_EVERY_RECORDS: u64 = 64;
+
     fn write(&mut self, event: &Event) -> Result<()> {
         if !self.folding {
-            return self.writer.write_record(event);
+            self.writer.write_record(event)?;
+            return self.maybe_flush();
         }
         let mut failure: Option<String> = None;
         {
@@ -325,8 +342,18 @@ impl LocalRecorder {
         }
         match failure {
             Some(message) => Err(Error::Trace(message)),
-            None => Ok(()),
+            None => self.maybe_flush(),
         }
+    }
+
+    /// 累计到阈值就把缓冲刷到磁盘（见 `FLUSH_EVERY_RECORDS` 的说明）。
+    fn maybe_flush(&mut self) -> Result<()> {
+        self.records_since_flush += 1;
+        if self.records_since_flush < Self::FLUSH_EVERY_RECORDS {
+            return Ok(());
+        }
+        self.records_since_flush = 0;
+        self.writer.flush().map_err(|e| Error::Trace(e.to_string()))
     }
 }
 

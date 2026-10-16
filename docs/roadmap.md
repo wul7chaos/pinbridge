@@ -75,9 +75,10 @@
 | ~~Hub ↔ agent 回环链路（真实握手、版本协商、重连）~~ | ✅ M0.5 已完成（`link.rs` + 两端共用协议；连接断开后重新 `ping` 即可，状态属于进程而不属于连接） |
 | ~~`pinbridge.dll`：Pin tool 骨架 + **入口点探针**~~ | ✅ 已完成：`pin -t pinbridge.dll -- pb_sample_target.exe` → 命中入口 → 事件穿过桥接层与 agent → **目标进程内写出 `.pbt`** → 我们的读取器解析通过（`ctest -R pin_tool_instruments_a_target`） |
 | ~~脚本策略与生命周期（登记 / 白名单 / 状态机 / 执行预算记账）~~ | ✅ 已完成：`crates/pinbridge-agent/src/script.rs`（静态扫描带行号拒绝，**明确说明它不是沙箱**；登记 ≠ 运行由 `receives_events` 与 `is_live` 两个判断分开表达） |
-| 系统调用 Hook（syscall_enter/exit） | 🚧 **已实现但默认关闭**：探针能识别 59–60 个插装点、按上限停止、把"重入跳过/推失败"都记账；但**在系统调用回调里调用我们的 DLL 会崩**（`RECEIVED_ACCESS_FAULT, Access Address = 0x8`，故障 IP 落在桥接层映像内）。定位结论可复现：把回调改成零外部调用 → 3/3 正常；恢复调用 → 2/2 崩溃。**修法已定**：回调只做内存入队，由 Pin 内部线程（`PIN_SpawnInternalThread`）冲刷。另外 `INS_IsSysret` 在 Windows 上没匹配上（`exit=0`），退出事件要另找机制 |
-| 内存访问观测（mem_read/mem_write） | ⏳ 需要 `IARG_MEMORYREAD_EA`/`IARG_MEMORYWRITE_EA` + 过滤；**注意上面的回调约束**——高频探针都必须走"入队 + 内部线程"这条路 |
-| 指令模板匹配（pattern_hit） | ⏳ 同上（同样属于高频） |
+| ~~系统调用 Hook（syscall_enter）~~ | ✅ 已完成：探针识别 `syscall`（实测 59–61 个插装点），采集 SSN + 前四个参数（x64 第一个参数在 **R10**）。**回调只做内存入队，跨边界由 Pin 内部线程每 10 ms 冲刷**——这个约束是实测逼出来的（回调里调外部 DLL → 5/5 崩溃；改成入队 → 6/6 通过）。`ctest -R pin_tool_captures_syscalls` 断言三件事：捕够 300+ 条、溢出丢弃为 0、Pin 无内部故障 |
+| syscall_exit 事件 | ⏳ `INS_IsSysret` 在当前 Windows 目标上没匹配到（`exit=0`），返回路径要另找机制 |
+| 内存访问观测（mem_read/mem_write） | ⏳ 需要 `IARG_MEMORYREAD_EA`/`IARG_MEMORYWRITE_EA` + 过滤；**必须复用"入队 + 内部线程"这条路**（高频探针的硬约束） |
+| 指令模板匹配（pattern_hit） | ⏳ 同上 |
 | TF 虚拟化（`flags_virtualize.cpp`） | ⏳ |
 | agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 策略层已就绪，缺的是运行时 |
 | 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |

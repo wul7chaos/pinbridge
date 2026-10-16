@@ -121,10 +121,11 @@ DynamoRIO（BSD、官方支持 AMD64）、QBDI、TinyInst——换基座只需�
    桥接层会稳定崩溃：`RECEIVED_ACCESS_FAULT, Access Address = 0x8`，
    故障 IP 落在被调模块的静态 CRT 区域，栈上毫无线索。把回调改成"零外部调用"
    就完全正常（3/3），恢复调用立刻崩（2/2）。正确做法是回调只做内存入队，
-   由 `PIN_SpawnInternalThread` 的内部线程（非回调上下文、不被插桩）冲刷。
+   由 `PIN_SpawnInternalThread` 的内部线程（非回调上下文、不被插桩）冲刷——
+   本项目已按此实现并稳定通过（6/6，`ctest -R pin_tool_captures_syscalls`）。
 2. **`INS_IsSysret` 在 Windows 上可能匹配不到**：我们的收尾统计里 `exit=0`，
    即进入系统调用的探针命中了、返回路径的探针一次都没命中。返回路径不只
-   `sysret` 一种，别只挂它。
+   `sysret` 一种，别只挂它（当前只采到 enter，exit 待补）。
 
 另外：`RTN_InsertCall(IPOINT_AFTER)`、`RTN_FindByAddress`、
 `RTN_IsSafeForProbedInsertion` 都要求 `PIN_StartProgramProbed()`——

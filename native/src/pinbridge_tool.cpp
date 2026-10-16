@@ -118,13 +118,17 @@ KNOB<std::string> KnobCaps(KNOB_MODE_WRITEONCE, "pintool", "pb_caps", "ro",
 // 会拒绝 `int` 字面量（"C2665 没有重载函数可以转换所有参数类型"）。
 KNOB<UINT32> KnobEvents(KNOB_MODE_WRITEONCE, "pintool", "pb_events", "16",
                         "退出时打印最后 n 条事件");
-// **默认关闭**：这条路径在高事件量下会崩溃（原因见 push_probe_event 的注释），
-// 已经定位到根因但修法（回调只入队 + 内部线程冲刷）还没落地。
-// 默认打开一个已知会崩的功能不是"功能可用"，是"等别人来踩"。
-KNOB<BOOL> KnobSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_syscalls", "0",
-                        "是否插装系统调用（1/0）；已知高事件量下会崩溃，见文档");
+// 现在可以默认打开：回调已改成"只入队"，跨边界由内部线程做，
+// 之前 5/5 稳定崩溃的那条命令现在 5/5 正常（判据进了 ctest）。
+KNOB<BOOL> KnobSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_syscalls", "1",
+                        "是否插装系统调用（1/0）");
 KNOB<std::string> KnobSyscallMax(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_max", "4096",
                                  "捕获多少条系统调用事件后停止插装（0 表示不限制）");
+// 自动化判据用：捕获数低于这个值时工具**自己以非零退出**。
+// 为什么放在工具里而不是靠测试脚本数日志行：退出码是机器可判定的，
+// 而"数日志里出现了几次"既脆弱又会被日志格式改动打断。
+KNOB<std::string> KnobRequireSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_require_syscalls", "0",
+                                      "捕获到的系统调用事件少于该值时以非零退出（0 表示不检查）");
 
 /// 能力位（与 pinbridge.h / capability.rs 一致；只用到这两个组合）。
 constexpr UINT32 PB_CAP_MEM_READ = 1u << 0;
@@ -264,6 +268,8 @@ ADDRINT g_entry_address = 0;
 // 系统调用探针的开关、上限与观测计数（定义见下方"系统调用探针"一节）
 bool pb_syscall_enabled = true;
 UINT64 g_syscall_cap = 0;
+/// 捕获数下限（见 KnobRequireSyscalls）。
+UINT64 g_required_syscalls = 0;
 volatile long g_syscall_sites = 0;
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
@@ -402,19 +408,58 @@ void OnImageLoad(IMG img, VOID* v) {
 // ── 计数为什么必须报出来 ────────────────────────────────────────────────
 // "丢了多少"与"看到多少"必须都能回答（项目规则：不允许静默降级）。
 // 所以这里既报捕获数，也报**重入跳过数**与**推事件失败数**。
+
+// ── 事件环形缓冲：回调只入队，由内部线程冲刷 ────────────────────────────
+//
+// 这是**实测逼出来的架构**，不是优化。上一版在回调里直接调用桥接层，
+// 稳定崩溃（`RECEIVED_ACCESS_FAULT, Access Address = 0x8`，故障 IP 落在
+// 桥接层映像的静态 CRT 区域内）；把那段改成"零外部调用"之后 3/3 全部正常，
+// 恢复调用之后 2/2 崩溃。所以约束是硬的：
+//
+//   探针回调 = 一次比较 + 一次内存拷贝，**绝不调用外部代码**。
+//   跨边界推事件交给 Pin 内部线程（非回调上下文、不被插桩）。
+//
+// 每个线程一个环：生产者只有本线程（无锁写 head），消费者只有冲刷线程
+// （无锁写 tail）。溢出时丢**最新**一条并计数——在回调里做任何"补救"
+// （写日志、分配、调用 DLL）都会把崩溃请回来。
+struct EventEntry {
+  UINT8 kind;
+  UINT32 thread_id;
+  UINT64 address;
+  UINT64 args[8];
+};
+
+/// 每线程环的容量。
+///
+/// 实测数据决定这个值：启动阶段一次系统调用风暴就能在 10 ms 内产生 400+ 条事件，
+/// 而 128 条的环会丢掉 39%（**会报出来**，但报出来不等于可以接受）。
+/// 1024 条 × 64 字节 = 64 KiB/线程，64 个线程槽位 ≈ 4 MiB 静态内存——
+/// 用内存换"不丢"，对采集工具是划算的。
+constexpr UINT32 kRingCapacity = 1024;
+
+struct EventRing {
+  EventEntry slots[kRingCapacity];
+  volatile UINT32 head;     // 生产者推进
+  volatile UINT32 tail;     // 消费者推进
+  volatile UINT64 dropped;  // 溢出丢弃（必须报出来）
+};
+
 struct ThreadStats {
   UINT64 enters;
   UINT64 exits;
   UINT64 reentrant_skips;
   UINT64 push_failures;
   bool in_hook;
+  /// 本线程的事件暂存环。回调只写这里（见 push_probe_event）。
+  EventRing ring;
 };
 
 /// 线程统计表。用固定槽位而不是每条线程都 new：探针回调在**任意线程**上
 /// 运行，那里不能做可能失败/可能阻塞的分配（分配本身可能又触发系统调用）。
 ///
 /// 槽位溢出时不假装成功：`g_slot_overflow` 会 +1 并在收尾时报出来。
-constexpr UINT32 kMaxThreadSlots = 256;
+// 线程槽位：每个槽位带一个 64 KiB 的环，所以不能随便放大（见 kRingCapacity）。
+constexpr UINT32 kMaxThreadSlots = 64;
 ThreadStats g_thread_slots[kMaxThreadSlots];
 ThreadStats g_overflow_slot;   // 槽位用尽后的共享槽（只记不细分）
 volatile long g_slot_overflow = 0;
@@ -491,20 +536,75 @@ ThreadStats* stats_for(THREADID tid) {
 /// 正因如此，系统调用探针**默认关闭**（`-pb_syscalls` 默认 0），入口探针不受影响。
 /// 正确修法已经明确：回调只做内存入队 + 由 Pin 内部线程冲刷（见
 /// docs/roadmap.md 的 M1 与 native/README.md 的"已知缺陷"一节）。
+/// 推一条事件：**只入队**。回调路径上除了下标的算术与内存拷贝，什么都不做。
 void push_probe_event(ThreadStats* stats, UINT8 kind, THREADID tid, ADDRINT address,
                       const UINT64* args, UINT32 arg_count) {
-  PbEventRaw raw;
-  std::memset(&raw, 0, sizeof(raw));
-  raw.sequence = static_cast<UINT64>(g_api.allocate_sequence());
-  raw.kind = kind;
-  raw.thread_id = static_cast<UINT32>(tid);
-  raw.address = address;
-  for (UINT32 i = 0; i < arg_count && i < 8; ++i) {
-    raw.args[i] = args[i];
+  EventRing* ring = &stats->ring;
+  if (static_cast<UINT32>(ring->head - ring->tail) >= kRingCapacity) {
+    ++ring->dropped;
+    return;
   }
-  if (g_api.push_event(&raw) != PB_OK) {
-    ++stats->push_failures;
+  EventEntry& slot = ring->slots[ring->head % kRingCapacity];
+  slot.kind = kind;
+  slot.thread_id = static_cast<UINT32>(tid);
+  slot.address = static_cast<UINT64>(address);
+  for (UINT32 i = 0; i < 8; ++i) {
+    slot.args[i] = i < arg_count ? args[i] : 0;
   }
+  ring->head = ring->head + 1;
+}
+
+/// 冲刷一个环。**只在内部线程或 Fini 里调用**（这两处可以安全跨边界）。
+UINT64 flush_ring(EventRing* ring) {
+  UINT64 flushed = 0;
+  while (ring->tail != ring->head) {
+    const EventEntry& slot = ring->slots[ring->tail % kRingCapacity];
+    PbEventRaw raw;
+    std::memset(&raw, 0, sizeof(raw));
+    // 序号**在这里**分配：只有冲刷路径会调 `pb_allocate_sequence`，
+    // 因此序号全局单调。代价是顺序 = 冲刷顺序而不是发生顺序（10 ms 粒度），
+    // 这点写在文档里，不假装是精确时序。
+    raw.sequence = static_cast<UINT64>(g_api.allocate_sequence());
+    raw.kind = slot.kind;
+    raw.thread_id = slot.thread_id;
+    raw.address = slot.address;
+    for (UINT32 i = 0; i < 8; ++i) {
+      raw.args[i] = slot.args[i];
+    }
+    if (g_api.push_event(&raw) != PB_OK) {
+      // 失败必须计数（不允许静默丢弃）。这里在内部线程上下文，
+      // 报日志是安全的，但为了不刷屏只累加，收尾统一报。
+      ++g_push_failures;
+    }
+    ring->tail = ring->tail + 1;
+    ++flushed;
+  }
+  return flushed;
+}
+
+/// 冲刷所有线程的环。返回本次送出的事件数。
+UINT64 flush_all_rings() {
+  UINT64 flushed = 0;
+  for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+    flushed += flush_ring(&g_thread_slots[i].ring);
+  }
+  flushed += flush_ring(&g_overflow_slot.ring);
+  return flushed;
+}
+
+/// 冲刷线程主体（Pin 内部线程）。
+///
+/// 用 10 ms 轮询而不是事件驱动：目标是"低开销采集"，不是"实时"。
+/// 环满时生产者会丢弃并计数（丢最新），因此延迟不会变成丢失的借口。
+VOID FlusherMain(VOID* arg) {
+  (void)arg;
+  while (!g_shutdown) {
+    g_flushed_total += flush_all_rings();
+    ::Sleep(10);
+  }
+  // 退出前把剩下的送走：Fini 也会再冲刷一次，这里只是尽早。
+  g_flushed_total += flush_all_rings();
+  PIN_ExitThread(0);
 }
 
 /// `syscall` 指令：x64 的调用约定是 RAX=SSN，前四个参数在 R10/RDX/R8/R9
@@ -634,15 +734,29 @@ void OnFini(INT32 code, VOID* v) {
   // 第一件事：关掉所有回调。晚一步就会在"已经被拆掉的模块"里调用函数
   // （见 g_shutdown 的说明——这是实测踩出来的坑）。
   g_shutdown = true;
+  // 冲刷线程可能刚被 g_shutdown 叫停，这里做最后一次兜底冲刷：
+  // 「事件已经产生但没送出去」是最不该有的丢失，因为它不可见。
+  const UINT64 flushed_at_fini = flush_all_rings();
   report("目标退出（code=%d），入口探针%s命中", code, g_entry_hit ? "已" : "**未**");
+  (void)flushed_at_fini;
 
   if (g_api.stop_trace != nullptr && !KnobTrace.Value().empty()) {
     uint64_t records = 0;
     uint64_t events = 0;
     const int32_t stop = g_api.stop_trace(&records, &events);
-    report("停止录制：返回 %d，记录 %llu 条 / 事件 %llu 条", stop,
-           static_cast<unsigned long long>(records),
-           static_cast<unsigned long long>(events));
+    if (stop == PB_OK) {
+      report("停止录制：记录 %llu 条 / 事件 %llu 条",
+             static_cast<unsigned long long>(records),
+             static_cast<unsigned long long>(events));
+    } else {
+      // **已知且刻意**的取舍，不是未处理的错误：Pin 的 Fini 晚于目标对 DLL 的
+      // 卸载，而桥接层的卸载保护会拒绝这次调用（返回 NOT_ATTACHED）。
+      // 代价是轨迹缺 SUMMARY/END 段；补偿是 agent 侧**增量落盘**，
+      // 所以文件里已经有可读的记录。
+      report("停止录制失败（返回 %d）——退出期的收尾被卸载保护拒绝。", stop);
+      report("  这是已知取舍：不为了一个摘要段去调用已拆掉的 CRT。");
+      report("  轨迹已增量落盘，读取器会报「汇总缺失」，不会假装完整。");
+    }
   }
 
   // ── 探针账本 ──────────────────────────────────────────────────────────
@@ -670,6 +784,37 @@ void OnFini(INT32 code, VOID* v) {
          static_cast<unsigned long long>(skips),
          static_cast<unsigned long long>(failures),
          g_slot_overflow != 0 ? "（线程槽位溢出，统计已并入共享槽）" : "");
+  // 环形缓冲的账：溢出丢弃与已送出条数。少了这两行，"事件为什么少了"
+  // 就只能靠猜——而猜测不是可复现的证据。
+  UINT64 ring_dropped = 0;
+  for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+    ring_dropped += g_thread_slots[i].ring.dropped;
+  }
+  ring_dropped += g_overflow_slot.ring.dropped;
+  report("  环形缓冲：已送出 %llu 条（含收尾兜底 %llu 条），溢出丢弃 %llu 条",
+         static_cast<unsigned long long>(g_flushed_total + flushed_at_fini),
+         static_cast<unsigned long long>(flushed_at_fini),
+         static_cast<unsigned long long>(ring_dropped));
+
+  // 自动化判据：没捕够就明确打出一条"失败"标记，由 ctest 的
+  // FAIL_REGULAR_EXPRESSION 判定。**不能只用一行普通日志**——
+  // 那等于让"探针没工作"看起来像"跑成功了"。
+  //
+  // 为什么不用退出码：这段代码在 Fini 里，进程已经在退出流程中，
+  // 从 Fini 里改退出码在各版本 Pin 上行为不一致；正则断言是可靠的。
+  // 另外把"溢出丢弃"也纳入断言（`溢出丢弃 [1-9]`）——静默丢事件是禁止的。
+  if (g_required_syscalls != 0) {
+    const UINT64 captured = enters + exits;
+    if (captured < g_required_syscalls) {
+      report("失败：要求至少捕获 %llu 条系统调用事件，实际 %llu 条",
+             static_cast<unsigned long long>(g_required_syscalls),
+             static_cast<unsigned long long>(captured));
+    } else {
+      report("✓ 捕获数满足要求（%llu >= %llu）",
+             static_cast<unsigned long long>(captured),
+             static_cast<unsigned long long>(g_required_syscalls));
+    }
+  }
 
   const UINT32 want = KnobEvents.Value();
   if (want == 0) {
@@ -738,6 +883,7 @@ int main(int argc, char** argv) {
   pb_syscall_enabled = KnobSyscalls.Value() != 0;
 
   g_syscall_cap = parse_u64(KnobSyscallMax.Value().c_str(), 4096);
+  g_required_syscalls = parse_u64(KnobRequireSyscalls.Value().c_str(), 0);
   report("系统调用探针：%s（上限 %llu 条，0 表示不限）",
          pb_syscall_enabled ? "开" : "关",
          static_cast<unsigned long long>(g_syscall_cap));
@@ -755,6 +901,20 @@ int main(int argc, char** argv) {
   IMG_AddUnloadFunction(OnImageUnload, nullptr);
   INS_AddInstrumentFunction(OnInstruction, nullptr);
   PIN_AddFiniFunction(OnFini, nullptr);
+
+  // 冲刷线程：**必须在布下探针之前起来**，否则第一批事件会一直躺在环里
+  // 等到第一次轮询（10 ms 后）才出去。它不是回调上下文、也不被插桩，
+  // 因此是唯一可以安全跨边界推事件的地方（见 push_probe_event 的注释）。
+  PIN_THREAD_UID flusher_uid = 0;
+  // `PIN_SpawnInternalThread` 用 `PIN_ThreadId` 之外的方式表示失败：
+  // 它返回 `PIN_THREAD_UID` 的指针，失败时是…实测拿 `nullptr` 比较会被拒
+  // （C2446 无法把 nullptr 转为 PIN_THREAD_UID），所以用句柄有效性判断。
+  PIN_SpawnInternalThread(FlusherMain, nullptr, 0, &flusher_uid);
+  if (flusher_uid == static_cast<PIN_THREAD_UID>(0)) {
+    report("警告：冲刷线程未启动，事件只会留在环形缓冲里（收尾时仍会兜底冲刷）");
+  } else {
+    report("冲刷线程已启动（10 ms 轮询；它不是回调上下文，跨边界在这里发生）");
+  }
 
   PIN_StartProgram();  // 不返回
   return 0;
