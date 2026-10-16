@@ -664,6 +664,9 @@ struct Pattern {
   UINT8 mask[32];  // 1 = 必须匹配，0 = 通配
   UINT32 length;
   UINT64 matches;  // 在这个映像里找到的地址数
+  /// 这个模板**执行到**的次数。与 `matches`（静态找到多少个位置）是两件事：
+  /// matches 说明"签名在不在"，hits 说明"这段代码跑没跑到"。
+  UINT64 hits;
 };
 
 constexpr UINT32 kMaxPatterns = 8;
@@ -1688,6 +1691,16 @@ void OnPatternHit(THREADID tid, ADDRINT ins_address, ADDRINT pattern_id) {
   stats->in_hook = true;
   ++stats->pattern_hits;
   ++g_pattern_hits;
+  // 按模板分别计数：只报总数时，"命中的是哪个模板"无法回答——
+  // 而多模板同跑时那正是最需要知道的事（A 命中 100 次与 B 命中 100 次，
+  // 结论完全不同）。事件里本来就带着模板 id（下面的 args[0]），
+  // 报告里也必须对得上，否则调用方还要自己去事件流里统计一遍。
+  for (UINT32 i = 0; i < g_pattern_count; ++i) {
+    if (g_patterns[i].id == pattern_id) {
+      ++g_patterns[i].hits;
+      break;
+    }
+  }
   const UINT64 args[2] = {static_cast<UINT64>(pattern_id), 0};
   push_probe_event(stats, 5 /* PB_EV_PATTERN_HIT */, tid, ins_address, args, 2);
   stats->in_hook = false;
@@ -2186,6 +2199,15 @@ void OnFini(INT32 code, VOID* v) {
     hits += g_overflow_slot.pattern_hits;
     report("模板命中：登记地址 %u 个，命中 %llu 次", g_match_count,
            static_cast<unsigned long long>(hits));
+    // 按模板分开报：只报总数时"命中的是哪个模板"无法回答，而多模板同跑时那正是
+    // 最需要知道的事（A 命中 100 次与 B 命中 100 次，结论完全不同）。
+    // 事件里本来就带模板 id（`pattern_hit` 的 args[0]），报告必须对得上，
+    // 否则调用方还得自己去事件流里再统计一遍。
+    for (UINT32 i = 0; i < g_pattern_count; ++i) {
+      report("  模板 %u（%s）：静态命中点 %llu 个、执行到 %llu 次", g_patterns[i].id,
+             g_patterns[i].name, static_cast<unsigned long long>(g_patterns[i].matches),
+             static_cast<unsigned long long>(g_patterns[i].hits));
+    }
     if (g_required_pattern_hits != 0) {
       if (hits < g_required_pattern_hits) {
         report("失败：要求至少命中 %llu 次，实际 %llu 次",

@@ -461,6 +461,28 @@ if(BUILD_TESTING)
         FAIL_REGULAR_EXPRESSION "溢出丢弃 [1-9]"
         SKIP_RETURN_CODE 77)
 
+      # ── 模板命中的**归属**（M2「模板 ID 可追溯」）────────────────────────
+      #
+      # 两个模板同时登记：一个真的会被执行到（靶子里的 PBRIDGE1 魔数），
+      # 另一个不会被扫到。判据是**分别**的：
+      #   * 模板 1 的执行数非零（命中确实发生）
+      #   * 模板 2 的执行数是 0（没有被算到别人头上）
+      # 只断言"总命中数 > 0"会被共享计数器骗过去——那正是"可追溯"要防的：
+      # 多模板同跑时"命中的是哪个模板"必须能从报告里直接读出来，
+      # 而不是让调用方自己再去事件流里数一遍。
+      add_test(NAME pin_tool_pattern_attribution
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_pattern "1:pbridge_magic:3145474449524250;2:absent:DEADBEEFCAFEBABE"
+                -pb_pattern_max 64
+                -pb_events 4
+                --
+                "$<TARGET_FILE:pb_sample_target>" --pattern-hits 200)
+      set_tests_properties(pin_tool_pattern_attribution PROPERTIES
+        PASS_REGULAR_EXPRESSION "模板 1（pbridge_magic）：静态命中点 [1-9][0-9]* 个、执行到 [1-9][0-9]* 次"
+        FAIL_REGULAR_EXPRESSION "模板 2（absent）：静态命中点 [1-9]|模板 2（absent）：.*执行到 [1-9]|Unhandled internal exception"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+
       # ── 脱壳场景验收（M2）：改内存属性 + 写盘能被系统调用时机观察到 ──────
       #
       # 判据是"某两个系统调用号必须出现过"，而号随 Windows 版本变化，

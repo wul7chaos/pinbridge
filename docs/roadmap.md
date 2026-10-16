@@ -142,8 +142,8 @@
 |------|------|
 | ~~系统调用 Hook（进入/离开）~~ | ✅ 验收达成：`pin_tool_unpack_scenario` —— 自写靶子真做「改内存属性（VirtualProtect→0x50）+ 写盘（WriteFile→0x8）」，工具用 `-pb_require_ssn` 要求这两个号出现；含**反向对照**（要求不存在的号必须失败）。号由靶子从 ntdll 桩读出（不写死，随版本变化） |
 | Windows 异常时机 | ✅ **性质**已验收：`pin_tool_exception_flow_continues` —— 靶子 32 轮异常控制流全部跑完（`observed=32`）、事件流持续、无 Pin 故障、全程不依赖调试框架。<br>⏳ **异常事件**（把异常本身变成 `exception` 事件）未落地：实测 `PIN_AddContextChangeFunction` 不送应用软件异常，`NtRaiseException` 也不在系统调用探针视野内 → 需要换挂点（`KiUserExceptionDispatcher` / `PIN_AddDebugInterpreter`），证据见 CHANGELOG 与代码注释 |
-| 指令模板匹配 Hook | 模板命中产生 `pattern_hit`，且模板 ID 可追溯 |
-| **TF 虚拟化** | 目标设 TF 时出现 `trap_flag` 事件，异常位置与原生执行一致（手工验证） |
+| ~~指令模板匹配 Hook~~ | ✅ 验收达成：`pin_tool_pattern_attribution` —— 两个模板同跑（一个真命中、一个不存在），报告**按模板分别**给出「静态命中点 N 个、执行到 M 次」：`模板 1（pbridge_magic）：静态命中点 1 个、执行到 200 次` / `模板 2（absent）：静态命中点 0 个、执行到 0 次`。事件侧 `pattern_hit` 的 `args[0]` 本来就是模板 id，报告现在与它对得上（**只报总数会被共享计数器骗过去**） |
+| **TF 虚拟化** | ✅ 事件与虚拟化：`pin_tool_tf_watch`/`virtualize`/`tf_per_thread` —— 出现 `trap_flag` 事件（args[0]：1=置位意图 0=清除意图 2=真实单步），virtualize 下目标侧 `real_steps=0` 而读回 TF 仍为置位（`read_tf=N`），每线程状态互不干扰。<br>⏳ 「**异常位置与原生执行一致**」还没对拍：需要工具把真实单步的地址与靶子 `__except` 过滤器里取到的 `ExceptionAddress` 做等值比较（靶子侧用 `GetExceptionInformation()` 可取，可做但尚未做）——**没验证的不打勾** |
 | ~~每线程虚拟 TF 状态机~~ | ✅ 已完成：`pin_tool_tf_per_thread` —— 两条线程各跑 6 轮（偶数轮置位/奇数轮清除，票据锁排成交错），分线程摘要 `TF 每线程：置位 3,3 / 清除 3,3`，两条线程目标侧读回都是 `read_tf=3`。**用例的判别力被验证过**：把状态故意改回全局 → 用例失败 |
 | ~~轨迹实时流式回传~~ | ✅ 已完成（ADR 0011）：`flush()` 写提交标记界定「完整到哪」，`PbtReader::open_streaming` 容忍截断尾部且**零头不丢**；两条用例覆盖「边录边读且序号接得上」与「截断的判定两种模式必须不同」 |
 | ~~事件前置过滤~~ | ✅ 已完成：`-pb_syscall_sample N` 在**入队之前**采样（实测同一负载下溢出丢弃 7952 → 0），"有意跳过"与"溢出丢弃"分开报；两条 ctest 做前后对照 |
