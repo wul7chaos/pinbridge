@@ -302,8 +302,9 @@ unsigned long read_ssn(const char* export_name) {
 
 /// `--print-ssns`：报出脱壳场景要用到的两个系统调用号。
 void print_unpack_ssns() {
-  std::printf("PB_SSN protect=0x%lX write=0x%lX\n", read_ssn("NtProtectVirtualMemory"),
-              read_ssn("NtWriteFile"));
+  std::printf("PB_SSN protect=0x%lX write=0x%lX raise=0x%lX\n",
+              read_ssn("NtProtectVirtualMemory"), read_ssn("NtWriteFile"),
+              read_ssn("NtRaiseException"));
 }
 
 /// `--unpack-scenario`：改内存属性 + 写盘，各做一次（真实调用，不是模拟）。
@@ -350,6 +351,47 @@ int unpack_scenario() {
   std::printf("PB_UNPACK ok region=0x%p previous=0x%lX bytes=%lu\n", region, previous,
               written);
   return 0;
+}
+
+// ------------------------------------------------- 异常即控制流（M2 验收靶子）
+//
+// 混淆与保护壳广泛用异常做控制流：把"下一步去哪"编码进异常码/参数里，
+// 由 `__except` 过滤器解码后决定继续执行哪条路径。静态看是"抛了异常"，
+// 动态看却是正常的分支。
+//
+// 靶子把它做成一个**可控的循环**：每轮抛一个带参数的异常，过滤器按参数
+// 更新状态，状态决定是否继续。验收要的是**事件流连续**：工具应当看到 N 次异常，
+// 而且没有把目标打断。
+//
+// 用私有异常码（0xE0000001 起是 MSVC 预留的用户自定义区间），避免与系统码撞车。
+
+constexpr unsigned long kFlowException = 0xE0000001UL;
+
+/// `--exception-flow N`：用异常当控制流跑 N 轮。
+int exception_flow(unsigned long rounds) {
+  unsigned long observed = 0;
+  unsigned long state = 7;
+  for (unsigned long i = 0; i < rounds; ++i) {
+    // 异常**参数**在工具侧是看不到的：Pin 的上下文变化回调只给异常码与出错
+    // 地址，不给 `RaiseException` 的参数表。这里带参数是为了让这条路径与真实
+    // 手法形状一致（真实手法确实把数据塞在参数里），而不是指望验收能从事件流
+    // 里读出它们——**别把"看不到"当成"没有"**。
+    ULONG_PTR details[1] = {static_cast<ULONG_PTR>(state)};
+    __try {
+      RaiseException(kFlowException, 0, 1, details);
+      // 抛异常之后这行不会执行到（除非过滤器要求继续搜索）。
+      std::printf("PB_EXCEPTION_FLOW FAIL not-raised\n");
+      return 1;
+    } __except (GetExceptionCode() == kFlowException ? EXCEPTION_EXECUTE_HANDLER
+                                                      : EXCEPTION_CONTINUE_SEARCH) {
+      ++observed;
+      // "解码"：状态按固定规则演进，下一轮继续用异常推进控制流。
+      state = state * 31 + i;
+    }
+  }
+  std::printf("PB_EXCEPTION_FLOW rounds=%lu observed=%lu final_state=%lu\n", rounds,
+              observed, state);
+  return observed == rounds ? 0 : 1;
 }
 
 // ---------------------------------------------------------------- agent 检查
@@ -613,6 +655,7 @@ int main(int argc, char** argv) {
   unsigned long pattern_hits = 0;
   unsigned long tf_sets = 0;
   unsigned long tf_thread_rounds = 0;
+  unsigned long exception_rounds = 0;
   bool print_ssns = false;
   bool unpack = false;
   bool print_buffer = false;
@@ -631,6 +674,8 @@ int main(int argc, char** argv) {
       tf_sets = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--tf-threads") == 0 && i + 1 < argc) {
       tf_thread_rounds = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--exception-flow") == 0 && i + 1 < argc) {
+      exception_rounds = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--print-ssns") == 0) {
       print_ssns = true;
     } else if (std::strcmp(argv[i], "--unpack-scenario") == 0) {
@@ -643,6 +688,9 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (exception_rounds != 0) {
+    return exception_flow(exception_rounds);
+  }
   if (print_ssns) {
     print_unpack_ssns();
     return 0;

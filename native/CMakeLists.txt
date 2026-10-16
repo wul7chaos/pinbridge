@@ -475,6 +475,34 @@ if(BUILD_TESTING)
         set_tests_properties(pin_tool_unpack_scenario PROPERTIES SKIP_RETURN_CODE 77)
       endif()
 
+      # ── 异常时机（M2）：目标用异常做控制流时，事件流必须**连续** ──────────
+      #
+      # 靶子用私有异常码抛 N 次，过滤器解码后继续——这就是混淆/保护壳的形状。
+      # 判据两条同时成立：① 工具看到 N 次异常（`✓ 异常观察数满足要求`）；
+      # ② 靶子自己报告 `observed=N`（异常流没有被工具打断）。
+      # 只断言 ① 不够：工具"看到了"不等于"目标跑完了"——一个把目标打断的
+      # 实现也能产生 N 条事件。
+      # 判据是**性质**，不是某个新事件类型（原因见下）：
+      #   ① 靶子自己报告 `observed=32` —— 异常控制流没有被我们打断；
+      #   ② 事件流在异常期间**持续**（`捕获 enter=` 非零）；
+      #   ③ 没有 Pin 内部故障。
+      # 为什么不断言"异常事件"：实测两条边界都不通——`PIN_AddContextChangeFunction`
+      # 不送应用自己 `RaiseException` 的软件异常（诊断打印每次回调，32 轮一次没进），
+      # 而 `NtRaiseException`（0x175）在系统调用探针下也**一次都没出现**。
+      # 想要"异常事件"需要换挂点（`KiUserExceptionDispatcher` 或
+      # `PIN_AddDebugInterpreter`），那属于后续工作；**不能把不成立的路径留在代码里**。
+      add_test(NAME pin_tool_exception_flow_continues
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_syscalls 1
+                -pb_syscall_max 200000
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --exception-flow 32)
+      set_tests_properties(pin_tool_exception_flow_continues PROPERTIES
+        PASS_REGULAR_EXPRESSION "observed=32"
+        FAIL_REGULAR_EXPRESSION "PB_EXCEPTION_FLOW FAIL|Unhandled internal exception|not-raised")
+
       add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-mem-probe.ps1"

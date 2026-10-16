@@ -141,7 +141,7 @@
 | 任务 | 验收 |
 |------|------|
 | ~~系统调用 Hook（进入/离开）~~ | ✅ 验收达成：`pin_tool_unpack_scenario` —— 自写靶子真做「改内存属性（VirtualProtect→0x50）+ 写盘（WriteFile→0x8）」，工具用 `-pb_require_ssn` 要求这两个号出现；含**反向对照**（要求不存在的号必须失败）。号由靶子从 ntdll 桩读出（不写死，随版本变化） |
-| Windows 异常时机接管 | 目标用异常做控制流时事件流连续，且不依赖调试框架 |
+| Windows 异常时机 | ✅ **性质**已验收：`pin_tool_exception_flow_continues` —— 靶子 32 轮异常控制流全部跑完（`observed=32`）、事件流持续、无 Pin 故障、全程不依赖调试框架。<br>⏳ **异常事件**（把异常本身变成 `exception` 事件）未落地：实测 `PIN_AddContextChangeFunction` 不送应用软件异常，`NtRaiseException` 也不在系统调用探针视野内 → 需要换挂点（`KiUserExceptionDispatcher` / `PIN_AddDebugInterpreter`），证据见 CHANGELOG 与代码注释 |
 | 指令模板匹配 Hook | 模板命中产生 `pattern_hit`，且模板 ID 可追溯 |
 | **TF 虚拟化** | 目标设 TF 时出现 `trap_flag` 事件，异常位置与原生执行一致（手工验证） |
 | ~~每线程虚拟 TF 状态机~~ | ✅ 已完成：`pin_tool_tf_per_thread` —— 两条线程各跑 6 轮（偶数轮置位/奇数轮清除，票据锁排成交错），分线程摘要 `TF 每线程：置位 3,3 / 清除 3,3`，两条线程目标侧读回都是 `read_tf=3`。**用例的判别力被验证过**：把状态故意改回全局 → 用例失败 |

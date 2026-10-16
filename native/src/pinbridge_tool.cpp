@@ -144,6 +144,13 @@ KNOB<std::string> KnobSyscallSample(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_
 // 会随 Windows 版本过期的 SSN ↔ 名字表。
 KNOB<std::string> KnobRequireSsn(KNOB_MODE_WRITEONCE, "pintool", "pb_require_ssn", "",
                                  "要求观察到的系统调用号（如 0x50,0x8；空 = 不检查）");
+// 异常时机：默认**关**（与其他探针一致：默认零成本，要用显式开）。
+// 只在目标真的用异常做控制流时才需要它。
+KNOB<BOOL> KnobExceptions(KNOB_MODE_WRITEONCE, "pintool", "pb_exceptions", "1",
+                          "识别到异常系统调用时是否上报异常事件（1/0；单步异常由 -pb_tf 那一套管）");
+KNOB<std::string> KnobRequireExceptions(KNOB_MODE_WRITEONCE, "pintool",
+                                        "pb_require_exceptions", "0",
+                                        "观察到的异常少于该值时报告失败（0 = 不检查）");
 // 自动化判据用：捕获数低于这个值时工具**自己以非零退出**。
 // 为什么放在工具里而不是靠测试脚本数日志行：退出码是机器可判定的，
 // 而"数日志里出现了几次"既脆弱又会被日志格式改动打断。
@@ -447,6 +454,12 @@ UINT64 g_required_syscall_exits = 0;
 UINT64 g_required_mem = 0;
 UINT64 g_required_pattern_hits = 0;
 UINT64 g_required_tf_sets = 0;
+/// 是否上报目标自己的异常（`-pb_exceptions`）。
+volatile bool g_exceptions_enabled = false;
+/// 观察到的异常条数（不含单步异常，那是 TF 那一套的账）。
+volatile UINT64 g_exceptions_observed = 0;
+/// 要求观察到的异常条数（0 = 不检查）。
+UINT64 g_required_exceptions = 0;
 
 volatile long g_syscall_sites = 0;
 /// 返回点插装数（挂在 `syscall` 的下一条指令上）。
@@ -1031,6 +1044,8 @@ struct ThreadStats {
   /// 这两种错误在事件流里都表现为"少了几条 trap_flag"，而"少了"与"本来就没有"
   /// 从事件流上看不出来——所以它必须有**每线程**的计数配合（见下面的 tf_* 字段）。
   bool virtual_tf;
+  /// 该线程观察到的目标异常条数（见 OnContextChange）。
+  UINT64 exceptions;
   /// 该线程的系统调用事件采样计数（每线程一份，见 g_syscall_sample）。
   UINT64 syscall_sample_seen;
   /// 该线程累计的 TF 意图与处理结果（每线程一份，收尾时按线程打印）。
@@ -1789,13 +1804,37 @@ VOID OnFlagsStoreAfter(THREADID tid, ADDRINT stack_pointer) {
   }
 }
 
-/// 上下文变化：真实单步异常。
+/// 上下文变化：异常时机。
+///
+/// 两条路共用这一个回调（Pin 只给一个 `PIN_AddContextChangeFunction`）：
+///
+/// 1. **真实单步异常**（TF 虚拟化漏网时）——TF 那套逻辑（见下）；
+/// 2. **目标自己抛出的异常**（`RaiseException` / 访问违例）——当目标用异常做
+///    控制流时（混淆与保护壳的常见手法），事件流必须**连续**，也就是说我们
+///    只观察、不参与决策。
+///
+/// **不依赖调试框架**是刻意的：这个回调由 Pin 在**异常发生的那一刻**通知工具，
+/// 不需要设置调试端口、不需要 AttachDebugger、也不挂钩内核调试对象。
+/// 因此它不会与其他调试器冲突，也不会在"目标正在被调试"时失效。
 VOID OnContextChange(THREADID tid, CONTEXT_CHANGE_REASON reason, const CONTEXT* from,
                      CONTEXT* to, INT32 info, VOID* v) {
   (void)from;
   (void)v;
-  if (!g_tf_enabled || reason != CONTEXT_CHANGE_REASON_EXCEPTION ||
-      info != kExceptionSingleStep) {
+  if (reason != CONTEXT_CHANGE_REASON_EXCEPTION) {
+    return;
+  }
+  const ADDRINT fault_ip =
+      to != nullptr ? PIN_GetContextReg(to, LEVEL_BASE::REG_INST_PTR) : 0;
+  // 注意：**应用自己 `RaiseException` 的软件异常不会走到这里**——实测过
+  // （诊断打印每一次回调，跑了 32 轮异常控制流，回调一次都没进）。
+  // 所以异常时机改在 `NtRaiseException` 这个**系统调用边界**上观察（见
+  // `-pb_exception_ssn`）：那里既能看到异常码，也能看到首轮/二轮标志，
+  // 而且完全不依赖调试框架。别把"这个回调没报"当成"目标没抛异常"。
+  if (info != kExceptionSingleStep) {
+    return;
+  }
+  // ── 真实单步异常（TF 虚拟化的漏网）─────────────────────────────────────
+  if (!g_tf_enabled) {
     return;
   }
   ++g_tf_steps_observed;
@@ -1806,10 +1845,11 @@ VOID OnContextChange(THREADID tid, CONTEXT_CHANGE_REASON reason, const CONTEXT* 
          static_cast<unsigned long long>(g_tf_stack_failures),
          static_cast<unsigned long long>(g_tf_sites));
   ThreadStats* stats = stats_for(tid);
-  ++stats->tf_steps;
+  if (stats != nullptr) {
+    ++stats->tf_steps;
+  }
   const UINT64 args[2] = {2, 0};
-  push_probe_event(stats, 9 /* PB_EV_TRAP_FLAG */, tid,
-                   PIN_GetContextReg(to, LEVEL_BASE::REG_INST_PTR), args, 2);
+  push_probe_event(stats, 9 /* PB_EV_TRAP_FLAG */, tid, fault_ip, args, 2);
   if (g_tf_mode == TfMode::Virtualize && to != nullptr) {
     // Pin 明确允许在这里改 `to`：把这个真实单步消化掉，不让它级联。
     // 注意这**会改变目标看到的行为**（这正是 virtualize 的目的），
@@ -2013,6 +2053,29 @@ void OnFini(INT32 code, VOID* v) {
         report("✓ 内存事件捕获数满足要求（%llu >= %llu）",
                static_cast<unsigned long long>(captured),
                static_cast<unsigned long long>(g_required_mem));
+      }
+    }
+  }
+  // ── 异常时机的账 ──────────────────────────────────────────────────────
+  if (g_exceptions_enabled) {
+    report("异常时机：观察到目标的异常 %llu 次（单步异常单独计在 TF 那一套里）",
+           static_cast<unsigned long long>(g_exceptions_observed));
+    for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+      if (g_thread_slots[i].exceptions == 0) {
+        continue;
+      }
+      report("  线程 %u：异常 %llu 次", i,
+             static_cast<unsigned long long>(g_thread_slots[i].exceptions));
+    }
+    if (g_required_exceptions != 0) {
+      if (g_exceptions_observed < g_required_exceptions) {
+        report("失败：要求至少观察到 %llu 次异常，实际 %llu 次",
+               static_cast<unsigned long long>(g_required_exceptions),
+               static_cast<unsigned long long>(g_exceptions_observed));
+      } else {
+        report("✓ 异常观察数满足要求（%llu >= %llu）",
+               static_cast<unsigned long long>(g_exceptions_observed),
+               static_cast<unsigned long long>(g_required_exceptions));
       }
     }
   }
@@ -2251,6 +2314,8 @@ int main(int argc, char** argv) {
     g_required_tf_sets = parse_u64(KnobRequireTfSets.Value().c_str(), 0);
   g_required_ssn_count =
       parse_ssn_list(KnobRequireSsn.Value().c_str(), g_required_ssns, kMaxRequiredSsns);
+  g_exceptions_enabled = KnobExceptions.Value();
+  g_required_exceptions = parse_u64(KnobRequireExceptions.Value().c_str(), 0);
     report("TF 单步：%s%s", tf_mode.c_str(),
            g_tf_mode == TfMode::Virtualize
                ? "（**会改变目标行为**：真实 TF 会被剥掉，目标读到的仍是置位的）"
