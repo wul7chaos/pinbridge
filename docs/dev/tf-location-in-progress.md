@@ -1,54 +1,42 @@
-# TF 异常位置比对：现状与下一步
+# TF 异常位置：结论与它为什么在插桩下无法验证
 
-- 状态：**两侧的报数已实现并有用例**；「等值」这条判据**还没有**，原因见下。
-- 相关：`scripts/check-tf-observation.ps1`、ctest `pin_tool_tf_observation`、
-  `native/tests/sample_target.cpp`、`native/src/pinbridge_tool.cpp`
+- 状态：**已定论**（本轮）。判据「工具观察到的单步位置 == 目标读到的 `ExceptionAddress`」
+  在**插桩环境下构造上取不到两侧数字**；能验的部分已经全部落成断言。
+- 相关用例：`sample_target_tf_veh`（靶子侧，独立运行）、`pin_tool_tf_observation`（工具侧分模式契约）
 
 ## 判据是什么
 
-**同一次**单步异常：工具说它发生在 X，靶子自己从
-`GetExceptionInformation()->ExceptionAddress` 读到 Y，验 **X == Y**。
-两边对不上就意味着"我们说的异常位置"与"目标看到的那一处"不是同一个 ——
-之后所有基于地址的分析都会错位。
+**同一次**单步异常：工具说它发生在 X，靶子自己从异常记录里读到 `ExceptionAddress` = Y，验 **X == Y**。
+两边对不上就意味着"我们说的异常位置"与"目标看到的那一处"不是同一个。
 
-## 为什么现在还取不到两侧的数字
+## 为什么在插桩下做不到（逐条实测）
 
-| 模式 | 目标能不能活过真实单步 | 有没有可比的 Y |
-|------|------------------------|----------------|
-| `-pb_tf virtualize` | ✅ 活（但工具把真实单步**剥掉了** ⇒ 目标**根本看不到异常**） | ✗ `PB_TF_EXC count=0` |
-| `-pb_tf watch` | ✗ 死 | ✗ |
-| `--tf-set` / `--tf-threads` 单独跑（不挂 Pin） | ✅ 活 | ✅（但那是**没有工具**时的原生行为） |
+| 尝试 | 结果 |
+|------|------|
+| `-pb_tf virtualize` | 工具把真实单步**剥掉** ⇒ 目标**根本看不到异常**（`PB_TF_EXC count=0`）⇒ 没有 Y |
+| `-pb_tf watch` + 靶子用 `__try/__except` | 目标**接不住** ⇒ 进程以 `STATUS_SINGLE_STEP`（`0x80000004`）终止（早已记录的预期，见 roadmap 与 ctest `pin_tool_tf_without_virtualize_is_fatal`） |
+| `-pb_tf watch` + 靶子改用 **VEH**（`AddVectoredExceptionHandler`） | **仍然接不住** ⇒ 同样以 `STATUS_SINGLE_STEP` 终止。而**同一份靶子不挂工具时完全正常**（`PB_TF_VEH count=4 addr0..3=0x7FF799B42378`） |
+| `--tf-set` / `--tf-threads` 不挂工具 | ✅ 目标能读到异常位置（`PB_TF_EXC count=8 addr0..7=0x7FF6EEFE1C9E`）——但那是**没有工具**时的原生行为，不是"两侧比对" |
 
-`watch` 下目标为什么死：未接住的单步异常，进程以
-`STATUS_SINGLE_STEP`（`0x80000004`）终止。**这不是缺陷** —— 它是本项目**早已记录并
-早已断言**的行为：
+⇒ 结论：插桩环境下，Pin 交付这个真实单步的方式**既不走 SEH、也不走 VEH**（两种都试过），
+目标在能观察到异常的两种模式里**活不下来**。所以"两侧等值"这条判据**不是没实现，而是取不到数据**。
 
-* `docs/roadmap.md` 的 TF 条目写着"Pin 下不虚拟化则进程以 `0x80000004` 终止"；
-* ctest 里有一条 `pin_tool_tf_without_virtualize_is_fatal` 专门断言它。
+## 能验的部分（都已断言，不再打空勾）
 
-> **更正（本轮）**：我在前两轮把这个行为写成"新发现的缺陷"，并据此把
-> `scripts/check-tf-location.ps1` 做成"已知缺陷 ⇒ 跳过"。那是错的 ——
-> 项目里既有文档也有用例。教训与第 38 轮那条同源：**在下结论之前先搜自家的文档与用例**；
-> 这次具体化为一条可操作的做法：**动手写"新缺陷"之前先 `ctest -N` 看有没有同名断言**。
+| 侧 | 断言 | 用例 |
+|----|------|------|
+| 靶子 | 能从 VEH 的 `ExceptionRecord` 读到异常位置并打印（`PB_TF_VEH count=4 addr0=0x…`） | `sample_target_tf_veh`（不挂工具） |
+| 工具 | 分模式契约：`virtualize` ⇒ 目标 0 次真实单步 + 读回 TF 仍置位 + 工具明说没有真实单步 + 退出码 0；`watch` ⇒ 目标按预期死于 `STATUS_SINGLE_STEP` | `pin_tool_tf_observation` |
+| 两侧数字**各自**存在 | 工具报 `TF 异常位置：0x…`（能观察到时）；靶子报它自己读到的位置 | 上面两条 + `pin_tool_tf_exc*` 系列 |
 
-## 下一步（唯一一条路）
+## 如果将来要真正做等值比对
 
-让靶子**活过**真实单步，才能同时拿到 X 与 Y：
+唯一可能成立的路子不是在插桩下硬试，而是**换观察点**：让工具在**同一时刻**把
+"它认为要执行的那条指令地址"交给目标（例如通过 `pb_*` 通道），由**目标**在异常处理里
+比较两者 —— 比较发生在目标侧，就不依赖"Pin 怎么交付异常"。这属于新能力（双向通道），
+不在 M2 的验收范围内，记录在此备查。
 
-1. 在靶子里改用**向量化异常处理（VEH）**而不是 `__try/__except`
-   （`AddVectoredExceptionHandler`）：VEH 不依赖栈上的作用域，即使单步发生在
-   Pin 注入的代码边界上也能接到，处理完 `EXCEPTION_CONTINUE_EXECUTION` 继续跑；
-2. 从 VEH 的 `ExceptionRecord->ExceptionAddress` 取 Y 并打印（与现在同形的 `PB_TF_EXC`）；
-3. 工具侧照旧报 X（已有）；
-4. 判据回到"工具的 X ∈ 靶子报出的 Y 集合"，写进 `check-tf-observation.ps1` 的第三档。
+## 教训（写在这里免得再踩）
 
-## 已经做到、且现在就有断言的部分
-
-* **工具侧** `TF 异常位置：0x…（首个真实单步，共 N 次）`；`virtualize` 下如实报
-  `没有观察到真实单步`；
-* **靶子侧** `PB_TF_EXC count=N addr0=0x…`（单独运行可验证：`count=8`，8 次同一地址）；
-* **分模式契约**（`pin_tool_tf_observation`，本轮新增，**真断言非跳过**）：
-  * `virtualize`：目标 0 次真实单步 + **读回 TF 仍为置位**（虚拟化的假象成立）+
-    工具明说没有真实单步 + 退出码 0；
-  * `watch`：目标按预期死在 `STATUS_SINGLE_STEP`（退出码 `-2147483644` = `0x80000004`）
-    —— 预期一旦改变，这条会红并提示同步更新文档。
+我前两轮把这个行为当成"新发现的缺陷"，实际上**文档与用例都已经有了**。做法上固化一条：
+**在下结论之前先搜自家的文档与用例**（`Select-String` 关键词 + `ctest -N` 看有没有同名断言）。

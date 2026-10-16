@@ -346,6 +346,20 @@ if(BUILD_TESTING)
       set_tests_properties(sample_target_tf_control PROPERTIES
         PASS_REGULAR_EXPRESSION "PB_TF_RESULT real_steps=50 tf_reads=0")
 
+      # 靶子的 VEH 路径（不挂工具）：这是「异常位置」判据**唯一**能取到数据的地方。
+      #
+      # 为什么单独立一条：实测在插桩下，真实单步**既不被 SEH 接住、也不被 VEH 接住**
+      # （进程仍以 STATUS_SINGLE_STEP 终止）—— 所以"工具观察的位置 == 目标读到
+      # 的位置"这条等值判据在插桩下**构造上取不到两侧数字**。能验的部分是：
+      # 目标自己确实能从 VEH 的 ExceptionRecord 里读到异常位置（本用例），
+      # 工具自己也确实会在能观察到的模式里报出它观察的位置
+      # （pin_tool_tf_observation 的 virtualize 档）。
+      add_test(NAME sample_target_tf_veh
+        COMMAND "$<TARGET_FILE:pb_sample_target>" --tf-veh 4)
+      set_tests_properties(sample_target_tf_veh PROPERTIES
+        PASS_REGULAR_EXPRESSION "PB_TF_VEH count=4 addr0=0x[1-9A-Fa-f]"
+        FAIL_REGULAR_EXPRESSION "FAIL add-handler")
+
       add_test(NAME pin_tool_tf_virtualize
         COMMAND "${PIN_ROOT}/pin.exe"
                 -t "$<TARGET_FILE:pinbridge>"

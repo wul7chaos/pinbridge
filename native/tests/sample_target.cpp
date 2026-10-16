@@ -420,6 +420,72 @@ int unpack_scenario() {
 
 constexpr unsigned long kFlowException = 0xE0000001UL;
 
+// ------------------------------------------------- VEH 路径的 TF 实验（M2 边界）
+
+/// 用**向量化异常处理**（VEH）而不是 `__try/__except` 来承接真实单步。
+///
+/// 为什么需要这条路（详见 `docs/dev/tf-location-in-progress.md`）：
+///
+/// * 判据要的是"**同一次**单步：工具说它发生在 X，靶子自己读到 `ExceptionAddress` = Y，
+///   验 X == Y"。两侧都要有数字才行；
+/// * `-pb_tf virtualize` 下工具把真实单步剥掉了 ⇒ 靶子**看不到**异常 ⇒ 没有 Y；
+/// * `watch` 下用 `__try/__except` 接不住（进程以 `STATUS_SINGLE_STEP` 终止，
+///   这是早已记录的预期，见 roadmap 的 TF 条目）⇒ 也拿不到 Y。
+///
+/// VEH 不依赖栈上的作用域：它在**任何**异常上先于 SEH 被调用，因此即使单步发生在
+/// Pin 注入代码的边界上也能接到，处理完返回 `EXCEPTION_CONTINUE_EXECUTION` 继续跑。
+///
+/// 接到之后必须**自己把 TF 清掉**：不清的话下一条指令又单步，会无限级联。
+static LONG CALLBACK tf_veh_handler(PEXCEPTION_POINTERS info) {
+  if (info == nullptr || info->ExceptionRecord == nullptr) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
+    return EXCEPTION_CONTINUE_SEARCH;  // 别人的异常一律不碰
+  }
+  const unsigned long slot = static_cast<unsigned long>(InterlockedIncrement(
+      const_cast<volatile long*>(reinterpret_cast<volatile long*>(&g_tf_exception_slots)))) - 1;
+  if (slot < kMaxTfSamples) {
+    g_tf_exception_addresses[slot] =
+        reinterpret_cast<unsigned long long>(info->ExceptionRecord->ExceptionAddress);
+  }
+  if (info->ContextRecord != nullptr) {
+    info->ContextRecord->EFlags &= ~0x100UL;  // 收掉 TF，避免级联
+  }
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/// `--tf-veh N`：置位 TF 跑 N 轮，让 VEH 承接真实单步并记下异常位置。
+///
+/// 打印 `PB_TF_VEH count=N addr0=0x…`：判据的一半（另一半由工具打）。
+int tf_veh_experiment(unsigned long iterations) {
+  void* handle = AddVectoredExceptionHandler(1, &tf_veh_handler);
+  if (handle == nullptr) {
+    std::printf("PB_TF_VEH FAIL add-handler\n");
+    return 1;
+  }
+  unsigned long caught = 0;
+  for (unsigned long i = 0; i < iterations; ++i) {
+    const long before = g_tf_exception_slots;
+    const unsigned long long flags = __readeflags();
+    __writeeflags(flags | 0x100ULL);  // 置位 TF：下一条指令会真的单步
+    g_tf_sink += 1;                   // 这条被单步（VEH 接住后继续执行）
+    if (g_tf_exception_slots > before) {
+      ++caught;  // 本轮确实被 VEH 接住了
+    }
+    __writeeflags(__readeflags() & ~0x100ULL);  // 保险：确保收尾不带 TF
+  }
+  RemoveVectoredExceptionHandler(handle);
+  std::printf("PB_TF_VEH count=%u", static_cast<unsigned>(caught));
+  for (unsigned long i = 0; i < kMaxTfSamples; ++i) {
+    if (g_tf_exception_addresses[i] != 0) {
+      std::printf(" addr%lu=0x%llX", i, g_tf_exception_addresses[i]);
+    }
+  }
+  std::printf("\n");
+  return 0;
+}
+
 /// `--exception-flow N`：用异常当控制流跑 N 轮。
 int exception_flow(unsigned long rounds) {
   unsigned long observed = 0;
@@ -712,6 +778,7 @@ int main(int argc, char** argv) {
   unsigned long tf_sets = 0;
   unsigned long tf_thread_rounds = 0;
   unsigned long exception_rounds = 0;
+  unsigned long tf_veh_rounds = 0;
   bool print_ssns = false;
   bool unpack = false;
   bool print_buffer = false;
@@ -730,6 +797,8 @@ int main(int argc, char** argv) {
       tf_sets = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--tf-threads") == 0 && i + 1 < argc) {
       tf_thread_rounds = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--tf-veh") == 0 && i + 1 < argc) {
+      tf_veh_rounds = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--exception-flow") == 0 && i + 1 < argc) {
       exception_rounds = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--print-ssns") == 0) {
@@ -744,6 +813,12 @@ int main(int argc, char** argv) {
     }
   }
 
+  // 注意：这一段是**独立**场景，不能掉进别的 `if` 里。
+  // （上一版就掉进了 `exception_rounds` 那一支，于是必须同时给 `--exception-flow`
+  // 才会跑 —— 表现出来是"给了参数却什么都没打印"，很容易误判成函数没实现。）
+  if (tf_veh_rounds != 0) {
+    return tf_veh_experiment(tf_veh_rounds);
+  }
   if (exception_rounds != 0) {
     return exception_flow(exception_rounds);
   }
