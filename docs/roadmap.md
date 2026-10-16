@@ -84,7 +84,9 @@
 | agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 策略层已就绪，缺的是运行时 |
 | 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |
 | 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |
-| Hub 侧加载器解析 `pb_start_trace`/`pb_stop_trace`（让 Hub 能驱动**目标内**录制） | ⏳ 桥接层与 agent 都已就绪，只差 `pinbridge-sys` 的符号表 |
+| ~~Hub 侧加载器解析 `pb_start_trace`/`pb_stop_trace`~~ | ✅ 已完成：`pinbridge-sys` 增加 `start_trace`/`stop_trace`（符号解析 + 参数校验 + 能力/状态码翻译），端到端测试**真的加载 DLL 并录出一份 `PBT1` 魔数的 `.pbt`** |
+| Hub 会话缺少到 agent 的 client 句柄 | ⏳ 做 `pb_memory_read` 时发现：agent 侧 `ReadMemory` 是真实实现、`pinbridge-client` 也能通话，但 Hub 的会话条目只有 `session`/`runtime`/`scripts`，**没有 client**，所以控制面到不了目标。把句柄挂进会话或新增「控制面 → 链路」请求路径 |
+| MCP `pb_registers` | ⏳ 协议已有 `ReadRegisters` 变体、agent 侧是诚实的 `not_supported`（真实实现属于 Pin 工具侧：agent 活在目标进程里，拿不到别的线程上下文） | |
 | MCP 新增工具：`pb_modules` / `pb_registers` | ⏳ |
 
 ### 明确不做（占位）

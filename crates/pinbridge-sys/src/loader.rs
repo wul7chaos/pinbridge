@@ -64,6 +64,13 @@ pub struct Api {
     pub pause: unsafe extern "C" fn() -> c_int,
     /// `int32_t pb_drain_events(PbEventRaw* out, uint32_t capacity, uint32_t* written)`
     pub drain_events: unsafe extern "C" fn(*mut PbEventRaw, c_uint, *mut c_uint) -> c_int,
+    /// `int32_t pb_start_trace(const char* path, uint32_t fold)`
+    ///
+    /// 让 **Hub 能驱动目标内录制**：轨迹由 DLL 这一侧写盘，而不是把事件全量
+    /// 搬回 Hub 再拼。少了它，"录一份轨迹"就只剩"Hub 自己收事件"这一条路。
+    pub start_trace: unsafe extern "C" fn(*const c_char, c_uint) -> c_int,
+    /// `int32_t pb_stop_trace(uint64_t* out_records, uint64_t* out_events)`
+    pub stop_trace: unsafe extern "C" fn(*mut u64, *mut u64) -> c_int,
     /// `const char* pb_last_error(void)`
     pub last_error: unsafe extern "C" fn() -> *const c_char,
 }
@@ -126,6 +133,8 @@ pub fn load(name: &str) -> Result<Api> {
             resume: resolve(handle, name, "pb_continue")?,
             pause: resolve(handle, name, "pb_pause")?,
             drain_events: resolve(handle, name, "pb_drain_events")?,
+            start_trace: resolve(handle, name, "pb_start_trace")?,
+            stop_trace: resolve(handle, name, "pb_stop_trace")?,
             last_error: resolve(handle, name, "pb_last_error")?,
         }
     };
@@ -275,6 +284,51 @@ impl Api {
             Capability::ProcessControl,
             self.held_capabilities(),
         )
+    }
+
+    /// 开始**目标内录制**（`pb_start_trace`）。
+    ///
+    /// `fold` 打开时，重复事件会被折叠成 `Repeat` 记录（体积换精度）——
+    /// 这个开关跟着能力一起下发给目标侧，所以它必须显式出现在调用里。
+    ///
+    /// # Errors
+    ///
+    /// - `CapabilityDenied`：没有 `trace_record` 时由目标侧返回 `-3`；
+    /// - `Protocol`：路径含 NUL，或目标侧返回其它错误码。
+    pub fn start_trace(&self, path: &str, fold: bool) -> Result<()> {
+        let path_c = c_string("轨迹路径", path)?;
+        // SAFETY: 函数指针已在加载时校验；`path_c` 的生命周期覆盖本次调用
+        // `u32::from(bool)` 而不是 `if fold { 1 } else { 0 }`：前者不会在
+        // 将来改签名时静默变成别的语义（clippy 的 bool_to_int_with_if 也是这个意思）。
+        let code = unsafe { (self.start_trace)(path_c.as_ptr(), u32::from(fold)) };
+        crate::abi::check(
+            code,
+            "start_trace",
+            Capability::TraceRecord,
+            self.held_capabilities(),
+        )
+    }
+
+    /// 结束**目标内录制**（`pb_stop_trace`），返回（记录数，事件数）。
+    ///
+    /// 两个计数**必须原样返回给调用方**：`records != events` 正说明发生了折叠，
+    /// 只报其中一个会让"轨迹里有多少东西"变成一个无法回答的问题。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Api::start_trace`]。
+    pub fn stop_trace(&self) -> Result<(u64, u64)> {
+        let mut records: u64 = 0;
+        let mut events: u64 = 0;
+        // SAFETY: 函数指针已在加载时校验；两个 `out` 参数都指向本栈帧的局部量
+        let code = unsafe { (self.stop_trace)(&raw mut records, &raw mut events) };
+        crate::abi::check(
+            code,
+            "stop_trace",
+            Capability::TraceRecord,
+            self.held_capabilities(),
+        )?;
+        Ok((records, events))
     }
 }
 

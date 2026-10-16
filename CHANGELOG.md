@@ -41,6 +41,25 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（M1：Hub 侧加载器打通"目标内录制"）
+- `pinbridge-sys` 的 `Api` 增加 `start_trace(path, fold)` / `stop_trace() -> (u64, u64)`，
+  并在加载时解析 `pb_start_trace`/`pb_stop_trace` 两个符号。意义：轨迹由**目标那一侧**
+  写盘，而不是把事件全量搬回 Hub 再拼；少了这两个符号，"录一份轨迹"就只剩
+  "Hub 自己收事件"这一条路。
+- 参数校验先于状态判断（与 `drain` 的 0 容量同一条原则）：路径含 NUL 直接
+  `Protocol` 错误，**不允许截断成半条路径**。
+- 端到端测试（`crates/pinbridge-sys/tests/bridge_end_to_end.rs`）真的加载 DLL、
+  attach、下发能力，然后**录出一份 186 字节、`PBT1` 魔数正确的 `.pbt`** 并取回计数；
+  同时断言路径含 NUL 被拒。这条路径之前只被"缺少 DLL 时给出明确错误"覆盖过。
+
+### 修复
+- MCP `pb_memory_read` 的返回文本与现实脱节：它说"M0 阶段依赖 agent 链路（Pin），
+  尚未接通"，但实际上 agent 侧 `AgentRequest::ReadMemory` 已是真实实现（含单次读取
+  上限与明确拒绝）、`pinbridge-client` 也能和 agent 通话。真正的缺口是
+  **Hub 的会话条目里只持有 `session`/`runtime`/`scripts`，没有到 agent 的 client 句柄**。
+  错误文本已改成如实描述这三段现状并指出下一步——含糊的"尚未接通"会让人去查错的
+  那一端。
+
 ### 新增（M1：TF 单步虚拟化——第四类插桩点，四类至此全部落地）
 - `-pb_tf off|watch|virtualize`：`watch`（默认）只观察目标对 EFLAGS.TF 的操作意图
   与真实单步异常并上报 `TrapFlag` 事件；`virtualize` 在 `popfq`/`iretq` 的**栈上

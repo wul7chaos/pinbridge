@@ -409,8 +409,13 @@ impl McpServer {
                     granted.iter().map(Capability::name).collect::<Vec<_>>()
                 ))
             }
-            "pb_memory_read" => Err("M0 阶段内存读取依赖 agent 链路（Pin），尚未接通。\
-请改用 pb_script_load 在目标进程内读取，或跟踪 docs/roadmap.md 的 M1。"
+            "pb_memory_read" => Err("内存读取在链路两端都已就绪，缺的是**中间这一段**：\
+                 agent 侧 `AgentRequest::ReadMemory` 是真实实现（含单次读取上限与明确拒绝），\
+                 `pinbridge-client` 也已经能和 agent 通话（`Client::call`，有端到端测试）；\
+                 但 Hub 的会话条目里只持有 `session`/`runtime`/`scripts`，**没有一个到 agent 的\
+                 client 句柄**，所以这个工具目前到不了目标。\
+                 下一步（见 docs/roadmap.md 的 M1）：把 client 句柄挂进会话，或新增一条\
+                 「控制面 → 链路」的请求路径。在那之前请用 pb_script_load 或直接驱动 agent。"
                 .to_owned()),
             other => Err(format!(
                 "工具 {other} 已声明但未实现（内部不一致，请报 issue）"

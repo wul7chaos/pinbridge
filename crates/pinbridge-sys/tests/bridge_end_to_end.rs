@@ -45,6 +45,10 @@ fn locate_bridge() -> Option<PathBuf> {
         root.join("native/build/pinbridge_bridge.dll"),
         root.join("native/build/Release/pinbridge_bridge.dll"),
         root.join("native/build/dist/pinbridge_bridge.dll"),
+        // 带 Pin 的构建目录（scripts/build-native.ps1 -WithPin）：
+        // 桥接 DLL 与 agent DLL 都在这里，两个都有就不必再拷。
+        root.join("native/build-pin/pinbridge_bridge.dll"),
+        root.join("native/build-pin/dist/pinbridge_bridge.dll"),
     ]
     .into_iter()
     .find(|candidate| candidate.is_file())
@@ -182,4 +186,47 @@ fn hub_side_loader_drives_a_real_dll() {
         "✓ pb_last_error 可读：{}",
         last.chars().take(60).collect::<String>()
     );
+
+    // ── 9. 目标内录制：Hub 侧驱动 DLL 写轨迹 ──────────────────────────────
+    // 这条路径的意义：轨迹由**目标那一侧**写盘，而不是把事件全量搬回 Hub 再拼。
+    // 少了 `pb_start_trace`/`pb_stop_trace` 两个符号，"录一份轨迹"就只剩
+    // "Hub 自己收事件"这一条路。
+    //
+    // 参数校验先于状态判断（与上面 `drain` 的 0 容量同一条原则）：
+    let error = api
+        .start_trace("轨迹\0路径", false)
+        .expect_err("路径含 NUL 必须被拒（不能截断成半条路径）");
+    assert!(
+        matches!(error, Error::Protocol(_)),
+        "参数非法应映射为 Protocol，实际: {error:?}"
+    );
+    println!("✓ start_trace 拒绝含 NUL 的路径：{error}");
+
+    // 正向路径：桥接层后面的 agent 是**真实实现**（不是桩），所以在
+    // attach + 全量能力之后，这一对调用应当真的产出一份轨迹文件。
+    // 注意能力位：`trace_record` 属于只读基线，但它必须已经下发过。
+    let trace_path = std::env::temp_dir().join("pinbridge-loader-trace.pbt");
+    let _ = std::fs::remove_file(&trace_path);
+    api.start_trace(trace_path.to_str().expect("临时目录应为有效 UTF-8"), true)
+        .expect("已附加且持有 trace_record：开始录制应当成功");
+    let (records, events) = api.stop_trace().expect("结束录制应当成功");
+    println!("✓ 目标内录制：记录 {records} 条 / 事件 {events} 条");
+
+    let bytes = std::fs::read(&trace_path).expect("录制应当真的写出文件");
+    assert!(
+        bytes.len() >= 8,
+        "轨迹文件太小（{} 字节），不可能是合法的 .pbt",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[..4],
+        b"PBT1",
+        "轨迹文件必须以 PBT1 魔数开头（收尾写入 SUMMARY/END 之后仍是这个头）"
+    );
+    assert!(
+        records == events,
+        "没有事件被折叠时两个计数应当相等（records={records}, events={events}）"
+    );
+    println!("✓ 轨迹文件 {} 字节，魔数正确", bytes.len());
+    let _ = std::fs::remove_file(&trace_path);
 }
