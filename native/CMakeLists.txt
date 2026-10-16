@@ -461,6 +461,26 @@ if(BUILD_TESTING)
         FAIL_REGULAR_EXPRESSION "溢出丢弃 [1-9]"
         SKIP_RETURN_CODE 77)
 
+      # ── 转移探针（M3 调用图的数据来源，见 ADR 0012）─────────────────────────
+      #
+      # 判据是"**确实观察到了**调用与返回"：call 为 0 几乎不可能是真的
+      # （进程跑起来必然在调函数），所以工具自己会为 0 的情况专门报一行，
+      # 这里用 FAIL 正则把它拦成失败——空数据不能当成"目标没有调用关系"。
+      add_test(NAME pin_tool_transfers
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_transfers 1
+                -pb_syscalls 1
+                -pb_syscall_max 200000
+                -pb_trace "${CMAKE_BINARY_DIR}/pin-transfers-trace.pbt"
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --syscalls 50)
+      set_tests_properties(pin_tool_transfers PROPERTIES
+        PASS_REGULAR_EXPRESSION "转移事件：插装 [1-9][0-9]* 个点，观察到 call [1-9][0-9]* 次 / ret [1-9][0-9]* 次"
+        FAIL_REGULAR_EXPRESSION "\\*\\*call 为 0\\*\\*|Unhandled internal exception"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/dist")
+
       # ── 模板命中的**归属**（M2「模板 ID 可追溯」）────────────────────────
       #
       # 两个模板同时登记：一个真的会被执行到（靶子里的 PBRIDGE1 魔数），

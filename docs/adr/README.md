@@ -40,6 +40,7 @@
 | [0009](0009-bounded-channel-drop-accounting.md) | 通道必须有界且丢弃必须计数 | 不能让"我看到的"冒充"发生过的" |
 | [0010](0010-pin-now-dynamorio-as-swappable-probe-layer.md) | 探针层用 Pin，但当作可替换件 | AMD 上"能跑但不受支持"不能变成项目级风险 |
 | [0011](0011-streaming-trace-reads.md) | 轨迹可以边录边读，用提交标记界定「完整到哪」 | 分析最有价值的时候是目标还在跑的时候；「读到的」与「发生过的」不能混 |
+| [0012](0012-call-graph-from-transfer-probe.md) | 调用图用转移探针，只画信号齐的边 | 从内存写入猜调用会被跳转/异常展开伪造出假边；一张错的图会把后续推理全带偏 |
 
 ## 什么时候需要新写一条
 

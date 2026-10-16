@@ -19,6 +19,7 @@ use pinbridge_core::session::TargetSpec;
 use pinbridge_hub::HubService;
 use pinbridge_proto::frames::ControlCommand;
 use pinbridge_proto::mcp::TOOLS;
+use pinbridge_trace::callgraph::{build as build_call_graph, CallGraphOptions};
 use pinbridge_trace::diff::{attach_warnings, diff_traces, diff_warnings, DiffOptions};
 use pinbridge_trace::event::EventKind;
 use pinbridge_trace::fold::expand_records;
@@ -36,6 +37,8 @@ pinbridge 0.1.0 —— 插装式动态分析框架（AI 主导 · 人机平级�
                                       离线读取轨迹并打印汇总/前 N 条记录
   pinbridge diff <A.pbt> <B.pbt> [--ignore-address]
                                       同一个目标的两次运行：行为在哪里分岔
+  pinbridge calls <FILE.pbt> [--top N] [--strict-code-targets]
+                                      从转移事件重建调用关系（需要录制时开 -pb_transfers）
   pinbridge demo [--trace-dir <DIR>]  端到端自检
   pinbridge mcp                       以 stdio 方式启动 MCP 服务
   pinbridge version                   打印版本
@@ -91,6 +94,22 @@ fn main() -> ExitCode {
                 eprintln!(
                     "用法: pinbridge diff <A.pbt> <B.pbt> [--ignore-address] [--ignore-thread]"
                 );
+                ExitCode::FAILURE
+            }
+        },
+        "calls" => match args.get(1) {
+            Some(path) => {
+                let top = parse_top(&args).unwrap_or(10);
+                match calls(path, top) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("建图失败: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            None => {
+                eprintln!("用法: pinbridge calls <FILE.pbt> [--top N]");
                 ExitCode::FAILURE
             }
         },
@@ -156,6 +175,11 @@ fn parse_head(args: &[String]) -> Option<usize> {
     args.get(index + 1)?.parse().ok()
 }
 
+fn parse_top(args: &[String]) -> Option<usize> {
+    let index = args.iter().position(|a| a == "--top")?;
+    args.get(index + 1)?.parse().ok()
+}
+
 fn parse_trace_dir(args: &[String]) -> std::path::PathBuf {
     let index = args.iter().position(|a| a == "--trace-dir");
     index.and_then(|i| args.get(i + 1)).map_or_else(
@@ -208,6 +232,19 @@ fn diff(left_path: &str, right_path: &str, options: DiffOptions) -> Result<(), S
     Ok(())
 }
 
+/// `pinbridge calls A.pbt`：从转移事件重建调用关系（规则见 ADR 0012）。
+fn calls(path: &str, top: usize) -> Result<(), String> {
+    let (events, _summary) = load_trace(path)?;
+    let graph = build_call_graph(
+        &events,
+        CallGraphOptions {
+            strict_code_targets: std::env::args().any(|a| a == "--strict-code-targets"),
+        },
+    );
+    println!("文件: {path}（已按展开后的事件建图）");
+    print!("{}", graph.render(top));
+    Ok(())
+}
 fn replay(path: &str, head: usize) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut reader = PbtReader::open(file).map_err(|e| e.to_string())?;

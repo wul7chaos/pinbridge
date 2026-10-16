@@ -173,7 +173,9 @@ KNOB<BOOL> KnobMemAllModules(KNOB_MODE_WRITEONCE, "pintool", "pb_mem_all_modules
                              "内存探针是否覆盖所有模块（默认只主模块）");
 KNOB<std::string> KnobMemMax(KNOB_MODE_WRITEONCE, "pintool", "pb_mem_max", "20000",
                              "捕获多少条内存事件后停止插桩（0 表示不限制）");
-KNOB<std::string> KnobRequireMem(KNOB_MODE_WRITEONCE, "pintool", "pb_require_mem", "0",
+// 转移探针：调用/返回（给调用图用，规则见 ADR 0012）。默认关，与其他探针一致。
+KNOB<BOOL> KnobTransfers(KNOB_MODE_WRITEONCE, "pintool", "pb_transfers", "0",
+                         "是否插装调用/返回并产生转移事件（1/0，供调用图使用）");KNOB<std::string> KnobRequireMem(KNOB_MODE_WRITEONCE, "pintool", "pb_require_mem", "0",
                                  "捕获到的内存事件少于该值时报告失败（0 表示不检查）");
 // 指令模板（字节签名）：只扫主模块，命中点会被插桩。
 KNOB<std::string> KnobPattern(KNOB_MODE_WRITEONCE, "pintool", "pb_pattern", "",
@@ -454,6 +456,14 @@ UINT64 g_required_syscall_exits = 0;
 UINT64 g_required_mem = 0;
 UINT64 g_required_pattern_hits = 0;
 UINT64 g_required_tf_sets = 0;
+/// 是否插装调用/返回（`-pb_transfers`，见 ADR 0012）。
+volatile bool g_transfers_enabled = false;
+/// 插装了多少个转移点，以及观察到多少次 call/ret。
+UINT64 g_transfer_sites = 0;
+/// 读不出转移目标的次数（读不出就不发事件——**猜一个目标比不发更糟**）。
+volatile UINT64 g_transfer_target_failures = 0;
+volatile UINT64 g_transfer_calls = 0;
+volatile UINT64 g_transfer_rets = 0;
 /// 是否上报目标自己的异常（`-pb_exceptions`）。
 volatile bool g_exceptions_enabled = false;
 /// 观察到的异常条数（不含单步异常，那是 TF 那一套的账）。
@@ -1047,6 +1057,8 @@ struct ThreadStats {
   /// 这两种错误在事件流里都表现为"少了几条 trap_flag"，而"少了"与"本来就没有"
   /// 从事件流上看不出来——所以它必须有**每线程**的计数配合（见下面的 tf_* 字段）。
   bool virtual_tf;
+  /// 该线程产生的转移事件条数（call + ret）。
+  UINT64 transfers;
   /// 该线程观察到的目标异常条数（见 OnContextChange）。
   UINT64 exceptions;
   /// 该线程的系统调用事件采样计数（每线程一份，见 g_syscall_sample）。
@@ -1545,6 +1557,65 @@ void on_instruction_patterns(INS ins, ADDRINT address);
 void OnPatternHit(THREADID tid, ADDRINT ins_address, ADDRINT pattern_id);
 void instrument_tf(INS ins);
 
+/// 转移探针回调（ADR 0012）：发出 `reg_write` 形状的转移事件。
+///
+/// ```text
+/// args[0] = 0（rip，见 pinbridge_trace::REGISTER_NAMES）
+/// args[1] = 目标地址（call 的目标 / ret 弹出的返回地址）
+/// args[2] = 转移码（1=call 2=ret）
+/// ```
+///
+/// `address` 字段是**发起转移的那条指令**：调用图的"谁调用了谁"要的就是它，
+/// 少了它建图会拒掉这条候选（见 callgraph 的 `NoSource`）。
+/// 发出一条转移事件（两个回调共用）。
+///
+/// **两个回调而不是一个**：`call` 的目标是**值**（`IARG_BRANCH_TARGET_ADDR`），
+/// `ret` 的目标是**指向栈上那个值的指针**（`IARG_MEMORYREAD_PTR`）。第一版把两者
+/// 塞进同一个回调（形参写成 `VOID*`），结果 call 路径把"函数入口地址"当指针去
+/// 解引用，读出来的是**那条指令的字节**——图里出现了一堆
+/// `0x83485708245c8948`（MSVC 的 `mov [rsp+8],rbx; push rdi…` 序言）这种
+/// "看起来像地址、其实是指令码"的目标。C++ 不会因为形参类型不符就报错，
+/// 只会静默地给出一组垃圾数据。
+void emit_transfer(ThreadStats* stats, THREADID tid, ADDRINT source, ADDRINT target,
+                   UINT64 code) {
+  if (stats->in_hook) {
+    ++stats->reentrant_skips;
+    return;
+  }
+  stats->in_hook = true;
+  ++stats->transfers;
+  if (code == 1) {
+    ++g_transfer_calls;
+  } else {
+    ++g_transfer_rets;
+  }
+  const UINT64 args[3] = {0, static_cast<UINT64>(target), code};
+  push_probe_event(stats, 8 /* PB_EV_REG_WRITE */, tid, source, args, 3);
+  stats->in_hook = false;
+}
+
+/// `call`：目标已经在 `IARG_BRANCH_TARGET_ADDR` 里是**值**。
+VOID OnTransferCall(THREADID tid, ADDRINT source, ADDRINT target) {
+  if (!g_transfers_enabled || g_shutdown) {
+    return;
+  }
+  emit_transfer(stats_for(tid), tid, source, target, 1);
+}
+
+/// `ret`：`IARG_MEMORYREAD_PTR` 给的是**指向返回地址的指针**，得读出来。
+VOID OnTransferRet(THREADID tid, ADDRINT source, VOID* value_ptr) {
+  if (!g_transfers_enabled || g_shutdown) {
+    return;
+  }
+  UINT64 target = 0;
+  if (value_ptr == nullptr ||
+      PIN_SafeCopy(&target, value_ptr, sizeof(target)) != sizeof(target)) {
+    // 读不出就不发事件：**猜一个目标比不发更糟**（假边会把整张图带偏）。
+    ++g_transfer_target_failures;
+    return;
+  }
+  emit_transfer(stats_for(tid), tid, source, static_cast<ADDRINT>(target), 2);
+}
 /// 指令级插桩：入口点 + 系统调用 + 内存访问 + 模板命中。
 void OnInstruction(INS ins, VOID* v) {
   (void)v;
@@ -1574,6 +1645,32 @@ void OnInstruction(INS ins, VOID* v) {
   // 拿到，而那个 API 需要 `PIN_StartProgramProbed()`（实测被拒）。
   // 保留它只会制造"有个机制但其实不生效"的错觉，所以直接删掉，
   // 现状写在 OnImageLoad 的注释里。
+
+  // ── 转移探针（call/ret）：给调用图用，事件形状见 ADR 0012 ──
+  //
+  // 为什么在**指令分类**上做，而不是事后从"栈上写了个代码地址"去猜：
+  // `INS_IsCall`/`INS_IsRet` 是精确的，而后者会被跳转、异常展开、手工改栈
+  // 制造出同样的形状——一条假的调用边会让整张图错下去。
+  //
+  // 位置必须在系统调用探针的**早退之前**：那段代码在 `-pb_syscalls 0` 时直接返回，
+  // 探针会被连带关掉，而"打开了却没数据"这类问题最难查。
+  if (g_transfers_enabled) {
+    if (INS_IsCall(ins)) {
+      // 直接调用的目标是常量，间接调用（`call rax`）靠运行期取值——
+      // `IARG_BRANCH_TARGET_ADDR` 两种情况都覆盖。
+      INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnTransferCall),
+                     IARG_THREAD_ID, IARG_INST_PTR, IARG_BRANCH_TARGET_ADDR, IARG_END);
+      ++g_transfer_sites;
+    } else if (INS_IsRet(ins)) {
+      // `ret` 的"目标"是从栈上弹出的那个值。不用 `IARG_BRANCH_TARGET_ADDR`：
+      // 它在 `IPOINT_BEFORE` 拿不到返回值，而 `IPOINT_TAKEN_BRANCH` 在部分指令/
+      // 平台上有支持限制（本项目在 `RTN_InsertCall(IPOINT_AFTER)` 上已经吃过一次亏）。
+      // Pin 对 `ret` 建模了那次栈读取，所以直接从**内存读取值**里取返回地址。
+      INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnTransferRet),
+                     IARG_THREAD_ID, IARG_INST_PTR, IARG_MEMORYREAD_PTR, IARG_END);
+      ++g_transfer_sites;
+    }
+  }
 
   // ── 系统调用探针 ──
   if (!pb_syscall_enabled || g_syscall_instrumentation_removed ||
@@ -2069,6 +2166,23 @@ void OnFini(INT32 code, VOID* v) {
       }
     }
   }
+  // ── 转移的账（调用图的数据来源，见 ADR 0012）───────────────────────────
+  if (g_transfers_enabled) {
+    report("转移事件：插装 %llu 个点，观察到 call %llu 次 / ret %llu 次",
+           static_cast<unsigned long long>(g_transfer_sites),
+           static_cast<unsigned long long>(g_transfer_calls),
+           static_cast<unsigned long long>(g_transfer_rets));
+    if (g_transfer_target_failures != 0) {
+      report("  有 %llu 次转移读不出目标（这些事件**没有发出**：猜一个目标比不发更糟）",
+             static_cast<unsigned long long>(g_transfer_target_failures));
+    }
+    if (g_transfer_calls == 0) {
+      // 0 次调用几乎不可能是真的：只要进程跑起来就会调用函数。
+      // 这条必须自己说出来，否则会被当成"目标没有调用关系"。
+      report("  **call 为 0**：这不正常（进程跑起来必然有调用），"
+             "多半是插装没生效——别把空数据当成结论");
+    }
+  }
   // ── 异常时机的账 ──────────────────────────────────────────────────────
   if (g_exceptions_enabled) {
     report("异常时机：观察到目标的异常 %llu 次（单步异常单独计在 TF 那一套里）",
@@ -2337,6 +2451,7 @@ int main(int argc, char** argv) {
   g_required_ssn_count =
       parse_ssn_list(KnobRequireSsn.Value().c_str(), g_required_ssns, kMaxRequiredSsns);
   g_exceptions_enabled = KnobExceptions.Value();
+  g_transfers_enabled = KnobTransfers.Value();
   g_required_exceptions = parse_u64(KnobRequireExceptions.Value().c_str(), 0);
     report("TF 单步：%s%s", tf_mode.c_str(),
            g_tf_mode == TfMode::Virtualize
