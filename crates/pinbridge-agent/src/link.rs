@@ -627,11 +627,23 @@ mod tests {
         let _guard = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         exports::pb_set_capabilities(Capability::read_only_baseline().bits());
         match dispatch(&AgentRequest::Modules {}) {
-            AgentResponse::Modules { modules, skipped } => {
-                if !cfg!(windows) {
-                    assert!(modules.is_empty(), "非 Windows 平台应当没有 PEB 可读");
-                    return;
-                }
+            // 非 Windows 上走的是**契约的另一半**：必须明确说"不支持"并给出原因，
+            // 而不是回一个空列表（空列表的含义是"一个模块都没有"）。
+            //
+            // 第一版把非 Windows 的断言写在了 Modules 分支里，于是它在 Linux 上
+            // 根本不会执行，CI 直接以 "期望 Modules，实际: Error { not_supported }" 失败。
+            AgentResponse::Error { code, message } if !cfg!(windows) => {
+                assert_eq!(
+                    code, "not_supported",
+                    "非 Windows 应当是明确的 not_supported"
+                );
+                assert!(
+                    message.contains("PEB"),
+                    "非 Windows 的错误必须说清原因，实际: {message}"
+                );
+                println!("✓ 非 Windows 平台明确拒绝：{message}");
+            }
+            AgentResponse::Modules { modules, skipped } if cfg!(windows) => {
                 assert!(
                     modules.len() >= 3,
                     "任何 Windows 进程至少加载了主模块、ntdll、kernel32，实际 {}",
@@ -656,7 +668,7 @@ mod tests {
                 );
                 println!("  第一个：{}", modules[0].name);
             }
-            other => panic!("期望 Modules，实际: {other:?}"),
+            other => panic!("非预期的响应: {other:?}"),
         }
     }
     #[test]

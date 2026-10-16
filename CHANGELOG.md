@@ -56,6 +56,13 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
   输出基址 + 大小 + 完整路径，并在 `skipped != 0` 时明确提示列表可能不完整。
 - 实测：agent 自己的测试进程里枚举到 **9 个模块**，主模块在首位、路径完整、跳过 0。
 
+- **非 Windows 的那一半契约也要测**：`modules_request_enumerates_this_process` 第一版
+  把「非 Windows 应当是明确的 not_supported」写在了 `Modules` 分支**里面**，
+  于是它在 Linux 上根本不会执行——CI 直接以
+  `期望 Modules，实际: Error { not_supported }` 失败。现在两个平台的期望各占一个
+  分支：Windows 断言"枚举到 ≥3 个模块且路径完整"，其它平台断言"明确拒绝并说清原因是 PEB"。
+  这正是"本地跑不了的平台要靠 CI 兜住"的一个实例：本地门禁只做 Linux 的 **clippy**，
+  跑不了 Linux 的测试。
 ### 修复
 - **`UNICODE_STRING` 的 `Buffer` 偏移是 8，不是 4**（`{Length, MaximumLength,
   <4 字节填充>, Buffer}`）。第一版按 `2 * size_of::<u16>()` 读，读到的是填充区，
