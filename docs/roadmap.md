@@ -77,8 +77,8 @@
 | ~~脚本策略与生命周期（登记 / 白名单 / 状态机 / 执行预算记账）~~ | ✅ 已完成：`crates/pinbridge-agent/src/script.rs`（静态扫描带行号拒绝，**明确说明它不是沙箱**；登记 ≠ 运行由 `receives_events` 与 `is_live` 两个判断分开表达） |
 | ~~系统调用 Hook（syscall_enter）~~ | ✅ 已完成：探针识别 `syscall`（实测 59–61 个插装点），采集 SSN + 前四个参数（x64 第一个参数在 **R10**）。**回调只做内存入队，跨边界由 Pin 内部线程每 10 ms 冲刷**——这个约束是实测逼出来的（回调里调外部 DLL → 5/5 崩溃；改成入队 → 6/6 通过）。`ctest -R pin_tool_captures_syscalls` 断言三件事：捕够 300+ 条、溢出丢弃为 0、Pin 无内部故障 |
 | syscall_exit 事件 | ⏳ `INS_IsSysret` 在当前 Windows 目标上没匹配到（`exit=0`），返回路径要另找机制 |
-| 内存访问观测（mem_read/mem_write） | ⏳ 需要 `IARG_MEMORYREAD_EA`/`IARG_MEMORYWRITE_EA` + 过滤；**必须复用"入队 + 内部线程"这条路**（高频探针的硬约束） |
-| 指令模板匹配（pattern_hit） | ⏳ 同上 |
+| ~~内存访问观测（mem_read / mem_write）~~ | ✅ 已完成（**默认关闭**）：三层过滤（模块 / 地址范围 / 读或写），写入事件用"BEFORE 记地址 + AFTER 读值"两段式拿到**写入后**的值。实测靶子执行 2000 次写入、探针捕获 2000 条（一个不多一个不少），零丢弃；`ctest -R pin_tool_mem_range_filter`（脚本化：地址随 ASLR 变化，必须先问靶子再跑探针） |
+| 指令模板匹配（pattern_hit） | ⏳ 复用"入队 + 内部线程"骨架 |
 | TF 虚拟化（`flags_virtualize.cpp`） | ⏳ |
 | agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 策略层已就绪，缺的是运行时 |
 | 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |

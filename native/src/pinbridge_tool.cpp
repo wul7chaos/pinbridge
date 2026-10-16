@@ -128,7 +128,23 @@ KNOB<std::string> KnobSyscallMax(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_max
 // 为什么放在工具里而不是靠测试脚本数日志行：退出码是机器可判定的，
 // 而"数日志里出现了几次"既脆弱又会被日志格式改动打断。
 KNOB<std::string> KnobRequireSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_require_syscalls", "0",
-                                      "捕获到的系统调用事件少于该值时以非零退出（0 表示不检查）");
+                                      "捕获到的系统调用事件少于该值时报告失败（0 表示不检查）");
+// 内存探针：**默认关闭**。
+//
+// 为什么不像系统调用探针那样默认开：它是高频探针，实测在默认配置下
+// （只采写入、只主模块）就能在启动阶段产生上千条事件并丢掉一半——
+// 一个"打开了但丢一半数据"的探针比不打开更危险，因为使用者会以为
+// 看到的是全部。要用就显式打开，并用 `-pb_mem_range`/`-pb_mem_max` 收紧。
+KNOB<std::string> KnobMem(KNOB_MODE_WRITEONCE, "pintool", "pb_mem", "0",
+                          "内存访问探针：0（关，默认）/ w（只写）/ r（只读）/ rw（都看）");
+KNOB<std::string> KnobMemRange(KNOB_MODE_WRITEONCE, "pintool", "pb_mem_range", "",
+                               "只看落在 lo-hi 内的地址（十六进制，形如 7ff6a000-7ff6a400；空表示不限）");
+KNOB<BOOL> KnobMemAllModules(KNOB_MODE_WRITEONCE, "pintool", "pb_mem_all_modules", "0",
+                             "内存探针是否覆盖所有模块（默认只主模块）");
+KNOB<std::string> KnobMemMax(KNOB_MODE_WRITEONCE, "pintool", "pb_mem_max", "20000",
+                             "捕获多少条内存事件后停止插桩（0 表示不限制）");
+KNOB<std::string> KnobRequireMem(KNOB_MODE_WRITEONCE, "pintool", "pb_require_mem", "0",
+                                 "捕获到的内存事件少于该值时报告失败（0 表示不检查）");
 
 /// 能力位（与 pinbridge.h / capability.rs 一致；只用到这两个组合）。
 constexpr UINT32 PB_CAP_MEM_READ = 1u << 0;
@@ -152,6 +168,35 @@ std::string last_error_text() {
   }
   const char* text = g_api.last_error();
   return text != nullptr ? std::string(text) : std::string();
+}
+
+/// 解析十六进制（`0x` 前缀可选）。用于 `-pb_mem_range`。
+///
+/// 与 `parse_u64` 分开而不是加个进制参数：出现非法字符时的**语义**不同
+/// （这里是"这不是个地址"），混在一个函数里报错会含糊。
+UINT64 parse_hex_u64(const char* text) {
+  if (text == nullptr) {
+    return 0;
+  }
+  UINT64 value = 0;
+  for (const char* cursor = text; *cursor != 0; ++cursor) {
+    const char c = *cursor;
+    if (c == 'x' || c == 'X') {
+      continue;  // 跳过 0x 前缀
+    }
+    UINT64 digit = 0;
+    if (c >= '0' && c <= '9') {
+      digit = static_cast<UINT64>(c - '0');
+    } else if (c >= 'a' && c <= 'f') {
+      digit = static_cast<UINT64>(c - 'a' + 10);
+    } else if (c >= 'A' && c <= 'F') {
+      digit = static_cast<UINT64>(c - 'A' + 10);
+    } else {
+      continue;  // 空白等无关字符直接跳过
+    }
+    value = value * 16 + digit;
+  }
+  return value;
 }
 
 /// 解析无符号十进制。
@@ -268,8 +313,9 @@ ADDRINT g_entry_address = 0;
 // 系统调用探针的开关、上限与观测计数（定义见下方"系统调用探针"一节）
 bool pb_syscall_enabled = true;
 UINT64 g_syscall_cap = 0;
-/// 捕获数下限（见 KnobRequireSyscalls）。
+/// 捕获数下限（见 KnobRequireSyscalls / KnobRequireMem）。
 UINT64 g_required_syscalls = 0;
+UINT64 g_required_mem = 0;
 volatile long g_syscall_sites = 0;
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
@@ -344,6 +390,41 @@ bool is_excluded(ADDRINT address) {
 /// `OnImageLoad` 是**安全上下文**，所以它要负责把回调里攒下的摘插装请求执行掉。
 void apply_pending_hard_stop();
 
+/// 主模块的映像范围（内存探针默认只在这个范围内插桩）。
+///
+/// 放在这里而不是内存探针那一节：`OnImageLoad`（在前面）要填它，
+/// 而 C++ 要求先声明后使用——踩过一次"未声明的标识符"，记下来。
+ADDRINT g_main_image_low = 0;
+ADDRINT g_main_image_high = 0;
+
+/// 把十六进制写进缓冲区。
+///
+/// 自己写而不是用 `snprintf`：Pin 自带的 CRT 不提供 `std::snprintf`
+/// （实测报"不是 std 的成员"），和 `std::strtoull` 是同一类问题。
+/// 这里只需要一个固定宽度的十六进制，不值得去和它的头文件较劲。
+void format_hex_into(char* buffer, UINT32 capacity, UINT64 value) {
+  static const char digits[] = "0123456789ABCDEF";
+  if (capacity == 0) {
+    return;
+  }
+  char tmp[16];
+  UINT32 count = 0;
+  if (value == 0) {
+    tmp[count++] = '0';
+  }
+  while (value != 0 && count < sizeof(tmp)) {
+    tmp[count++] = digits[value & 0xF];
+    value >>= 4;
+  }
+  UINT32 written = 0;
+  buffer[written++] = '0';
+  buffer[written++] = 'x';
+  while (count > 0 && written + 1 < capacity) {
+    buffer[written++] = tmp[--count];
+  }
+  buffer[written] = 0;
+}
+
 void OnImageLoad(IMG img, VOID* v) {
   (void)v;
   const std::string name = module_name_of(IMG_Name(img));
@@ -377,7 +458,11 @@ void OnImageLoad(IMG img, VOID* v) {
     return;
   }
   g_entry_address = entry;
-  report("主模块 %s 入口点 0x%llX，已布下入口探针", IMG_Name(img).c_str(),
+  g_main_image_low = IMG_LowAddress(img);
+  g_main_image_high = IMG_HighAddress(img);
+  report("主模块 %s 范围 0x%llX-0x%llX，入口点 0x%llX，已布下入口探针",
+         IMG_Name(img).c_str(), static_cast<unsigned long long>(g_main_image_low),
+         static_cast<unsigned long long>(g_main_image_high),
          static_cast<unsigned long long>(entry));
 
   // ── 关于「退出信号」的现状（别凭直觉再试一遍）────────────────────────
@@ -435,7 +520,10 @@ struct EventEntry {
 /// 而 128 条的环会丢掉 39%（**会报出来**，但报出来不等于可以接受）。
 /// 1024 条 × 64 字节 = 64 KiB/线程，64 个线程槽位 ≈ 4 MiB 静态内存——
 /// 用内存换"不丢"，对采集工具是划算的。
-constexpr UINT32 kRingCapacity = 1024;
+// 2048 条：实测一个 2000 次的写循环会在一瞬间产生上千条事件，
+// 1024 条的环在这种突发下会丢。槽位数相应减半，总量仍然可控
+// （2048 × 80 字节 × 32 ≈ 5 MiB 静态内存）。
+constexpr UINT32 kRingCapacity = 2048;
 
 struct EventRing {
   EventEntry slots[kRingCapacity];
@@ -452,6 +540,15 @@ struct ThreadStats {
   bool in_hook;
   /// 本线程的事件暂存环。回调只写这里（见 push_probe_event）。
   EventRing ring;
+  /// 内存探针的计数。
+  UINT64 mem_writes;
+  UINT64 mem_reads;
+  /// 写入的两段式实现用的待处理槽（BEFORE 记地址，AFTER 读值）。
+  /// 每线程一份，同一线程内两条回调严格相邻，不需要任何同步。
+  bool pending_write_valid;
+  UINT64 pending_write_address;
+  UINT32 pending_write_size;
+  UINT64 pending_write_instruction;
 };
 
 /// 线程统计表。用固定槽位而不是每条线程都 new：探针回调在**任意线程**上
@@ -459,7 +556,7 @@ struct ThreadStats {
 ///
 /// 槽位溢出时不假装成功：`g_slot_overflow` 会 +1 并在收尾时报出来。
 // 线程槽位：每个槽位带一个 64 KiB 的环，所以不能随便放大（见 kRingCapacity）。
-constexpr UINT32 kMaxThreadSlots = 64;
+constexpr UINT32 kMaxThreadSlots = 32;
 ThreadStats g_thread_slots[kMaxThreadSlots];
 ThreadStats g_overflow_slot;   // 槽位用尽后的共享槽（只记不细分）
 volatile long g_slot_overflow = 0;
@@ -599,8 +696,15 @@ UINT64 flush_all_rings() {
 VOID FlusherMain(VOID* arg) {
   (void)arg;
   while (!g_shutdown) {
-    g_flushed_total += flush_all_rings();
-    ::Sleep(10);
+    const UINT64 flushed = flush_all_rings();
+    g_flushed_total += flushed;
+    // **有活就不睡**：10 ms 固定间隔在访存这种密集探针下会成为瓶颈——
+    // 实测内存写入探针 1 秒内就能把环灌满两次，而固定的 10 ms 间隔意味着
+    // 大部分时间花在睡眠上。改成"送完了才睡 1 ms"：
+    // 空闲时几乎不占 CPU（1 ms 轮询），繁忙时尽快把环清空。
+    if (flushed == 0) {
+      ::Sleep(1);
+    }
   }
   // 退出前把剩下的送走：Fini 也会再冲刷一次，这里只是尽早。
   g_flushed_total += flush_all_rings();
@@ -677,7 +781,157 @@ VOID OnImageUnload(IMG img, VOID* v) {
   }
 }
 
-/// 指令级插桩：入口点 + 系统调用。
+// ══════════════════════════════════════════════════════════════ 内存访问探针
+//
+// ── 为什么过滤是**必需**的，不是优化 ────────────────────────────────────
+// 几乎每条指令都会访存。不加过滤的话产出的是无法使用的噪声，而且开销会
+// 掩盖被分析程序本身的行为。所以三层过滤都能收紧：
+//
+//   1. 模块："谁在访存"——默认只关心主模块；
+//   2. 地址范围："访到哪里"——`-pb_mem_range lo-hi`（十六进制）；
+//   3. 类型：读/写——默认**只写**。
+//
+// 第 3 条的默认值与事件模型保持一致：`EventKind::MemRead::default_subscribed()`
+// 就是 false（读的体量比写大一到两个数量级）。两处各定各的，会让人先被
+// "订阅了却收不到"困惑一次。
+//
+// ── 写入后的值怎么拿 ──────────────────────────────────────────────────
+// `IARG_MEMORYWRITE_EA` 只在 `IPOINT_BEFORE` 有效，而 BEFORE 读到的还是
+// **写入前**的值。所以写入事件分两段：
+//   BEFORE：把 (EA, 长度, 指令地址) 记进本线程的待处理槽（纯内存写）
+//   AFTER ：取出地址，用 `PIN_SafeCopy` 读**写入后**的值再入队
+// 不支持 AFTER 点的写入指令**跳过并计数**——宁可少采一条，也不送出一条
+// 语义错误的"新值"。
+struct MemPolicy {
+  bool enabled = false;
+  bool reads = false;
+  bool writes = true;
+  bool main_image_only = true;
+  UINT64 low = 0;
+  UINT64 high = 0;        // low==0 && high==0 表示不限
+  UINT64 max_events = 0;  // 0 表示不限
+};
+
+MemPolicy g_mem;
+volatile long g_mem_sites = 0;
+volatile UINT64 g_mem_captured = 0;
+volatile UINT64 g_mem_skipped_no_after = 0;
+volatile UINT64 g_mem_unreadable = 0;
+/// 被地址范围过滤掉的条数（"事件为什么少"的可回答性靠它）。
+volatile UINT64 g_mem_filtered = 0;
+volatile bool g_mem_soft_stopped = false;
+// `g_main_image_low/high` 的声明在前面（`OnImageLoad` 要填它，见那里的注释）。
+
+bool mem_address_in_scope(UINT64 address) {
+  if (g_mem.low == 0 && g_mem.high == 0) {
+    return true;
+  }
+  return address >= g_mem.low && address <= g_mem.high;
+}
+
+bool mem_instruction_in_scope(ADDRINT address) {
+  if (!g_mem.main_image_only) {
+    return true;
+  }
+  return g_main_image_high > g_main_image_low && address >= g_main_image_low &&
+         address <= g_main_image_high;
+}
+
+/// 写入的第一段：只记地址（`IARG_MEMORYWRITE_EA` 在 BEFORE 才有效）。
+void OnMemWriteBefore(THREADID tid, ADDRINT ins_address, ADDRINT effective_address,
+                      UINT32 size) {
+  if (g_shutdown || g_mem_soft_stopped) {
+    return;
+  }
+  // 地址过滤**必须在这里**做：插桩期只知道"哪条指令"，不知道它会访哪个地址。
+  // 少了这一步，`-pb_mem_range` 就只是个摆设——实测过：范围外的事件照样灌进来，
+  // 环形缓冲被冲爆、丢掉一半。被过滤掉的条数也要计数，否则"事件为什么这么少"
+  // 同样无从回答。
+  if (!mem_address_in_scope(static_cast<UINT64>(effective_address))) {
+    ++g_mem_filtered;
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  stats->pending_write_valid = true;
+  stats->pending_write_address = static_cast<UINT64>(effective_address);
+  stats->pending_write_size = size;
+  stats->pending_write_instruction = static_cast<UINT64>(ins_address);
+}
+
+/// 写入的第二段：此时内存里已经是**写入后**的值。
+void OnMemWriteAfter(THREADID tid) {
+  if (g_shutdown || g_mem_soft_stopped) {
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  if (!stats->pending_write_valid) {
+    return;  // 第一段被软停止挡掉了
+  }
+  stats->pending_write_valid = false;
+  if (stats->in_hook) {
+    ++stats->reentrant_skips;
+    return;
+  }
+  stats->in_hook = true;
+  UINT64 value = 0;
+  const UINT32 size = stats->pending_write_size;
+  if (size <= 8) {
+    // `PIN_SafeCopy` 是 Pin 自己的安全读：读不到就给 0 并计数，不抛异常。
+    // 它**不违反**"回调不许调用外部 DLL"那条约束（那是我们自己的代码与 CRT）。
+    const size_t got = PIN_SafeCopy(
+        &value, reinterpret_cast<const VOID*>(static_cast<ADDRINT>(stats->pending_write_address)),
+        size);
+    if (got != size) {
+      value = 0;
+      ++g_mem_unreadable;
+    }
+  }
+  ++stats->mem_writes;
+  ++g_mem_captured;
+  const UINT64 args[3] = {stats->pending_write_address, size, value};
+  push_probe_event(stats, 6 /* PB_EV_MEM_WRITE */, tid,
+                   static_cast<ADDRINT>(stats->pending_write_instruction), args, 3);
+  stats->in_hook = false;
+  if (g_mem.max_events != 0 && g_mem_captured >= g_mem.max_events) {
+    g_mem_soft_stopped = true;
+  }
+}
+
+/// 读取：BEFORE 就能拿到有效地址与长度，顺带把读到的值也带上。
+void OnMemRead(THREADID tid, ADDRINT ins_address, ADDRINT effective_address, UINT32 size) {
+  if (g_shutdown || g_mem_soft_stopped) {
+    return;
+  }
+  if (!mem_address_in_scope(static_cast<UINT64>(effective_address))) {
+    ++g_mem_filtered;
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  if (stats->in_hook) {
+    ++stats->reentrant_skips;
+    return;
+  }
+  stats->in_hook = true;
+  UINT64 value = 0;
+  if (size <= 8) {
+    const size_t got = PIN_SafeCopy(
+        &value, reinterpret_cast<const VOID*>(effective_address), size);
+    if (got != size) {
+      value = 0;
+      ++g_mem_unreadable;
+    }
+  }
+  ++stats->mem_reads;
+  ++g_mem_captured;
+  const UINT64 args[3] = {static_cast<UINT64>(effective_address), size, value};
+  push_probe_event(stats, 7 /* PB_EV_MEM_READ */, tid, ins_address, args, 3);
+  stats->in_hook = false;
+  if (g_mem.max_events != 0 && g_mem_captured >= g_mem.max_events) {
+    g_mem_soft_stopped = true;
+  }
+}
+
+/// 指令级插桩：入口点 + 系统调用 + 内存访问。
 void OnInstruction(INS ins, VOID* v) {
   (void)v;
 
@@ -721,6 +975,38 @@ void OnInstruction(INS ins, VOID* v) {
                    IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE,
                    LEVEL_BASE::REG_RAX, IARG_END);
     ++g_syscall_sites;
+    return;
+  }
+
+  // ── 内存访问探针 ──
+  // 注意这一段在系统调用判断**之后**：系统调用指令本身不访存用户内存，
+  // 两者互斥，早 return 也省掉了重复判断。
+  if (!g_mem.enabled || g_mem_soft_stopped || g_shutdown) {
+    return;
+  }
+  if (!mem_instruction_in_scope(address)) {
+    return;
+  }
+  if (g_mem.writes && INS_IsMemoryWrite(ins)) {
+    if (INS_IsValidForIpointAfter(ins)) {
+      // 两段式：BEFORE 记地址（EA 的 IARG 只在 BEFORE 有效），AFTER 读写入后的值。
+      INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnMemWriteBefore),
+                     IARG_THREAD_ID, IARG_INST_PTR, IARG_MEMORYWRITE_EA,
+                     IARG_MEMORYWRITE_SIZE, IARG_END);
+      INS_InsertCall(ins, IPOINT_AFTER, reinterpret_cast<AFUNPTR>(OnMemWriteAfter),
+                     IARG_THREAD_ID, IARG_END);
+      ++g_mem_sites;
+    } else {
+      // 不能在这里改成 BEFORE 采集：那会把**写入前**的值当成"新值"送出去，
+      // 而调用方无法分辨。跳过并计数，宁可少一条。
+      ++g_mem_skipped_no_after;
+    }
+  }
+  if (g_mem.reads && INS_IsMemoryRead(ins)) {
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnMemRead),
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_MEMORYREAD_EA,
+                   IARG_MEMORYREAD_SIZE, IARG_END);
+    ++g_mem_sites;
   }
 }
 
@@ -816,6 +1102,37 @@ void OnFini(INT32 code, VOID* v) {
     }
   }
 
+  // ── 内存探针的账 ──────────────────────────────────────────────────────
+  if (g_mem.enabled) {
+    UINT64 mem_writes_total = 0;
+    UINT64 mem_reads_total = 0;
+    for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+      mem_writes_total += g_thread_slots[i].mem_writes;
+      mem_reads_total += g_thread_slots[i].mem_reads;
+    }
+    mem_writes_total += g_overflow_slot.mem_writes;
+    mem_reads_total += g_overflow_slot.mem_reads;
+    report("内存探针：插装点 %ld 个，捕获 write=%llu read=%llu",
+           static_cast<long>(g_mem_sites),
+           static_cast<unsigned long long>(mem_writes_total),
+           static_cast<unsigned long long>(mem_reads_total));
+    report("  地址范围过滤掉 %llu 条，缺 AFTER 点跳过 %ld 个写入点，值读不出 %llu 条",
+           static_cast<unsigned long long>(g_mem_filtered),
+           static_cast<long>(g_mem_skipped_no_after),
+           static_cast<unsigned long long>(g_mem_unreadable));
+    if (g_required_mem != 0) {
+      const UINT64 captured = mem_writes_total + mem_reads_total;
+      if (captured < g_required_mem) {
+        report("失败：要求至少捕获 %llu 条内存事件，实际 %llu 条",
+               static_cast<unsigned long long>(g_required_mem),
+               static_cast<unsigned long long>(captured));
+      } else {
+        report("✓ 内存事件捕获数满足要求（%llu >= %llu）",
+               static_cast<unsigned long long>(captured),
+               static_cast<unsigned long long>(g_required_mem));
+      }
+    }
+  }
   const UINT32 want = KnobEvents.Value();
   if (want == 0) {
     return;
@@ -884,6 +1201,38 @@ int main(int argc, char** argv) {
 
   g_syscall_cap = parse_u64(KnobSyscallMax.Value().c_str(), 4096);
   g_required_syscalls = parse_u64(KnobRequireSyscalls.Value().c_str(), 0);
+
+  // 内存探针：模式串 `0/w/r/rw`；范围形如 `lo-hi`（十六进制）。
+  const std::string mem_mode = KnobMem.Value();
+  g_mem.enabled = mem_mode != "0" && !mem_mode.empty();
+  g_mem.writes = mem_mode.find('w') != std::string::npos;
+  g_mem.reads = mem_mode.find('r') != std::string::npos;
+  g_mem.main_image_only = !KnobMemAllModules.Value();
+  g_mem.max_events = parse_u64(KnobMemMax.Value().c_str(), 20000);
+  g_required_mem = parse_u64(KnobRequireMem.Value().c_str(), 0);
+  const std::string mem_range = KnobMemRange.Value();
+  const std::size_t dash = mem_range.find('-');
+  if (dash != std::string::npos) {
+    g_mem.low = parse_hex_u64(mem_range.substr(0, dash).c_str());
+    g_mem.high = parse_hex_u64(mem_range.substr(dash + 1).c_str());
+    if (g_mem.high < g_mem.low) {
+      // 不给"空区间"这种含糊状态：交换并说出来。
+      report("警告：-pb_mem_range 的 hi < lo，已交换两端");
+      const UINT64 swap = g_mem.low;
+      g_mem.low = g_mem.high;
+      g_mem.high = swap;
+    }
+  }
+  char range_lo[24];
+  char range_hi[24];
+  format_hex_into(range_lo, sizeof(range_lo), g_mem.low);
+  format_hex_into(range_hi, sizeof(range_hi), g_mem.high);
+  report("内存探针：%s（读=%s 写=%s，%s，范围 %s-%s，上限 %llu）",
+         g_mem.enabled ? "开" : "关", g_mem.reads ? "是" : "否", g_mem.writes ? "是" : "否",
+         g_mem.main_image_only ? "仅主模块" : "全部模块",
+         (g_mem.low == 0 && g_mem.high == 0) ? "不限" : range_lo,
+         (g_mem.low == 0 && g_mem.high == 0) ? "" : range_hi,
+         static_cast<unsigned long long>(g_mem.max_events));
   report("系统调用探针：%s（上限 %llu 条，0 表示不限）",
          pb_syscall_enabled ? "开" : "关",
          static_cast<unsigned long long>(g_syscall_cap));

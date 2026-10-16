@@ -57,16 +57,48 @@ void syscall_loop(unsigned long iterations) {
 #endif
 }
 
+/// 一个模块内的全局缓冲区：内存探针要观察的"目标地址"就在这里。
+/// 刻意做成固定大小 + 固定访问模式，让"地址落在 [base, base+size)"这件事可判定。
+constexpr unsigned long kTouchBufferBytes = 256;
+alignas(64) unsigned char g_touch_buffer[kTouchBufferBytes];
+
+/// 对缓冲区做 N 次"写 + 读"。
+///
+/// 访问模式是刻意的：写与读落在同一个 256 字节窗口内，
+/// 因此可以给探针一个**明确的地址范围**去过滤，从而把
+/// "捕获到事件"与"捕获到我关心的那段内存"区分开。
+void touch_loop(unsigned long iterations) {
+  unsigned long checksum = 0;
+  for (unsigned long i = 0; i < iterations; ++i) {
+    const unsigned long index = i % kTouchBufferBytes;
+    g_touch_buffer[index] = static_cast<unsigned char>(i & 0xFF);
+    checksum += g_touch_buffer[(index + 7) % kTouchBufferBytes];
+  }
+  g_sink = static_cast<int>(checksum & 0x7FFFFFFF);
+}
+
+/// 把缓冲区地址打印出来：脚本据此构造 `-pb_mem_range`。
+void print_touch_buffer() {
+  std::printf("PB_TOUCH_BUFFER=0x%p size=0x%lX\n",
+              static_cast<const void*>(g_touch_buffer), kTouchBufferBytes);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   unsigned long syscalls = 0;
   unsigned long spins = 0;
+  unsigned long touches = 0;
+  bool print_buffer = false;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--syscalls") == 0 && i + 1 < argc) {
       syscalls = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--spin") == 0 && i + 1 < argc) {
       spins = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--touch") == 0 && i + 1 < argc) {
+      touches = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--print-buffer") == 0) {
+      print_buffer = true;
     }
   }
 
@@ -75,6 +107,12 @@ int main(int argc, char** argv) {
   }
   if (spins != 0) {
     spin(spins);
+  }
+  if (touches != 0) {
+    touch_loop(touches);
+  }
+  if (print_buffer) {
+    print_touch_buffer();
   }
 
   const int value = add(20, 22);

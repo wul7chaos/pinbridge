@@ -305,6 +305,19 @@ if(BUILD_TESTING)
         set_tests_properties(pin_tool_captures_syscalls PROPERTIES
           ENVIRONMENT "PINBRIDGE_AGENT_DLL=${PINBRIDGE_AGENT_DLL}")
       endif()
+
+      # -------------------------------------------------- 内存探针端到端
+      # 这条必须用脚本：判断"-pb_mem_range 过滤生效"需要先知道缓冲区地址，
+      # 而它每次运行都不同（ASLR）。ctest 的一条命令里做不到"先读输出再决定参数"。
+      # 脚本自己跑两步，并给出三条判定（写入数精确、零丢弃、过滤计数 > 0）。
+      find_program(PINBRIDGE_PWSH pwsh)
+      if(PINBRIDGE_PWSH)
+        add_test(NAME pin_tool_mem_range_filter
+          COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
+                  "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-mem-probe.ps1"
+                  -PinRoot "third_party/pin" -BuildDir "native/build-pin")
+        set_tests_properties(pin_tool_mem_range_filter PROPERTIES SKIP_RETURN_CODE 77)
+      endif()
     endif()
   else()
     message(STATUS "非 Windows：只注册 abi_selfcheck（桥接层不可用）")
