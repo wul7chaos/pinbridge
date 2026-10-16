@@ -9,6 +9,12 @@
 
 ## [Unreleased]
 
+### 变更
+- 收紧 Dependabot 策略：所有生态**显式忽略 major 升级**（major 属于决策，走 ADR），
+  GitHub Actions 与 npm 各自分组、限制并发 PR 数。原因：首次推送后 Dependabot 在两分钟内
+  开了 10 条大版本 PR（react 18→19、typescript 5→7、actions/checkout 4→7 等），
+  全部需要人工评估，噪音会淹没真正要处理的事。
+
 ### 计划中（M1）
 - `pinbridge.dll` 接通 Intel Pin：JIT 探针、上下文控制、TF 虚拟化。
 - agent 内嵌 CPython 3.x：脚本加载/替换/卸载与执行时间预算。

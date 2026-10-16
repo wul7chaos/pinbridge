@@ -4,10 +4,19 @@
 # 理由很实际：一次"顺手升级依赖"的合并，会让 VMP 对抗场景下的行为变化
 # 无法归因——是样本变了还是依赖变了？
 #
-# 分组规则：把 RustCrypto 全家桶与 serde 生态分开，避免一个 PR 同时动
-# 五个 crate 导致 review 只能"看 CI 绿了就点同意"。
+# 两条经验（第一次配置时踩到的）：
+#
+#   1. **必须显式忽略 major**。Dependabot 默认会把 major 版本也开成 PR，
+#      一个刚建好的仓库会在两分钟内收到十条"react 18 → 19""actions/checkout
+#      4 → 7"这样的 PR，而它们全都需要人工评估。噪音会淹没真正要处理的事。
+#   2. **分组要按生态分组**，不要把 GitHub Actions 与 npm 包塞进同一个 PR：
+#      前者的验证方式是"workflow 还能跑"，后者是"应用还能构建"，两者无法一起评审。
+#
+# 与 docs/dev/dependency-policy.md 一致：major 升级属于**决策**，走 ADR，不自动开 PR。
+
 version: 2
 updates:
+  # ---------------------------------------------------------------- Rust
   - package-ecosystem: cargo
     directory: "/"
     schedule:
@@ -15,48 +24,86 @@ updates:
       day: monday
       time: "03:00"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     labels: ["deps", "rust"]
     commit-message:
       prefix: "build(deps)"
       include: scope
+    ignore:
+      # major 升级 = 一次架构决策（见 docs/dev/dependency-policy.md），不自动开 PR
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       serde:
         patterns: ["serde", "serde_json"]
-        update-types: ["minor", "patch"]
       crypto:
         patterns: ["sha2", "digest", "generic-array", "typenum", "crypto-common"]
-      dev-tools:
+      errors:
         patterns: ["thiserror", "thiserror-impl"]
-        update-types: ["minor", "patch"]
 
+  # -------------------------------------------------------------- Python
   - package-ecosystem: pip
     directory: "/python"
     schedule:
       interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 2
     labels: ["deps", "python"]
     commit-message:
       prefix: "build(deps)"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       python-dev:
         patterns: ["pytest*", "mypy*", "ruff*"]
 
+  # -------------------------------------------------------- 桌面端（npm）
+  # 桌面端当前是 M0 骨架（未接线、未在 CI 中构建），
+  # 因此这里只接受补丁级更新：任何 minor/major 都需要有人先把它跑起来再评估。
   - package-ecosystem: npm
     directory: "/apps/desktop"
     schedule:
       interval: monthly
+    open-pull-requests-limit: 2
     labels: ["deps", "desktop"]
     commit-message:
       prefix: "build(deps)"
     ignore:
-      # Tauri 大版本升级需要人工评估（它决定桌面端的运行方式）
+      # 桌面前端栈（React / 构建工具 / 类型定义）的大版本一律人工评估：
+      # 它们决定的是"应用怎么跑"，不是"哪天能顺手升一下"
       - dependency-name: "@tauri-apps/*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "vite"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@vitejs/*"
         update-types: ["version-update:semver-major"]
 
+  # -------------------------------------------------- GitHub Actions
+  # 单独的生态：major 升级通常要求同步改 workflow（缓存的 key、输入名等），
+  # 因此整体只跟补丁/小版本，且合并成一个 PR 评审。
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: monthly
+    open-pull-requests-limit: 1
     labels: ["deps", "ci"]
     commit-message:
       prefix: "ci(deps)"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
