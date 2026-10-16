@@ -19,6 +19,7 @@ pub mod diff;
 pub mod event;
 pub mod fold;
 pub mod pbt;
+pub mod slice;
 pub mod varint;
 
 pub use callgraph::{
@@ -28,4 +29,5 @@ pub use diff::{diff_traces, diff_warnings, DiffOptions, Difference, Divergence, 
 pub use event::{register_name, Event, EventKind, MAX_ARGS, REGISTER_COUNT, REGISTER_NAMES};
 pub use fold::{expand_records, expand_records_checked, FoldOutcome, RepeatFolder};
 pub use pbt::{PbtReader, PbtWriter, Summary};
+pub use slice::{reverse_slice, ReadRecord, Slice, WriteRecord};
 pub use varint::{read_u64, try_read_u64, write_u64, write_zigzag};

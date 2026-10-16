@@ -24,9 +24,12 @@ use pinbridge_trace::diff::{attach_warnings, diff_traces, diff_warnings, DiffOpt
 use pinbridge_trace::event::EventKind;
 use pinbridge_trace::fold::expand_records;
 use pinbridge_trace::pbt::{PbtReader, Summary};
+use pinbridge_trace::slice::reverse_slice;
 
 /// 报告里最多列出几处分岔（总数仍然准确）。
 const MAX_DIFFERENCES: usize = 8;
+/// 切片报告里最多列出几个写入者/读取者（总数仍然准确）。
+const SLICE_LIMIT: usize = 12;
 
 const USAGE: &str = "\
 pinbridge 0.1.0 —— 插装式动态分析框架（AI 主导 · 人机平级）
@@ -39,6 +42,8 @@ pinbridge 0.1.0 —— 插装式动态分析框架（AI 主导 · 人机平级�
                                       同一个目标的两次运行：行为在哪里分岔
   pinbridge calls <FILE.pbt> [--top N] [--strict-code-targets]
                                       从转移事件重建调用关系（需要录制时开 -pb_transfers）
+  pinbridge slice <FILE.pbt> --at 0xADDR [--len N]
+                                      地址级反向切片：谁写了这块字节、谁读过、何时执行到
   pinbridge demo [--trace-dir <DIR>]  端到端自检
   pinbridge mcp                       以 stdio 方式启动 MCP 服务
   pinbridge version                   打印版本
@@ -113,6 +118,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "slice" => match args.get(1) {
+            Some(path) => match parse_at(&args) {
+                Some(target) => match slice_command(path, target, parse_len(&args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("切片失败: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                None => {
+                    eprintln!("用法: pinbridge slice <FILE.pbt> --at 0xADDR [--len N]");
+                    ExitCode::FAILURE
+                }
+            },
+            None => {
+                eprintln!("用法: pinbridge slice <FILE.pbt> --at 0xADDR [--len N]");
+                ExitCode::FAILURE
+            }
+        },
         "demo" => {
             let dir = parse_trace_dir(&args);
             match demo(&dir) {
@@ -173,6 +197,21 @@ fn print_tools() {
 fn parse_head(args: &[String]) -> Option<usize> {
     let index = args.iter().position(|a| a == "--head")?;
     args.get(index + 1)?.parse().ok()
+}
+
+fn parse_at(args: &[String]) -> Option<u64> {
+    let index = args.iter().position(|a| a == "--at")?;
+    let text = args.get(index + 1)?;
+    let trimmed = text.trim_start_matches("0x").trim_start_matches("0X");
+    u64::from_str_radix(trimmed, 16).ok()
+}
+
+fn parse_len(args: &[String]) -> u64 {
+    let index = args.iter().position(|a| a == "--len");
+    index
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
 }
 
 fn parse_top(args: &[String]) -> Option<usize> {
@@ -243,6 +282,14 @@ fn calls(path: &str, top: usize) -> Result<(), String> {
     );
     println!("文件: {path}（已按展开后的事件建图）");
     print!("{}", graph.render(top));
+    Ok(())
+}
+/// `pinbridge slice A.pbt --at 0x… [--len N]`：地址级反向切片（见 ADR 0013）。
+fn slice_command(path: &str, target: u64, len: u64) -> Result<(), String> {
+    let (events, _summary) = load_trace(path)?;
+    let slice = reverse_slice(&events, target, len);
+    println!("文件: {path}（{len} 字节的窗口）");
+    print!("{}", slice.render(SLICE_LIMIT));
     Ok(())
 }
 fn replay(path: &str, head: usize) -> Result<(), String> {
