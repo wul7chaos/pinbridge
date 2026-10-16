@@ -137,7 +137,9 @@ try {
         Step '桌面端: node --test（NDJSON 客户端）' {
             Push-Location (Join-Path $root 'apps/desktop')
             try {
-                node --test src/api/
+                # 不传路径：用 Node 的自动发现（不同版本对"目录参数"的处理不一样，
+                # CI 上的 Node 22 会把目录当成模块名而报错）。
+                node --test
                 if ($LASTEXITCODE -ne 0) { throw "node --test 失败" }
             } finally {
                 Pop-Location

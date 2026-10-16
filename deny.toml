@@ -42,6 +42,10 @@ exceptions = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# 工作区内部依赖用的是 `{ path = "crates/xxx" }`（不带版本）——这是 Cargo 的常规写法，
+# 不是"通配版本依赖"。不加这一条，cargo-deny 会把每个内部 path 依赖都报成 wildcard，
+# 于是**这条 workflow 从建立起就是红的**（定时任务，很容易被忽略）。
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

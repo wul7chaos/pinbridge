@@ -119,7 +119,9 @@ jobs:
           node-version: "22"
       - name: node --test（分帧 / 关联 / 错误传播 / 回环约束）
         working-directory: apps/desktop
-        run: node --test src/api/
+        # 不传路径：用自动发现（Node 22 与更新版本对"目录参数"的处理不同，
+        # 传目录在旧版本上会被当成模块名 ⇒ "在我机器上是好的"）。
+        run: node --test
 
   native:
     name: native 层（C++ 桥接 + ABI 自检）
