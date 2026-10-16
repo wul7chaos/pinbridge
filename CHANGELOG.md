@@ -41,6 +41,15 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 修复（CI #34 ubuntu 失败：把 Windows 行为当成了通用契约）
+- 两条导出面用例在 ubuntu 上断言了 Windows 专有的结果：
+  `abi_surface_smoke` 要求错误文本含 `Windows 错误`、
+  `memory_read_and_write_go_through_the_real_path` 要求读写必须成功。
+  现在两个平台**各有各的断言**：Windows 断言真实读写往返与系统错误码；
+  非 Windows 断言"明确报平台未实现"——而不是假装成功。
+- 这类问题第二次出现了（CI #29 是同类：非 Windows 的期望写在了 Windows 分支里）。
+  **本机只做 Linux 目标的 clippy，运行时行为只有 CI 能看**（本机 WSL 没有发行版，
+  装不了），所以纪律是：涉及平台差异的用例，每个平台都写自己的断言。
 ### 新增（M1：真实内存读写 + 脚本侧 `pb.read`）
 - **内存读写不再是桩**。读走 `ReadProcessMemory`、写走 `WriteProcessMemory`，
   都在 agent 自己的进程里。**刻意不解引用**：agent 就在目标进程里，

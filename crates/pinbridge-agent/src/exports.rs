@@ -823,14 +823,30 @@ pb.subscribe("syscall_enter", on_syscall)
         assert_eq!(untouched, [0u8; 32], "被拒绝的写绝不能真的落下去");
 
         // 2) 给读写能力：写进去，再读回来
+        //
+        // 读写往返是 **Windows** 的行为（M1 只在 Windows 上实现进程内读写）。
+        // 别的平台上这里必须明确报"平台未实现"，而**不能**假装成功——
+        // 所以两个平台各有自己的断言，而不是把 Windows 的行为当通用契约。
         let bits = Capability::MemRead.bit() | Capability::MemWrite.bit();
         assert_eq!(pb_set_capabilities(bits), Status::Ok.code());
         // SAFETY: 同上
-        assert_eq!(
-            unsafe { pb_memory_write(address, pattern.as_ptr(), 11) },
-            Status::Ok.code(),
-            "有 mem_write 时写应当成功"
-        );
+        let write_code = unsafe { pb_memory_write(address, pattern.as_ptr(), 11) };
+        if !cfg!(windows) {
+            assert_eq!(
+                write_code,
+                Status::Internal.code(),
+                "非 Windows 平台必须明确报未实现"
+            );
+            // SAFETY: 立刻拷贝
+            let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+            assert!(
+                text.contains("未实现") || text.contains("Windows"),
+                "原因要说清是平台限制：{text}"
+            );
+            println!("✓ 非 Windows 平台明确报未实现：{text}");
+            return;
+        }
+        assert_eq!(write_code, Status::Ok.code(), "有 mem_write 时写应当成功");
         let mut buffer = [0u8; 11];
         let mut written = 0u32;
         // SAFETY: buffer 有 11 字节，written 指向本栈变量
@@ -940,7 +956,16 @@ pb.subscribe("syscall_enter", on_syscall)
         // SAFETY: 立刻拷贝成 String
         let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
         assert!(text.contains("0x1000"), "失败原因要带上地址：{text}");
-        assert!(text.contains("Windows 错误"), "要带上系统错误码：{text}");
+        // 系统错误码只有 Windows 有；别的平台上这条契约是"说清平台未实现"。
+        // 把某个平台的行为当成通用契约写过一次，CI 上就会红一次。
+        if cfg!(windows) {
+            assert!(text.contains("Windows 错误"), "要带上系统错误码：{text}");
+        } else {
+            assert!(
+                text.contains("未实现") || text.contains("Windows"),
+                "非 Windows 平台要说清是平台限制：{text}"
+            );
+        }
 
         // 4) 越界参数
         let code = unsafe { pb_memory_read(0x1000, 32, buffer.as_mut_ptr(), 16, &mut written) };
