@@ -553,20 +553,21 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "异常事件：观察到 32 次.*code=0xE0000001"
         FAIL_REGULAR_EXPRESSION "PB_EXCEPTION_FLOW FAIL|Unhandled internal exception|not-raised|异常事件：一次都没观察到")
 
-      # ── TF 异常位置：两侧比对（脚本，见脚本头部说明）───────────────────────
+      # ── TF 分模式契约（脚本，见脚本头部说明）───────────────────────────────
       #
-      # 为什么用脚本：正则比不出两个值**相等**，而这条要验的恰恰是"工具说的异常位置"
-      # 与"靶子自己读到的那一处"是不是同一个。
+      # 为什么用脚本：断言不止一条（目标 0 次单步 + 读回 TF 仍置位 + 工具明说没有
+      # 真实单步 + 进程退出码），而 `PASS_REGULAR_EXPRESSION` 是"任一匹配即通过"，
+      # 表达不了"且"；退出码这一半正则也看不到。
       #
-      # 脚本分两段：`virtualize` 那段现在就能成立（验对照关系：目标 0 次异常 +
-      # 工具明说没有真实单步 + 目标完整跑完）；`watch` 那段因一个**已知缺陷**
-      # （`-pb_tf watch` 下靶子跑死）而 exit 77 跳过 —— 缺陷修好那天它会自动变成
-      # 真正的断言，脚本不用改。
-      add_test(NAME pin_tool_tf_location
+      # `watch` 那一档断的是**早已记录在案的预期**：不虚拟化时目标死于未接住的
+      # 单步异常（`STATUS_SINGLE_STEP` = 0x80000004，见 docs/roadmap.md 的 TF 条目）。
+      # 把它写成断言，是为了让它从"未知失败"变成"已知预期"：
+      # 预期一旦改变（例如将来目标能在 watch 下活下来），这条会红，提示同步更新文档。
+      add_test(NAME pin_tool_tf_observation
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
-                  "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-tf-location.ps1"
+                  "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-tf-observation.ps1"
                   -PinRoot "third_party/pin" -BuildDir "native/build-pin")
-        set_tests_properties(pin_tool_tf_location PROPERTIES SKIP_RETURN_CODE 77)
+        set_tests_properties(pin_tool_tf_observation PROPERTIES SKIP_RETURN_CODE 77)
 
       add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
