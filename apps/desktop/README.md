@@ -15,7 +15,19 @@
 > * **演示数据必须自报家门**：`useViewPayload` 优先走 Tauri 命令；拿不到就退到演示
 >   数据，但会**在告警里写明"当前是演示数据"** —— 演示数据与真实数据长得一样，
 >   这是这个界面最容易骗到人的地方。
-> * **仍未做**：把 Tauri 壳装起来（`src-tauri/` 的命令薄包装）。
+> * **Tauri 壳**（`src-tauri/`）：命令只做转发，逻辑全在 `pinbridge-workbench`。
+>   三个命令与 `src/state/useViewPayload.ts` 一一对应：`view_trace` / `capability_matrix` /
+>   `coverage_audit`。**壳里有 4 条用例**（直接调命令函数，不经窗口消息循环）：
+>   真实轨迹 → 界面可用 JSON（含告警与折叠）、读不到文件时报错而不是返回空载荷、
+>   能力矩阵来自单一真相、覆盖缺口单独可查。
+>
+> **怎么验证**（本仓库的 registry 只通 crates.io，npm 不通）：
+>
+> ```powershell
+> pwsh scripts/build-desktop.ps1     # 构建壳 + 跑壳里的用例（不进 verify.ps1）
+> node --test                        # 前端侧纯逻辑（无需依赖），在 apps/desktop 下
+> pnpm install && pnpm tauri dev      # 需要 npm registry，装不了就跳过
+> ```
 >   Tauri/React 的**构建**刻意不进 CI（需要 Node 依赖 + 系统 WebView，
 >   会让门禁从几十秒变成十分钟）；只验证不依赖 registry 的那部分逻辑。
 

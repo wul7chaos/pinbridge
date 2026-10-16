@@ -41,6 +41,28 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（第 43 轮：Tauri 壳落地，并且**真的构建过、跑过**）
+`apps/desktop/src-tauri/`：命令层**刻意做薄**（只做转发），逻辑全在
+`pinbridge-workbench`（那里有用例、不依赖 Tauri ⇒ 能进 CI）。
+
+三个命令与 `src/state/useViewPayload.ts` 一一对应：
+`view_trace(path, head)` / `capability_matrix()` / `coverage_audit(path)`。
+
+**壳里有 4 条用例，直接调命令函数**（不经窗口与消息循环 —— 那两样不是这里要验证的
+东西），实测全绿：
+1. 真实轨迹 → 界面可用的 JSON（含告警、折叠保留为 `repeats`、覆盖缺口）；
+2. 读不到文件时**报错**，而不是返回一个"看起来正常"的空载荷（界面据此显示失败原因）；
+3. 能力矩阵来自**同一份真相**（12 项、位序号连续、`mem_read` 在）；
+4. 覆盖缺口单独可查（面板上那一格）。
+
+- 构建时踩到两个真问题，都记下来了：
+  * **Windows 上必须有 `icons/icon.ico`** —— 缺了 `tauri-build` 直接失败。项目不引外部
+    素材，所以用脚本自造了一个 32×32 的占位图标（`icons/README.md` 写明它是占位，
+    不是设计稿，以及生成方式）；
+  * **壳不能被吸进工作区**：`exclude` 里显式加上 `apps/desktop/src-tauri`
+    （已用 `cargo metadata` 确认工作区成员里没有 `pinbridge-desktop`）——
+    否则每次 `cargo clippy --workspace` 与 CI 都会多出几分钟，而它不贡献"核心是否正确"。
+- 新增 `scripts/build-desktop.ps1`（本地按需构建 + 跑壳用例，**不进 `verify.ps1`**）。
 ### 新增（第 42 轮：把 README 里的三条**硬要求**写成代码）
 `apps/desktop` 的 README 有三条"人不能被蒙"的要求。写在文档里只是文档，所以把它们
 做成了**零依赖的视图模型**（`src/state/view-model.mjs` + 7 条 `node --test` 用例）：

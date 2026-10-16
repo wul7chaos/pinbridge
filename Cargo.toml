@@ -12,7 +12,10 @@ members = [
     "crates/pinbridge-cli",
     "crates/pinbridge-workbench",
 ]
-exclude = ["apps/desktop", "native"]
+# apps/desktop 及其 src-tauri 都**不属于工作区**：前者是前端工程，后者依赖 Tauri
+# （需要系统 WebView 与一大堆依赖）。放进工作区会让每次 `cargo clippy --workspace`
+# 与 CI 都多出几分钟，而它们对"核心是否正确"没有贡献。
+exclude = ["apps/desktop", "apps/desktop/src-tauri", "native"]
 
 # ---------------------------------------------------------------------------
 # 工作区元数据：所有成员继承，禁止各 crate 自行写死版本

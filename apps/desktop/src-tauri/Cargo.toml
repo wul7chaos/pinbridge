@@ -1,0 +1,26 @@
+[package]
+name = "pinbridge-desktop"
+description = "PinBridge 工作台的 Tauri 壳：把 pinbridge-workbench 的能力暴露给界面"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98.1"
+authors = ["PinBridge Authors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wul7chaos/pinbridge"
+publish = false
+
+# 这个 crate **不**属于工作区（与 apps/desktop 一样被 exclude）：
+# 它依赖 Tauri，而 Tauri 需要系统 WebView 与一大堆依赖 —— 放进工作区会让
+# 每次 `cargo clippy --workspace` 和 CI 都多出好几分钟，而它对"核心是否正确"
+# 没有任何贡献。它验证的是"界面能不能拿到真实数据"。
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde_json = "1"
+# 数据层：真实产物 → 界面视图。逻辑与用例都在这里，壳只负责转发。
+pinbridge-workbench = { path = "../../../crates/pinbridge-workbench" }
+
+[dev-dependencies]
+pinbridge-trace = { path = "../../../crates/pinbridge-trace" }
