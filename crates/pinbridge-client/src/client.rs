@@ -13,9 +13,7 @@
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
-use pinbridge_core::capability::{Capability, CapabilitySet};
+use pinbridge_core::capability::CapabilitySet;
 use pinbridge_core::error::Error;
 
 use crate::transport::Transport;
@@ -24,180 +22,10 @@ use crate::transport::Transport;
 /// 单步/继续这类会影响目标执行流的命令由调用方显式放宽。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5_000);
 
-/// 发给 agent 的请求。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "req", rename_all = "snake_case")]
-pub enum AgentRequest {
-    /// 探活并取回 agent 信息。
-    Ping {
-        /// 协议版本。
-        wire_version: u16,
-    },
-    /// 读内存。
-    ReadMemory {
-        /// 起始地址。
-        address: u64,
-        /// 长度（上限由 agent 决定，默认 64 KiB）。
-        length: u32,
-    },
-    /// 写内存。
-    WriteMemory {
-        /// 地址。
-        address: u64,
-        /// hex 字节。
-        hex_bytes: String,
-    },
-    /// 读寄存器。
-    ReadRegisters {
-        /// 线程 ID。
-        thread: u32,
-    },
-    /// 下断点。
-    SetBreakpoint {
-        /// 地址。
-        address: u64,
-        /// 备注。
-        #[serde(default)]
-        label: String,
-    },
-    /// 清断点。
-    ClearBreakpoint {
-        /// 地址。
-        address: u64,
-    },
-    /// 单步。
-    SingleStep {
-        /// 步数。
-        count: u32,
-    },
-    /// 继续。
-    Continue,
-    /// 中断。
-    Pause,
-    /// 运行到地址。
-    RunTo {
-        /// 地址。
-        address: u64,
-    },
-    /// 加载脚本。
-    LoadScript {
-        /// 名称。
-        name: String,
-        /// 源码。
-        source: String,
-        /// 订阅的事件类型名。
-        #[serde(default)]
-        subscribe: Vec<String>,
-    },
-    /// 卸载脚本。
-    UnloadScript {
-        /// 脚本 ID。
-        script: u64,
-    },
-    /// 拉取事件。
-    DrainEvents {
-        /// 起始序号。
-        from: u64,
-        /// 条数上限。
-        limit: u32,
-        /// 是否折叠。
-        #[serde(default)]
-        fold_repeats: bool,
-    },
-    /// 开始录制。
-    StartTrace {
-        /// 输出路径。
-        path: String,
-        /// 是否折叠。
-        #[serde(default)]
-        fold: bool,
-    },
-    /// 停止录制。
-    StopTrace,
-}
-
-/// agent 返回的响应。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "res", rename_all = "snake_case")]
-pub enum AgentResponse {
-    /// 探活结果。
-    Pong {
-        /// agent 版本（`pinbridge-agentdll 0.1.0` 这种）。
-        agent_version: String,
-        /// 目标架构。
-        arch: String,
-        /// agent 当前能力集（由 Hub 授权下发）。
-        capabilities: CapabilitySet,
-    },
-    /// 内存内容。
-    Memory {
-        /// 起始地址。
-        address: u64,
-        /// hex 字节。
-        hex_bytes: String,
-    },
-    /// 寄存器内容。
-    Registers {
-        /// 线程。
-        thread: u32,
-        /// 名称 → 值。
-        values: Vec<(String, u64)>,
-    },
-    /// 事件批。
-    Events {
-        /// 事件。
-        items: Vec<EventDto>,
-        /// 下一批的游标。
-        next: u64,
-        /// 丢失条数。
-        dropped: u64,
-    },
-    /// 脚本已加载。
-    Script {
-        /// 脚本 ID。
-        script: u64,
-    },
-    /// 录制已开始。
-    Trace {
-        /// 路径。
-        path: String,
-    },
-    /// 录制汇总。
-    TraceSummary {
-        /// 记录条数。
-        records: u64,
-        /// 展开后的事件条数。
-        events: u64,
-        /// 折叠条数。
-        folded: u64,
-        /// 丢弃条数。
-        dropped: u64,
-    },
-    /// 简单成功。
-    Ok,
-    /// 失败。
-    Error {
-        /// 机器可读错误码。
-        code: String,
-        /// 描述。
-        message: String,
-    },
-}
-
-/// 事件在线路上的形态。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventDto {
-    /// 序号。
-    pub seq: u64,
-    /// 类型判别值（与 `.pbt` 的类型表一致）。
-    pub kind: u8,
-    /// 线程。
-    pub thread: u32,
-    /// 地址。
-    pub address: u64,
-    /// 参数。
-    pub args: Vec<u64>,
-}
+// 请求/响应/事件与"请求需要什么能力"这一张表都属于**协议**，定义在
+// `pinbridge-proto::agent_link`：连接的两端（Hub 侧与本文件、目标侧 agent）
+// 必须用同一份定义，否则"对同一条命令需要什么权限"迟早会分叉。
+pub use pinbridge_proto::agent_link::{AgentRequest, AgentResponse, EventDto};
 
 /// agent 信息（`Ping` 的结果）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,7 +146,7 @@ impl<T: Transport> AgentClient<T> {
     /// 发送请求并解析响应。
     pub fn call(&mut self, request: &AgentRequest) -> ClientResult<AgentResponse> {
         // 客户端侧能力校验（agent 侧还会再校验一次）
-        self.capabilities.require(required_capability(request))?;
+        self.capabilities.require(request.required_capability())?;
         let payload = serde_json::to_vec(request)
             .map_err(|e| Error::Protocol(format!("编码请求失败: {e}")))?;
         let raw = self.transport.roundtrip(&payload, self.timeout)?;
@@ -340,31 +168,11 @@ impl<T: Transport> AgentClient<T> {
     }
 }
 
-/// 请求所需能力。**这张表是 agent 权限的唯一真相**，
-/// 新增请求类型时必须同时在这里登记，否则会落到 `ProofOnly` 兜底分支上。
-fn required_capability(request: &AgentRequest) -> Capability {
-    match request {
-        AgentRequest::Ping { .. }
-        | AgentRequest::ReadMemory { .. }
-        | AgentRequest::ReadRegisters { .. }
-        | AgentRequest::DrainEvents { .. } => Capability::MemRead,
-        AgentRequest::WriteMemory { .. } => Capability::MemWrite,
-        AgentRequest::SetBreakpoint { .. } | AgentRequest::ClearBreakpoint { .. } => {
-            Capability::Breakpoint
-        }
-        AgentRequest::SingleStep { .. } | AgentRequest::RunTo { .. } => Capability::SingleStep,
-        AgentRequest::Continue | AgentRequest::Pause => Capability::ProcessControl,
-        AgentRequest::LoadScript { .. } | AgentRequest::UnloadScript { .. } => {
-            Capability::ScriptLoad
-        }
-        AgentRequest::StartTrace { .. } | AgentRequest::StopTrace => Capability::TraceRecord,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::MemoryTransport;
+    use pinbridge_core::capability::Capability;
 
     fn scripted(response: &AgentResponse) -> MemoryTransport {
         MemoryTransport::new([serde_json::to_vec(response).unwrap()])
@@ -480,19 +288,19 @@ mod tests {
         // 每个请求类型都必须映射到某个能力；这里逐个断言，防止将来新增请求
         // 悄悄落到兜底分支而失去权限约束。
         assert_eq!(
-            required_capability(&AgentRequest::Ping { wire_version: 1 }),
+            AgentRequest::Ping { wire_version: 1 }.required_capability(),
             Capability::MemRead
         );
         assert_eq!(
-            required_capability(&AgentRequest::Continue),
+            AgentRequest::Continue.required_capability(),
             Capability::ProcessControl
         );
         assert_eq!(
-            required_capability(&AgentRequest::StopTrace),
+            AgentRequest::StopTrace.required_capability(),
             Capability::TraceRecord
         );
         assert_eq!(
-            required_capability(&AgentRequest::UnloadScript { script: 1 }),
+            AgentRequest::UnloadScript { script: 1 }.required_capability(),
             Capability::ScriptLoad
         );
     }

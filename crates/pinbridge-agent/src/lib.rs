@@ -35,5 +35,7 @@
 
 pub mod exports;
 pub mod host;
+pub mod link;
 
 pub use host::{AgentHost, AgentState};
+pub use link::LinkServer;

@@ -13,9 +13,15 @@ publish.workspace = true
 [dependencies]
 pinbridge-core.workspace = true
 pinbridge-proto.workspace = true
-pinbridge-trace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# 只用于集成测试：让"Hub 侧客户端 → 真实回环链路 → 真实 agent"这条路径
+# 能被真的跑起来。方向是 client → agent，**反向不允许**（agent 依赖 client
+# 会形成环，也会让"谁驱动谁"这件事在依赖图里说不清）。
+pinbridge-agent = { path = "../pinbridge-agent" }
+pinbridge-trace.workspace = true
 
 [lints]
 workspace = true

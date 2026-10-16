@@ -16,8 +16,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pinbridge-core.workspace = true
+pinbridge-proto.workspace = true
 pinbridge-sys.workspace = true
 pinbridge-trace.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 
 [features]

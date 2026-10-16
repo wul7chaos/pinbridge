@@ -34,10 +34,15 @@
 ### `pinbridge-proto` —— 线路协议
 
 * `frames.rs`：`Request` / `Response` / `ControlCommand`，以及面向 AI 的事件视图。
+* `agent_link.rs`：Hub ↔ agent 的请求/响应类型**与那张能力表**
+  （`AgentRequest::required_capability`）。放在这里而不是 client 里，是因为
+  连接的两端（Hub 与目标侧 agent）必须用同一份定义——两侧各写一份，
+  "同一条命令需要什么权限"迟早会分叉。
 * `codec.rs`：行分隔 JSON，单帧上限 4 MiB（防一条坏包打满内存）。
 * `mcp.rs`：MCP 工具描述表（名字、说明、JSON Schema、所需能力、是否在目标内执行）。
 
 **改动提示**：字段删除/改名要提升 `WIRE_VERSION`；新增可选字段不需要。
+新增请求类型要同步 `required_capability` 与 `docs/specs/ipc-protocol.md`。
 
 ### `pinbridge-trace` —— 事件与轨迹
 
@@ -60,8 +65,10 @@
 ### `pinbridge-client` —— Hub → agent
 
 * `Transport` 抽象（`MemoryTransport` 用于测试、`TcpTransport` 用于真链路）。
-* `AgentRequest`/`AgentResponse`（带 `req`/`res` 标签的 JSON）。
+* `AgentClient`：请求/响应类型来自 `pinbridge-proto::agent_link`（见上），
+  本 crate 只加"超时、能力快照、错误翻译"这三件客户端该管的事。
 * **客户端侧也校验能力**：agent 侧还会再校验一次（双端校验）。
+  客户端侧那一关的意义是"报文不出门"，目标侧那一关才是真正的边界。
 
 **安全约束**：`TcpTransport::connect` 拒绝非回环地址。这不是可配置项。
 
@@ -75,7 +82,12 @@
 
 * `host.rs`：全局状态（一把 `Mutex`）、能力校验、事件采集热路径、本地录制器。
 * `exports.rs`：C ABI 导出面。**桩函数先校验能力再返回 `not_supported`**——
-  顺序不能反，否则权限链路在 M0 无法被测试覆盖。
+  顺序不能反，否则权限链路在 M0 无法被测试覆盖。状态码与错误文本也必须一致
+  （早期写法是"先报 Internal 再重映射成 not_supported"，于是文本里留着
+  "内部错误: 轨迹错误"，读日志的人会以为发现了缺陷，而不是"这功能还没做"）。
+* `link.rs`：**回环链路的服务端**。它不自己判断权限，而是转发给
+  `exports::pb_*`——两条入口（C ABI 与回环链路）因此不可能对"该不该放行"产生分歧。
+  规范见 [docs/specs/ipc-protocol.md](../specs/ipc-protocol.md) 的"agent 链路"一节。
 * 允许 `unsafe`（同 `sys`）。
 
 ### `pinbridge-mcp` —— MCP 工具层
@@ -120,7 +132,7 @@
 | 会被外部（AI/CLI/工作台）看到的数据结构 | `pinbridge-proto` |
 | 事件、轨迹、压缩 | `pinbridge-trace` |
 | 会话编排、权限判断、脚本生命周期 | `pinbridge-hub` |
-| 与目标进程说话 | `pinbridge-client`（协议）/ `pinbridge-sys`（C ABI） |
+| 与目标进程说话 | `pinbridge-proto`（协议类型）/ `pinbridge-client`（客户端）/ `pinbridge-sys`（C ABI） |
 | 跑在目标进程里的逻辑 | `pinbridge-agent` |
 | 暴露给 AI 的动作 | `pinbridge-mcp`（工具表要同步 `docs/specs/mcp-tools.md`） |
 | 人用的命令行 | `pinbridge-cli` |

@@ -79,8 +79,10 @@ name = "pinbridge-agent"
 version = "0.1.0"
 dependencies = [
  "pinbridge-core",
+ "pinbridge-proto",
  "pinbridge-sys",
  "pinbridge-trace",
+ "serde_json",
  "sha2",
 ]
 
@@ -99,6 +101,7 @@ dependencies = [
 name = "pinbridge-client"
 version = "0.1.0"
 dependencies = [
+ "pinbridge-agent",
  "pinbridge-core",
  "pinbridge-proto",
  "pinbridge-trace",

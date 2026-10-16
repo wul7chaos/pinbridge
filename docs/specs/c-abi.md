@@ -111,7 +111,7 @@ typedef struct pb_event_raw {
 | `pb_start_trace` / `pb_stop_trace` | `trace_record` | 完整 |
 | `pb_memory_read` | `mem_read` | **桩** |
 | `pb_memory_write` | `mem_write` | **桩** |
-| `pb_set_breakpoint` | `breakpoint` | **桩** |
+| `pb_set_breakpoint` / `pb_clear_breakpoint` | `breakpoint` | **桩** |
 | `pb_single_step` / `pb_continue` / `pb_pause` | `single_step` / `process_control` | **桩** |
 | `pb_load_script` | `script_load` | **桩** |
 
@@ -123,6 +123,17 @@ typedef struct pb_event_raw {
 在 M0 阶段就无法被测试覆盖；等 M1 把桩换成真实现时，这条链路会**第一次**
 被真正执行——那是最不适合发现权限漏洞的时机。
 （`crates/pinbridge-agent/src/exports.rs` 的 `abi_surface_smoke` 就是在测这个顺序。）
+
+**状态码与错误文本必须一致**：早期实现先用 `Error::Trace` 走通用映射、
+再把码重映射成 `not_supported`，于是 `pb_last_error()` 里留着
+"内部错误: 轨迹错误: …"。读日志的人会以为发现了缺陷，而事实是"这功能还没做"。
+现在 `stub()` 直接以 `Status::NotSupported` 写文本，两者不会错配。
+
+### 追加导出是允许的（不需要提升版本）
+
+`pb_clear_breakpoint` 就是例子：新的导出**只有主动解析它的人会用到**，
+老的加载器不解析它，因此不影响二进制兼容。判据是"老的调用方会不会因此行为改变"——
+改变必须提升 `PB_ABI_VERSION`；单纯的追加不需要。
 
 ### tool 侧（C++ 导出，Hub 通过 `pinbridge-sys` 加载）
 

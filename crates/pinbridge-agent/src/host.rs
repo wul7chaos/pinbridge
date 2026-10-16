@@ -139,9 +139,19 @@ impl AgentState {
 
     /// 设置错误并返回对应状态码。**每次失败都必须设置**，
     /// 否则 C++ 侧只能拿到一个整数，无法向人或 AI 解释发生了什么。
+    ///
+    /// 文本形状：`<状态短名>: <细节>`。但如果细节本身就是从状态派生的
+    /// （例如 `Error::CapabilityDenied` 的 Display 已经以"能力不足"开头），
+    /// 就不再重复加前缀——实测出现过 `能力不足: 能力不足: 需要 …` 这种
+    /// 读起来像 bug 的文本，而它是会直接送给 AI 的。
     pub fn fail(&mut self, status: Status, message: &str) -> i32 {
-        let text = format!("{}: {message}", status.message());
-        self.last_error = CString::new(text).unwrap_or_default();
+        let label = status.message();
+        self.last_error = CString::new(if message.starts_with(label) {
+            message.to_string()
+        } else {
+            format!("{label}: {message}")
+        })
+        .unwrap_or_default();
         status.code()
     }
 

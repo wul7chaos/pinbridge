@@ -24,6 +24,21 @@
 
 M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与验证方式先钉死"。
 
+### 新增（M0.5：Hub ↔ agent 回环链路）
+- `pinbridge-agent/src/link.rs`：目标侧的**回环链路服务端**。它不自己判断权限，
+  而是转发给 `exports::pb_*`——两条入口（C ABI 与回环链路）因此不可能对
+  "该不该放行"产生分歧。只监听 `127.0.0.1`（没有地址参数，不是默认值而是设计）。
+- `pinbridge-proto/src/agent_link.rs`：`AgentRequest`/`AgentResponse`/`EventDto`
+  **以及那张能力表**从 client 移到 proto，让连接的两端用同一份定义；
+  新增请求类型若不登记能力会被测试拦下。
+- `link.rs` 的健壮性：单帧上限、超大帧拒绝（不按声明长度分配内存）、
+  非法 JSON 回结构化错误、空闲超时（对端消失不会让服务端线程永久阻塞）、
+  50 行一条注释说明"`from` 只做向前过滤"。
+- `crates/pinbridge-client/tests/agent_link_end_to_end.rs`：真 socket 握手、
+  版本协商、**双端闸门可区分**（客户端拦下的请求根本不到服务端，服务端只收到 5 条）、
+  事件过链路逐字段完好。
+- `pb_clear_breakpoint` 追加导出（只有"下"没有"清"会让使用者无法收回断点）。
+
 ### 新增（M0.5：C++ 桥接层）
 - `native/src/agent_bridge.cpp` → `pinbridge_bridge.dll`：导出 Hub 期望的 8 个
   tool 符号并转发给真实 agent DLL。**不需要 Intel Pin**，因此"Hub ↔ agent"
@@ -41,6 +56,14 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - `scripts/verify.ps1` 新增 native 步骤（装了 VS 就自动跑）。
 
 ### 修复
+- `pinbridge-agent` 的桩实现状态码与错误文本不一致：内部先用 `Error::Trace` 走通用
+  映射、再把码重映射成 `not_supported`，于是 `pb_last_error()` 里留着
+  "内部错误: 轨迹错误: …"。现在 `stub()` 直接以 `NotSupported` 写文本，
+  并删掉了 `mapped()` 这个重映射补丁。能力不足的文本也不再出现
+  "能力不足: 能力不足:" 这种重复前缀。
+- 链接路测试的偶发失败（"推 3 条取回 8 条"）：测试夹具的队列清理只排一次 64 条，
+  上一个用例留下的多余事件会混进断言。现在循环拉空到 0，
+  并把这条坑写进了夹具的注释（复位必须"干净"，不是"差不多干净"）。
 - `pinbridge-sys` 在能力不足时把 `needed` 固定填成 `MemRead`：AI 会读到
   "需要 mem_read"并去申请一个它其实已经有的能力。`to_error`/`check` 现在
   要求调用方传入真实需要的能力；`Api` 记住下发过的能力集，`held` 如实回报。

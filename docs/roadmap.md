@@ -45,6 +45,7 @@
 | 反向用例：agent 缺失时必须明确失败 | `ctest` 的 `bridge_missing_agent` 通过（错误文本给出**尝试过的路径**） |
 | 能力闸门跨语言生效 | 只读基线（257）调用 `pause` → `CapabilityDenied{needed: ProcessControl, held: 257}`；给出全量能力位后 → `NotSupported`（两道闸门可区分） |
 | **Hub 侧加载器端到端** | `crates/pinbridge-sys/tests/bridge_end_to_end.rs`：真实 `LoadLibraryA` → 校验 ABI v1 → `attach` → 下发能力 → 驱动事件 → 取回错误文本 |
+| **Hub ↔ agent 回环链路** | `crates/pinbridge-agent/src/link.rs`（服务端）+ `pinbridge-proto::agent_link`（两端共用的协议与能力表）+ `crates/pinbridge-client/tests/agent_link_end_to_end.rs`：真 socket 握手、版本协商、**双端闸门可区分**、事件过链路、对端消失不阻塞 |
 | 跨平台 lint 不再靠 CI 抓 | `scripts/verify.ps1` 内置 `cargo clippy --target x86_64-unknown-linux-gnu` |
 
 **这一阶段顺带修掉的真实缺陷**（都是"跑起来才暴露"的）：
@@ -65,12 +66,12 @@
 |------|------|
 | ~~`pinbridge-sys` 加载器端到端~~ | ✅ M0.5 已完成（真实 DLL，真实 ABI 校验） |
 | ~~agent 加载与调用转发的桥接拓扑~~ | ✅ M0.5 已完成（`agent_bridge.cpp`，Pin tool 复用同一拓扑） |
+| ~~Hub ↔ agent 回环链路（真实握手、版本协商、重连）~~ | ✅ M0.5 已完成（`link.rs` + 两端共用协议；连接断开后重新 `ping` 即可，状态属于进程而不属于连接） |
 | `pinbridge.dll`：Pin tool 入口、探针注册、JIT 上下文 | ⏳ 需要 Pin SDK |
 | agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ |
 | 脚本沙箱白名单（禁 `os`/`ctypes`/`socket`/写文件） | ⏳ |
 | 脚本执行时间预算（超时 → `TimedOut` + 强制卸载） | ⏳ |
 | 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |
-| Hub ↔ agent 回环链路（真实握手、版本协商、重连） | ⏳ M0.5 已铺好桥接层，剩下的是 NDJSON 会话层 |
 | MCP 新增工具：`pb_modules` / `pb_registers` | ⏳ |
 
 | 验收标准 | 判据 |

@@ -32,7 +32,6 @@
 use std::os::raw::{c_char, c_int, c_uint};
 
 use pinbridge_core::capability::Capability;
-use pinbridge_core::error::Error;
 use pinbridge_sys::abi::{cstr_to_string, PbEventRaw, Status, PB_ABI_VERSION};
 
 use crate::host::{kind_name, AgentHost};
@@ -229,15 +228,7 @@ pub unsafe extern "C" fn pb_memory_read(
     }
     // SAFETY: out_written 已判空
     unsafe { *out_written = 0 };
-    mapped(
-        AgentHost::call(|state| {
-            state.require(Capability::MemRead)?;
-            Err(Error::Trace(
-                "pb_memory_read: 需要 Pin 运行时（M0 桩实现，见 docs/roadmap.md 的 M1）".into(),
-            ))
-        }),
-        Status::NotSupported,
-    )
+    stub(Capability::MemRead, "pb_memory_read")
 }
 
 /// 写目标内存（M0 桩）。
@@ -252,21 +243,23 @@ pub unsafe extern "C" fn pb_memory_write(_address: u64, bytes: *const u8, length
             state.fail(Status::InvalidArgument, "pb_memory_write: bytes 为空指针")
         });
     }
-    mapped(
-        AgentHost::call(|state| {
-            state.require(Capability::MemWrite)?;
-            Err(Error::Trace(
-                "pb_memory_write: 需要 Pin 运行时（M0 桩实现）".into(),
-            ))
-        }),
-        Status::NotSupported,
-    )
+    stub(Capability::MemWrite, "pb_memory_write")
 }
 
 /// 下断点（M0 桩）。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_set_breakpoint(_address: u64) -> c_int {
     stub(Capability::Breakpoint, "pb_set_breakpoint")
+}
+
+/// 清断点（M0 桩）。
+///
+/// 与 `pb_set_breakpoint` 成对存在：只给"下"不给"清"的接口会让使用者
+/// （尤其是 AI）在换策略时无法收回已经下过的断点，只能重启会话。
+/// 这是 ABI 的**追加**导出，老的加载器不解析它，因此不需要提升 `PB_ABI_VERSION`。
+#[unsafe(no_mangle)]
+pub extern "C" fn pb_clear_breakpoint(_address: u64) -> c_int {
+    stub(Capability::Breakpoint, "pb_clear_breakpoint")
 }
 
 /// 单步（M0 桩）。
@@ -313,19 +306,14 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
             )
         });
     };
-    mapped(
-        AgentHost::call(|state| {
-            state.require(Capability::ScriptLoad)?;
-            if script_name.trim().is_empty() || script_source.trim().is_empty() {
-                return Err(Error::Script("脚本名或正文为空".into()));
-            }
-            Err(Error::Trace(
-                "pb_load_script: 需要内嵌 CPython 运行时（M0 桩实现，见 docs/roadmap.md 的 M1）"
-                    .into(),
-            ))
-        }),
-        Status::NotSupported,
-    )
+    // 空名/空正文是**调用方的 bug**，不是"权限"也不是"未实现"：
+    // 先按 invalid_argument 报出来，别让它退化成一句含糊的"不支持"。
+    if script_name.trim().is_empty() || script_source.trim().is_empty() {
+        return AgentHost::with(|state| {
+            state.fail(Status::InvalidArgument, "pb_load_script: 脚本名或正文为空")
+        });
+    }
+    stub(Capability::ScriptLoad, "pb_load_script")
 }
 
 /// 开始录制轨迹（M0 已可用）。
@@ -397,28 +385,15 @@ pub unsafe extern "C" fn pb_stop_trace(out_records: *mut u64, out_events: *mut u
 ///
 /// 顺序不能反（见文件头说明）：先校验能力才能让"权限链路"在 M0 阶段就被测试覆盖。
 fn stub(capability: Capability, what: &str) -> c_int {
-    mapped(
-        AgentHost::call(|state| {
-            state.require(capability)?;
-            Err(Error::Trace(format!(
-                "{what}: 需要 Pin 运行时（M0 桩实现）"
-            )))
-        }),
-        Status::NotSupported,
-    )
-}
-
-/// 把 `Internal` 重映射成"未实现"。
-///
-/// 为什么需要它：桩实现内部用的是 `Error::Trace`（因为它确实是个"能力之外"的
-/// 执行问题），但对外必须报 `not_supported`——让调用方一眼看出"这条路径还没做"，
-/// 而不是"出错了"。这两者的排查方向完全不同。
-fn mapped(code: c_int, fallback: Status) -> c_int {
-    if code == Status::Internal.code() {
-        fallback.code()
-    } else {
-        code
-    }
+    AgentHost::with(|state| match state.require(capability) {
+        Ok(()) => state.fail(
+            Status::NotSupported,
+            &format!("{what}: 需要 Pin 运行时的支撑（M0 桩实现，见 docs/roadmap.md 的 M1）"),
+        ),
+        // 能力不足的文本由 Error 自己给（"能力不足: 需要 X，当前持有 Y"），
+        // 这里只补上状态码，避免出现"码说不支持、文本说能力不足"的错配。
+        Err(error) => state.fail(Status::CapabilityDenied, &error.to_string()),
+    })
 }
 
 #[cfg(test)]
