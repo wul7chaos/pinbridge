@@ -1675,8 +1675,14 @@ bool hand_coverage_to_agent(bool capped) {
     report("采集覆盖交给转发层失败：%d %s", code, last_error_text().c_str());
     return false;
   }
-  report("采集覆盖已交给转发层（将写进轨迹的 AUDIT 通道，capped=%s）",
-         capped ? "是" : "否");
+  // **往返验证**：设完之后立刻回读（`pb_stats(5)` = agent 存下的插装点数）。
+  // 返回 0 不等于生效——第 37 轮就是"返回 0 但轨迹里没有覆盖行"，而这个回读
+  // 能把两种可能分开：读回一致 ⇒ 静态确实设上了（问题在收尾的写入）；
+  // 读回 u64::MAX ⇒ agent 那边根本没有这份记录（问题在这次调用）。
+  const UINT64 read_back = g_api.stats != nullptr ? g_api.stats(5) : 0;
+  report("采集覆盖已交给转发层（capped=%s）；回读 agent 存下的插装点 = %s",
+         capped ? "是" : "否",
+         read_back == UINT64_MAX ? "无记录（交付失败）" : "一致");
   return true;
 }
 

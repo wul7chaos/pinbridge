@@ -555,6 +555,12 @@ pub extern "C" fn pb_stats(which: c_uint) -> u64 {
         // 就成了一个只能靠猜的问题。
         3 => state.paused_skipped(),
         4 => u64::from(state.is_paused()),
+        // 5 = 工具报来的「采集覆盖」里的插装点数。
+        //
+        // 它存在的唯一目的是**往返验证**：工具设完之后可以回读这个数，
+        // 从而区分"调用真的作用到了 agent 的静态上"与"返回 0 但其实没生效"。
+        // 第 37 轮就是卡在这个区分上——工具报成功、轨迹里却没有覆盖行。
+        5 => crate::host::coverage().map_or(u64::MAX, |coverage| coverage.sites),
         _ => 0,
     })
 }

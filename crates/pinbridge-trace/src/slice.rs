@@ -66,9 +66,12 @@ pub struct CoverageGap {
 /// 解析失败返回 `None`（老轨迹、或者录制方没有这套元信息），**不猜**。
 #[must_use]
 pub fn parse_coverage_audit(audit: &str) -> Option<CoverageGap> {
+    // 取**最后**一条：工具会在运行期多次交出覆盖（抓到第一条事件时、探针软停时），
+    // 最新的那条才是最终状态（例如软停那条带着 `capped=1`）。取第一条会把
+    // 「上限用尽」这条最关键的信息漏掉——**而它恰恰是「没采到」与「没发生」的分界**。
     let line = audit
         .lines()
-        .find(|line| line.starts_with("pb_coverage "))?;
+        .rfind(|line| line.starts_with("pb_coverage "))?;
     let mut gap = CoverageGap::default();
     let mut seen_any = false;
     for field in line.split_whitespace().skip(1) {
@@ -608,5 +611,19 @@ mod tests {
         let capped_at = text.find("达到事件上限").unwrap();
         let conclusion_at = text.find("没有观察到写入").unwrap();
         assert!(capped_at < conclusion_at, "告警要在结论之前");
+    }
+
+    /// 多条覆盖记录时**取最后一条**：工具会在运行期多次交出（首个事件、软停），
+    /// 最新的才是最终状态。取第一条会把"上限用尽"这一关键信息漏掉。
+    #[test]
+    fn the_last_coverage_record_wins() {
+        let gap = parse_coverage_audit(
+            "pb_coverage mem_write_sites=10 skipped_no_after=1 unreadable=0 filtered=0 capped=0\n\
+             pb_coverage mem_write_sites=1452 skipped_no_after=245 unreadable=0 filtered=0 capped=1\n",
+        )
+        .expect("应当解析出覆盖");
+        assert_eq!(gap.sites, 1452, "最新那条胜出");
+        assert_eq!(gap.skipped, 245);
+        assert!(gap.capped, "软停的标记不能丢");
     }
 }

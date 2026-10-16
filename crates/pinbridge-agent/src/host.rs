@@ -64,11 +64,32 @@ pub struct Coverage {
 
 static COVERAGE: std::sync::Mutex<Option<Coverage>> = std::sync::Mutex::new(None);
 
-/// 记录工具侧报来的采集覆盖。
+/// 记录工具侧报来的采集覆盖，并**立刻**把它写进正在录制的轨迹的 `AUDIT` 通道。
+///
+/// **为什么是"立刻"而不是"收尾时"**：Pin 工具的收尾（Fini）**晚于**目标对 DLL 的
+/// 卸载，桥接层的卸载保护会拒绝那次 `pb_stop_trace`（返回 `NOT_ATTACHED`）——
+/// 这是项目里**已知且刻意**的取舍（见 `pinbridge_tool.cpp` 的说明）。
+/// 结论很直接：写在 `stop_trace` 里的任何 AUDIT 行，在 Pin 这条路径上
+/// **永远不会出现**。所以覆盖必须在**收到的那一刻**就落盘（agent 持有文件，
+/// `audit_line` 是直接写文件、不缓冲）。
+///
+/// 收尾那次写入保留为**尽力而为**：走 Hub 停机等路径时 `stop_trace` 是能成功的，
+/// 那时它会覆盖成最新值。
 pub fn set_coverage(coverage: Coverage) {
     if let Ok(mut slot) = COVERAGE.lock() {
         *slot = Some(coverage);
     }
+    let line = format!(
+        "pb_coverage mem_write_sites={} skipped_no_after={} unreadable={} filtered={} capped={}",
+        coverage.sites,
+        coverage.skipped,
+        coverage.unreadable,
+        coverage.filtered,
+        u8::from(coverage.capped)
+    );
+    // 失败不改变返回值：覆盖是**元信息**，写不进去不该让采集本身失败；
+    // 而"写没写进去"由工具侧的回读（`pb_stats(5)`）与文件内容各自可查。
+    let _ = AgentHost::with(|state| state.note_coverage_audit(&line));
 }
 
 /// 读回当前记录（供测试与离线工具对照）。
@@ -509,6 +530,17 @@ impl AgentState {
         Ok(())
     }
 
+    /// 把一条覆盖记录写进**正在录制**的轨迹的 AUDIT 通道。
+    ///
+    /// 没有在录制时返回 `Ok(())`：这不是错误（工具有可能在录制开始前就报覆盖，
+    /// 那时没有文件可写），调用方也不该因此失败。
+    pub fn note_coverage_audit(&mut self, line: &str) -> Result<()> {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return Ok(());
+        };
+        recorder.audit(line)
+    }
+
     /// 停止录制并返回汇总。
     pub fn stop_trace(&mut self) -> Result<Summary> {
         let Some(mut recorder) = self.recorder.take() else {
@@ -529,6 +561,13 @@ impl AgentState {
         // 都会被丢掉（第 35 轮实测：`溢出丢弃 10252 条`，轨迹里连
         // `state_change` 都没有）。而 agent 是**拥有文件并负责收尾**的一方，
         // 在这里写一定进得去。
+        // 先写一条**起点标记**：它证明"收尾路径确实走到了 AUDIT 写入这一步"。
+        // 与后面的覆盖行合起来就能区分两种失败：标记在、覆盖不在 ⇒ 覆盖没送到
+        // agent（交付断点）；两者都不在 ⇒ AUDIT 通道本身在实机路径上没写进去。
+        // （第 37 轮只剩这两种可能，而当时没有数据能区分。）
+        recorder
+            .writer
+            .audit_line("pb_finish begin：收尾开始，下面若有 pb_coverage 即为工具报来的覆盖")?;
         if let Some(line) = coverage_audit_line() {
             recorder.writer.audit_line(&line)?;
         }
