@@ -29,7 +29,9 @@
 //! * `pb_last_error` 返回的指针在**下一次修改错误状态之前**有效；
 //!   调用方必须立刻拷贝，不得跨调用保存。
 
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint};
+use std::sync::OnceLock;
 
 use pinbridge_core::capability::Capability;
 use pinbridge_sys::abi::{cstr_to_string, PbEventRaw, Status, PB_ABI_VERSION};
@@ -385,7 +387,164 @@ fn flush_breakpoint_hits() {
     }
 }
 
-/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走 3=暂停期间跳过 4=是否暂停。
+/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。/// 保存某个线程的寄存器快照（由 Pin 工具侧在探针命中时捕获后交来）。
+///
+/// **为什么不让 agent 自己抓**：agent 在目标进程里，但它拿到的"当前线程"永远
+/// 是**为请求服务的那条线程**（Link 线程 / 冲刷线程），而不是探针命中的那条。
+/// 那份寄存器和用户想看的东西毫无关系，却看起来像合法数据——这是最坏的组合。
+/// 所以快照只能由**在正确线程上执行**的一侧捕获（Pin 的工具回调），
+/// agent 负责存与取。
+///
+/// # Safety
+///
+/// `values` 必须指向至少 `count` 个 `u64`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pb_set_thread_registers(
+    thread: u32,
+    values: *const u64,
+    count: u32,
+) -> c_int {
+    if values.is_null() {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::InvalidArgument,
+                "pb_set_thread_registers: values 为空指针",
+            )
+        });
+    }
+    if count == 0 {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::InvalidArgument,
+                "pb_set_thread_registers: count 为 0",
+            )
+        });
+    }
+    // SAFETY: 由调用方保证 values 至少 count 个元素
+    let slice = unsafe { std::slice::from_raw_parts(values, count as usize) };
+    // `AgentHost::call` 已经把错误映射成状态码并写好 last_error（宽度不符会走
+    // `Error::Protocol` → `InvalidArgument`），所以这里只补一句成功时的说明。
+    let code = AgentHost::call(|state| state.set_thread_registers(thread, slice));
+    if code == Status::Ok.code() {
+        AgentHost::with(|state| {
+            state.fail(
+                Status::Ok,
+                &format!("pb_set_thread_registers: 线程 {thread} 的快照已保存（{count} 个）"),
+            )
+        })
+    } else {
+        code
+    }
+}
+
+/// 取某个线程最近的寄存器快照。
+///
+/// 能力闸门是 `MemRead`：它和"读目标内存"是同一类信息（进程状态快照），
+/// 而且协议侧 `ReadRegisters` 一直映射到这个能力位——这里保持一致，
+/// 免得出现"协议说需要 A、实现说需要 B"的分叉。
+///
+/// # Safety
+///
+/// `out` 必须指向至少 `capacity` 个 `u64`；`written` 必须指向一个有效的 `u32`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pb_read_registers(
+    thread: u32,
+    out: *mut u64,
+    capacity: u32,
+    written: *mut u32,
+) -> c_int {
+    if out.is_null() || written.is_null() {
+        return AgentHost::with(|state| {
+            state.fail(Status::InvalidArgument, "pb_read_registers: 出参为空指针")
+        });
+    }
+    if capacity == 0 {
+        return AgentHost::with(|state| {
+            state.fail(Status::InvalidArgument, "pb_read_registers: capacity 为 0")
+        });
+    }
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::MemRead)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    let snapshot = AgentHost::with(|state| state.thread_registers(thread).map(<[u64]>::to_vec));
+    let Some(values) = snapshot else {
+        let known = AgentHost::with(|state| state.threads_with_registers());
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::InvalidArgument,
+                &format!(
+                    "pb_read_registers: 线程 {thread} 没有快照（有快照的线程：{known:?}）。\
+                     快照只在探针命中时由 Pin 工具捕获，没命中过就没有"
+                ),
+            )
+        });
+    };
+    let count = values.len().min(capacity as usize);
+    // SAFETY: 由调用方保证 out 至少 capacity 个元素
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), out, count);
+        *written = count as u32;
+    }
+    Status::Ok.code()
+}
+
+/// 取第 `index` 个寄存器的名字（永不返回 NULL，越界返回空串）。
+///
+/// 与 `pb_kind_name` 同一形状：跨语言边界上返回**静态字符串**，
+/// 调用方立刻拷贝即可，不涉及生命周期问题。
+#[unsafe(no_mangle)]
+pub extern "C" fn pb_register_name(index: u32) -> *const c_char {
+    static NAMES: OnceLock<Vec<CString>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        pinbridge_trace::REGISTER_NAMES
+            .iter()
+            .map(|name| CString::new(*name).unwrap_or_default())
+            .collect()
+    });
+    // 空串而不是 NULL：调用方不必为"没有这个名字"再写一条分支
+    static EMPTY: OnceLock<CString> = OnceLock::new();
+    let empty = EMPTY.get_or_init(|| CString::new("").unwrap_or_default());
+    names
+        .get(index as usize)
+        .map_or(empty.as_ptr(), |name| name.as_ptr())
+}
+
+/// 有寄存器快照的线程 ID（写进 `out`，返回写入个数）。
+///
+/// 存在的理由：调用方通常只有"事件里的 thread_id"，但**第一次**问寄存器时
+/// 它可能还不知道该问哪个线程。能枚举比"猜一个线程号再被拒"好。
+///
+/// # Safety
+///
+/// `out` 必须指向至少 `capacity` 个 `u32`；`written` 必须指向有效的 `u32`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pb_thread_ids_with_registers(
+    out: *mut u32,
+    capacity: u32,
+    written: *mut u32,
+) -> c_int {
+    if out.is_null() || written.is_null() {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::InvalidArgument,
+                "pb_thread_ids_with_registers: 出参为空指针",
+            )
+        });
+    }
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::MemRead)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    let threads = AgentHost::with(|state| state.threads_with_registers());
+    let count = threads.len().min(capacity as usize);
+    // SAFETY: 由调用方保证 out 至少 capacity 个元素
+    unsafe {
+        std::ptr::copy_nonoverlapping(threads.as_ptr(), out, count);
+        *written = count as u32;
+    }
+    Status::Ok.code()
+}
+
+/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走 3=暂停期间跳过 4=是否暂停。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_stats(which: c_uint) -> u64 {
     AgentHost::with(|state| match which {
@@ -1234,6 +1393,90 @@ pb.subscribe("syscall_enter", on_syscall)
             guard += 1;
             assert!(guard < 1024, "队列一直取不空，说明有东西在往里推");
         }
+    }
+    /// 寄存器快照：存下来、读回去、名单对得上、没有快照时说清楚。
+    #[test]
+    fn register_snapshots_round_trip_and_say_what_is_missing() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(4242), Status::Ok.code());
+        assert_eq!(
+            pb_set_capabilities(Capability::MemRead.bit()),
+            Status::Ok.code()
+        );
+
+        // 1) 没快照时：明确说出"有快照的线程"是谁，而不是含糊失败
+        let mut values = [0u64; 8];
+        let mut written = 99u32;
+        // SAFETY: 缓冲区与计数都是本栈变量
+        assert_eq!(
+            unsafe { pb_read_registers(77, values.as_mut_ptr(), 8, &mut written) },
+            Status::InvalidArgument.code()
+        );
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("没有快照"), "要说清是缺快照：{text}");
+        assert_eq!(written, 99, "失败时不动 written（不是我们的输出契约）");
+
+        // 2) 存一份（工具侧在探针命中时就是这么交上来的）
+        let snapshot = [0x1400_01000u64, 0x19_FF00, 7, 8, 9, 10, 11, 12];
+        // SAFETY: 快照是 8 个 u64 的栈数组
+        assert_eq!(
+            unsafe { pb_set_thread_registers(4242, snapshot.as_ptr(), 8) },
+            Status::Ok.code()
+        );
+
+        // 3) 读回来，逐个对
+        let mut back = [0u64; 8];
+        let mut count = 0u32;
+        // SAFETY: 同上
+        assert_eq!(
+            unsafe { pb_read_registers(4242, back.as_mut_ptr(), 8, &mut count) },
+            Status::Ok.code()
+        );
+        assert_eq!(count, 8);
+        assert_eq!(back, snapshot, "读写必须逐字节一致");
+        // SAFETY: 静态字符串，立刻使用
+        let rip = unsafe { cstr_to_string(pb_register_name(0)) }.unwrap_or_default();
+        let rdi = unsafe { cstr_to_string(pb_register_name(7)) }.unwrap_or_default();
+        let out_of_range = unsafe { cstr_to_string(pb_register_name(8)) }.unwrap_or_default();
+        assert_eq!((rip.as_str(), rdi.as_str()), ("rip", "rdi"));
+        assert!(out_of_range.is_empty(), "越界返回空串而不是 NULL");
+        println!("✓ 快照往返：{}={:#x} … {}={}", rip, back[0], rdi, back[7]);
+
+        // 4) 宽度不符必须被拒（静默接受会让调用方读到错位的寄存器）
+        // SAFETY: 3 个 u64 的栈数组
+        assert_eq!(
+            unsafe { pb_set_thread_registers(4242, snapshot.as_ptr(), 3) },
+            Status::InvalidArgument.code()
+        );
+
+        // 5) 枚举有快照的线程
+        let mut threads = [0u32; 4];
+        let mut thread_count = 0u32;
+        // SAFETY: 同上
+        assert_eq!(
+            unsafe { pb_thread_ids_with_registers(threads.as_mut_ptr(), 4, &mut thread_count) },
+            Status::Ok.code()
+        );
+        assert!(threads[..thread_count as usize].contains(&4242));
+
+        // 6) 能力闸门：没有 mem_read 时读寄存器要被拒
+        assert_eq!(
+            pb_set_capabilities(Capability::ProcessControl.bit()),
+            Status::Ok.code()
+        );
+        let mut again = [0u64; 8];
+        let mut count2 = 0u32;
+        // SAFETY: 同上
+        assert_eq!(
+            unsafe { pb_read_registers(4242, again.as_mut_ptr(), 8, &mut count2) },
+            Status::CapabilityDenied.code()
+        );
+        assert_eq!(
+            pb_set_capabilities(Capability::MemRead.bit()),
+            Status::Ok.code()
+        );
     }
     /// 暂停/继续的语义：事件被**计数后跳过**，状态变化自己留痕。
     #[test]

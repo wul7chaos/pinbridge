@@ -65,6 +65,15 @@ pub struct AgentState {
     /// "最近一次推送"来判断——按 `next_sequence` 判断会把正常用法误判成落后
     /// （实测过：每次推送都被无意义地 +1）。
     last_pushed: u64,
+    /// 每个线程最近一次的**寄存器快照**（探针命中时刻，由 Pin 工具侧捕获后交来）。
+    ///
+    /// 为什么是"最近一次"而不是"完整历史"：agent 在目标进程里，内存占用必须是
+    /// 有界的——按线程保存 N 份快照会随运行时间线性增长。要历史就去轨迹里找
+    /// （事件带序号与地址），要"此刻"就问这里。
+    ///
+    /// 键是**线程 ID**：工具侧在回调里拿到的 `thread_id` 与事件里的是同一个，
+    /// 调用方据此把"这条事件"和"那时的寄存器"对上。
+    registers: std::collections::BTreeMap<u32, Vec<u64>>,
     /// 是否处于"暂停采集"状态（`pb_pause` / `pb_continue`）。
     paused: bool,
     /// 暂停期间到达、**被计数后跳过**的事件条数。
@@ -104,6 +113,7 @@ impl AgentState {
             recorder: None,
             drained: 0,
             last_pushed: 0,
+            registers: std::collections::BTreeMap::new(),
             paused: false,
             paused_skipped: 0,
         }
@@ -259,6 +269,7 @@ impl AgentState {
             // 那时暂停状态会留着，表现为"刚附加上却收不到事件"。
             self.paused = false;
             self.paused_skipped = 0;
+            self.clear_registers();
         }
         self.attached = attached;
     }
@@ -324,6 +335,42 @@ impl AgentState {
         self.paused_skipped
     }
 
+    /// 保存某个线程最近一次的寄存器快照。
+    ///
+    /// 空/超长的快照直接拒绝：宽度对不上说明工具侧与 agent 侧的布局假设已经
+    /// 分叉，静默接受会让调用方读到**错位的寄存器**（看起来像数据，其实全错）。
+    pub fn set_thread_registers(&mut self, thread: u32, values: &[u64]) -> Result<()> {
+        if values.is_empty() {
+            return Err(Error::Protocol("寄存器快照为空".into()));
+        }
+        if values.len() != pinbridge_trace::REGISTER_COUNT {
+            return Err(Error::Protocol(format!(
+                "寄存器快照宽度是 {}，期望 {}（工具侧与 agent 侧的布局假设已经分叉）",
+                values.len(),
+                pinbridge_trace::REGISTER_COUNT
+            )));
+        }
+        self.registers.insert(thread, values.to_vec());
+        Ok(())
+    }
+
+    /// 取某个线程最近的寄存器快照。
+    #[must_use]
+    pub fn thread_registers(&self, thread: u32) -> Option<&[u64]> {
+        self.registers.get(&thread).map(Vec::as_slice)
+    }
+
+    /// 有快照的线程 ID（升序）。
+    #[must_use]
+    pub fn threads_with_registers(&self) -> Vec<u32> {
+        self.registers.keys().copied().collect()
+    }
+
+    /// 附加（新会话）时清掉旧快照：上一次会话的寄存器对这一次没有意义，
+    /// 留着会让调用方读到**别的进程/别的运行**的值。
+    fn clear_registers(&mut self) {
+        self.registers.clear();
+    }
     /// 切换暂停状态，返回"这次切换是不是真的改变了状态"。
     ///
     /// 返回布尔值而不是无条件成功：重复 `pb_pause()` 是调用方的记账错误，

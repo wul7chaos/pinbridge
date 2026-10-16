@@ -19,7 +19,7 @@ pub mod fold;
 pub mod pbt;
 pub mod varint;
 
-pub use event::{Event, EventKind, MAX_ARGS};
+pub use event::{register_name, Event, EventKind, MAX_ARGS, REGISTER_COUNT, REGISTER_NAMES};
 pub use fold::{expand_records, expand_records_checked, FoldOutcome, RepeatFolder};
 pub use pbt::{PbtReader, PbtWriter, Summary};
 pub use varint::{read_u64, try_read_u64, write_u64, write_zigzag};

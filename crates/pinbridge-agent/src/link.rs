@@ -235,7 +235,7 @@ pub fn dispatch(request: &AgentRequest) -> AgentResponse {
             },
         },
         // 寄存器读取需要 Pin 的上下文访问，M1 落地。
-        AgentRequest::ReadRegisters { .. } => not_supported("read_registers"),
+        AgentRequest::ReadRegisters { thread } => dispatch_read_registers(*thread),
         AgentRequest::Modules {} => dispatch_modules(),
         AgentRequest::SetBreakpoint { address, label } => {
             let _ = label; // 标签只用于审计展示，不参与下发
@@ -271,6 +271,38 @@ pub fn dispatch(request: &AgentRequest) -> AgentResponse {
 ///
 /// 失败时不返回"空列表"：空列表是有含义的（"一个模块都没有"），
 /// 平台不支持或枚举失败必须用错误表达，否则调用方会把"做不到"当成"没有"。
+/// 读某个线程**最近一次**的寄存器快照。
+///
+/// 快照来自 Pin 工具侧（它在探针回调里能拿到真正的 CONTEXT）。agent 自己抓不到
+/// 探针线程的上下文——它拿到的"当前线程"永远是为请求服务的那条线程，
+/// 那份寄存器看起来合法，其实毫无关系。所以这里只存与取。
+fn dispatch_read_registers(thread: u32) -> AgentResponse {
+    let names = pinbridge_trace::REGISTER_NAMES;
+    let mut values = [0u64; pinbridge_trace::REGISTER_COUNT];
+    let mut written = 0u32;
+    // SAFETY: 缓冲区与计数都是本栈变量，且容量与常量一致
+    let code = unsafe {
+        exports::pb_read_registers(
+            thread,
+            values.as_mut_ptr(),
+            pinbridge_trace::REGISTER_COUNT as u32,
+            &mut written,
+        )
+    };
+    if code != Status::Ok.code() {
+        return status_only(code, "read_registers");
+    }
+    let count = written as usize;
+    AgentResponse::Registers {
+        thread,
+        values: names
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(index, name)| ((*name).to_string(), values[index]))
+            .collect(),
+    }
+}
 fn dispatch_modules() -> AgentResponse {
     if !crate::modules::supported() {
         return AgentResponse::Error {
@@ -847,10 +879,7 @@ mod tests {
     #[test]
     fn unimplemented_requests_say_so_explicitly() {
         let _guard = lock_and_reset(Capability::operator_default());
-        for request in [
-            AgentRequest::ReadRegisters { thread: 0 },
-            AgentRequest::RunTo { address: 0x1000 },
-        ] {
+        for request in [AgentRequest::RunTo { address: 0x1000 }] {
             match dispatch(&request) {
                 AgentResponse::Error { code, message } => {
                     assert_eq!(

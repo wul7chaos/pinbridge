@@ -118,6 +118,67 @@ Rust 只保留两个窄入口：
    "这段内存是零"，那是**静默的错误结论**，比报错危险得多。异常文本与 Hub 侧
    完全一致（`能力不足: 需要 MemRead，当前持有 CapabilitySet(0)`）。
 
+## 寄存器：谁负责抓，谁负责存
+
+`pb_registers`（MCP 工具）背后是三段：
+
+```
+Pin 工具回调（唯一能拿到探针线程 CONTEXT 的地方）   抓
+        ↓ pb_set_thread_registers(thread, values, 8)   跨边界，在冲刷线程上
+agent（pb_register_name / pb_read_registers / pb_thread_ids_with_registers）  存与取
+        ↓ 链路 ReadRegisters
+Hub / MCP `pb_registers`                            问
+```
+
+**为什么 agent 不能自己抓**：agent 在目标进程里，但它拿到的"当前线程"永远是
+**为请求服务的那条线程**（Link 线程 / 冲刷线程），而不是探针命中的那条。那份寄存器
+和用户想看的东西毫无关系，却看起来像合法数据——这是最坏的组合。
+
+三段里已完成两段（agent 存与取 + 链路），**捕获段尚未落地**，原因见下。
+
+### 本轮实测：`IARG_CONTEXT` + `PIN_GetContextReg` 在本工具的回调里会 fault
+
+按最直观的写法（插桩点加 `IARG_CONTEXT`，回调里 `PIN_GetContextReg(ctxt, REG_*)`）
+做了一版，结果是稳定崩溃：
+
+```
+E: UPC Dispatcher: Unhandled internal exception in Pin or tool.
+   IP: 0x7ffe6561ffdb  Exception Code: RECEIVED_ACCESS_FAULT
+   Access Type: READ  Access Address = 0xffffffffffffffff
+```
+
+已经排除的可能：
+
+* 不是某个寄存器的问题——只读 `REG_INST_PTR` 一样崩；
+* 不是名字空间的问题——`LEVEL_BASE::REG_INST_PTR` 一样崩；
+* 不是写入的问题——把结果读进一个**局部变量**再丢弃，一样崩；
+* 不是 `IARG_` 顺序不对——入口探针传的是 `IARG_THREAD_ID, IARG_CONTEXT, IARG_INST_PTR`，
+  与回调签名 `(tid, ctxt, address)` 对得上。
+
+所以 `PIN_GetContextReg` 在这个工具（`PIN_StartProgram` + 回调内入队）的上下文里
+**不可用**，而失败模式是"整个目标进程带着 Pin 一起崩"，不是可降级的错误。
+
+**下一步（M2）**：改用 Pin 官方支持的取寄存器方式——`IARG_REG_VALUE`。
+同一个文件里系统调用探针**一直**在用 `IARG_REG_VALUE, LEVEL_BASE::REG_RAX` 读寄存器
+（那是被验证过能工作的路径）。代价是每个命中点要写 8 个 `IARG_REG_VALUE`，回调签名
+多 8 个参数，所以这是"多写几行"而不是"换个 API"。
+
+**这一轮为什么先停在这里**：一条会把目标进程连 Pin 一起打崩的采集路径不能进主干，
+哪怕它"大部分时候能用"。留一个抓不到寄存器的诚实实现（读回来会说"这个线程还没有
+快照"），比留一个偶尔把被测进程打崩的实现要好。
+
+### 追加能力不能变成硬依赖
+
+寄存器快照是 M1 的**追加**能力，所以：
+
+* 桥接层把它当**可选符号**解析：旧版 agent DLL 没有它只是拿不到寄存器，
+  不该让"旧 agent + 新桥接层"这种完全可用的组合直接起不来；
+* Pin 工具侧同样按可选处理（`g_api.set_thread_registers != nullptr` 才交）。
+
+这条曾经被违反过一次：桥接层把它算进"导出面不全"，于是新桥接层配一个稍旧的
+agent DLL 直接 `pb_attach` 失败——**错误信息指向"缺符号"，而真正的问题是
+"我们要求了一个本来可选的符号"**。
+
 ## 暂停 / 继续的语义
 
 **这是"采集"的暂停与继续，不是"目标线程"的暂停与继续。**

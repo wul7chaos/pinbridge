@@ -165,6 +165,20 @@ if (Test-Path $cacheFile) {
     if ($LASTEXITCODE -ne 0) { Die "cmake --build 失败（exit=$LASTEXITCODE）" }
     Ok "产物目录：$BuildDir"
 
+    # 把 agent DLL 也拷进产物目录。
+    #
+    # 为什么必须拷：Pin 工具在目标进程里加载桥接层，而桥接层默认去**自己旁边**
+    # 找 agent DLL。构建目录里那份是**上一次**留下的，于是"新 agent + 旧副本"
+    # 会产生一个非常费解的错误（桥接层报某个新符号缺失，而 target\debug 里那份
+    # 明明有）。实测踩过一次，排查花的时间远超这一行拷贝。
+    if ($agentDll) {
+        $agentCopy = Join-Path $BuildDir 'pinbridge_agent.dll'
+        if ((Resolve-Path $agentDll.FullName).Path -ne (Resolve-Path $agentCopy -ErrorAction SilentlyContinue)?.Path) {
+            Copy-Item $agentDll.FullName $agentCopy -Force
+            Ok "已同步 agent DLL 到产物目录：$agentCopy"
+        }
+    }
+
     # -------------------------------------------------------------------- 5. 测试
     if (-not $SkipTests) {
         if (-not $ctest -or -not (Test-Path $ctest)) { $ctest = (Get-Command ctest -ErrorAction SilentlyContinue)?.Source }

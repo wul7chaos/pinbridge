@@ -12,6 +12,34 @@
 /// 事件参数个数。改动它等于改协议，必须走版本流程。
 pub const MAX_ARGS: usize = 8;
 
+/// 寄存器快照的字段顺序：**跨语言的单一真相**。
+///
+/// C++ 侧（Pin 工具）按这个顺序填、agent 按这个顺序存、Hub 与 Python 按这个
+/// 顺序展示。顺序**不得重排**——重排之后每一侧都还能跑，但值是错位的，
+/// 表现为"能读出来、但读出来的是别的寄存器"。
+///
+/// 名字是 64 位架构的拼写。32 位目标上这些字段仍是 64 位容器（高 32 位为 0），
+/// 名字**刻意不随架构变化**：一份固定名单才能让跨版本对比寄存器值成为可能，
+/// 而"同一个位置在不同架构下叫不同名字"会在分析里制造无谓的歧义。
+pub const REGISTER_NAMES: [&str; REGISTER_COUNT] =
+    ["rip", "rsp", "rax", "rbx", "rcx", "rdx", "rsi", "rdi"];
+
+/// 寄存器快照的字段个数。
+///
+/// 8 是刻意的：它正好等于事件的 `args` 个数，于是"寄存器快照"与"事件参数"
+/// 用同一套搬运代码，不引入第二个宽度常量。
+pub const REGISTER_COUNT: usize = 8;
+
+/// 取第 `index` 个寄存器的名字；越界返回 `None`。
+#[must_use]
+pub const fn register_name(index: usize) -> Option<&'static str> {
+    if index < REGISTER_COUNT {
+        Some(REGISTER_NAMES[index])
+    } else {
+        None
+    }
+}
+
 /// 事件类型。判别值写入文件，**不得重排**；新增只能追加并更新
 /// `docs/specs/pbt-format.md` 的类型表。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

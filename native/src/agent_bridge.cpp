@@ -51,6 +51,7 @@ using fn_set_capabilities = int32_t(PB_CALL*)(uint32_t);
 using fn_continue = int32_t(PB_CALL*)();
 using fn_pause = int32_t(PB_CALL*)();
 using fn_single_step = int32_t(PB_CALL*)(uint32_t);
+using fn_set_thread_registers = int32_t(PB_CALL*)(uint32_t, const uint64_t*, uint32_t);
 using fn_drain_events = int32_t(PB_CALL*)(pb_event_raw*, uint32_t, uint32_t*);
 using fn_last_error = const char*(PB_CALL*)();
 using fn_allocate_sequence = uint64_t(PB_CALL*)();
@@ -76,6 +77,7 @@ struct AgentApi {
   fn_continue resume = nullptr;
   fn_pause pause = nullptr;
   fn_single_step single_step = nullptr;
+  fn_set_thread_registers set_thread_registers = nullptr;
   fn_drain_events drain_events = nullptr;
   fn_last_error last_error = nullptr;
   fn_allocate_sequence allocate_sequence = nullptr;
@@ -234,6 +236,16 @@ void load_agent(AgentApi* api) {
   api->pause = resolve_symbol<fn_pause>(module, "pb_pause", &missing);
   api->single_step =
       resolve_symbol<fn_single_step>(module, "pb_single_step", &missing);
+  // 寄存器快照是**可选**符号：它属于 M1 的追加能力，旧版 agent DLL 没有它
+  // 只是拿不到寄存器（Pin 工具侧也按可选处理）。把它算进"导出面不全"会让
+  // "旧 agent + 新桥接层"这种完全可用的组合直接起不来——**追加能力不该
+  // 变成硬依赖**。
+  {
+    std::string optional_missing;
+    api->set_thread_registers =
+        resolve_symbol<fn_set_thread_registers>(module, "pb_set_thread_registers",
+                                                &optional_missing);
+  }
   api->drain_events = resolve_symbol<fn_drain_events>(module, "pb_drain_events", &missing);
   api->last_error = resolve_symbol<fn_last_error>(module, "pb_last_error", &missing);
   api->allocate_sequence =
@@ -379,6 +391,21 @@ PB_EXPORT int32_t PB_CALL pb_pause(void) {
     return status;
   }
   return agent().pause();
+}
+
+// 寄存器快照：Pin 工具侧在探针命中时捕获，交给 agent 保存（agent 自己抓不到
+// 探针线程的上下文——它拿到的"当前线程"永远是为请求服务的那条线程）。
+PB_EXPORT int32_t PB_CALL pb_set_thread_registers(uint32_t thread, const uint64_t* values,
+                                                  uint32_t count) {
+  if (values == nullptr) {
+    set_error("pb_set_thread_registers: values 为空指针");
+    return PB_STATUS_INVALID_ARGUMENT;
+  }
+  int32_t status = PB_STATUS_OK;
+  if (!require_agent(&status)) {
+    return status;
+  }
+  return agent().set_thread_registers(thread, values, count);
 }
 
 // 单步：与 `pb_pause` 同样的转发形状。它当前**明确未实现**（agent 侧返回

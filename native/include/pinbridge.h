@@ -150,6 +150,16 @@ PB_EXPORT int32_t PB_CALL pb_memory_write(uint64_t address, const uint8_t* bytes
 PB_EXPORT int32_t PB_CALL pb_set_breakpoint(uint64_t address);
 PB_EXPORT int32_t PB_CALL pb_clear_breakpoint(uint64_t address);
 PB_EXPORT int32_t PB_CALL pb_single_step(uint32_t count);  /* 桥接层也导出（转发给 agent） */
+
+/* 保存线程的寄存器快照：由 Pin 工具侧在探针命中时捕获后交来。
+ * 顺序见 crates/pinbridge-trace/src/event.rs 的 REGISTER_NAMES（跨语言单一真相）。 */
+PB_EXPORT int32_t PB_CALL pb_set_thread_registers(uint32_t thread, const uint64_t* values,
+                                                  uint32_t count);
+PB_EXPORT int32_t PB_CALL pb_read_registers(uint32_t thread, uint64_t* out, uint32_t capacity,
+                                            uint32_t* written);
+PB_EXPORT const char* PB_CALL pb_register_name(uint32_t index);
+PB_EXPORT int32_t PB_CALL pb_thread_ids_with_registers(uint32_t* out, uint32_t capacity,
+                                                       uint32_t* written);
 PB_EXPORT int32_t PB_CALL pb_continue(void);
 PB_EXPORT int32_t PB_CALL pb_pause(void);
 PB_EXPORT int32_t PB_CALL pb_load_script(const char* name, const char* source);
