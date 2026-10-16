@@ -426,6 +426,41 @@ if(BUILD_TESTING)
       set_tests_properties(pin_tool_tf_per_thread PROPERTIES
         PASS_REGULAR_EXPRESSION "TF 每线程：置位 3,3 / 清除 3,3"
         FAIL_REGULAR_EXPRESSION "Unhandled internal exception")
+      # ── 事件前置过滤（M2）：同一负载下，"溢出丢弃"从非零降到 0 ──────────
+      #
+      # 先记录**没有过滤时**的行为：同一负载（5000 次系统调用）会显著超过
+      # 环形缓冲的冲刷能力，于是丢事件。这条用例存在的意义是让"过滤真的解决了
+      # 一个问题"有据可查——否则"过滤后不丢"可能只是因为负载本来就不大。
+      add_test(NAME pin_tool_syscall_drops_without_filter
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_syscalls 1
+                -pb_syscall_max 200000
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --syscalls 5000)
+      set_tests_properties(pin_tool_syscall_drops_without_filter PROPERTIES
+        PASS_REGULAR_EXPRESSION "溢出丢弃 [1-9][0-9]* 条"
+        FAIL_REGULAR_EXPRESSION "Unhandled internal exception")
+
+      # 前置过滤打开：事件在**入队之前**被按比例采掉，缓冲不再溢出。
+      # 判据由两部分构成（一个 PASS 加一个 FAIL 就是"且"）：
+      #   * PASS：报出"有意跳过 N 条"（采样必须如实计数，不能悄悄少事件）
+      #   * FAIL：**任何**非零溢出丢弃都算失败——这正是验收要的那条性质
+      add_test(NAME pin_tool_syscall_prefilter
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_syscalls 1
+                -pb_syscall_max 200000
+                -pb_syscall_sample 16
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --syscalls 5000)
+      set_tests_properties(pin_tool_syscall_prefilter PROPERTIES
+        PASS_REGULAR_EXPRESSION "每 16 条保留 1 条，有意跳过 [1-9][0-9]* 条"
+        FAIL_REGULAR_EXPRESSION "溢出丢弃 [1-9]"
+        SKIP_RETURN_CODE 77)
+
       add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-mem-probe.ps1"

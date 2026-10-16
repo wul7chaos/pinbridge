@@ -127,6 +127,18 @@ KNOB<BOOL> KnobSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_syscalls", "1",
                         "是否插装系统调用（1/0）");
 KNOB<std::string> KnobSyscallMax(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_max", "4096",
                                  "捕获多少条系统调用事件后停止插装（0 表示不限制）");
+// 前置过滤：**在事件进入环形缓冲之前**按比例采样。
+//
+// 为什么必须发生在"入队之前"而不是"出队时再丢"：环形缓冲的价值就是"不丢"，
+// 而一旦生产速率超过冲刷速率，缓冲满之后就**必然**丢（丢最新那些，且只有计数
+// 能说明丢了多少）。在回调里先丢掉大部分，缓冲就再也满不了——代价是拿到的是
+// **代表性样本**，不是全部事件。
+//
+// 所以两件事要一起做：① 采样跳过的条数**如实报出来**（它是"有意采样"，与
+// "溢出丢弃"是两件事，混在一起就分不清"样本少"与"数据丢了"）；
+// ② 采样按**线程**独立计数，两条线程不会互相吃掉对方的样本起点。
+KNOB<std::string> KnobSyscallSample(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_sample", "1",
+                                    "系统调用事件每 N 条保留 1 条（1 = 全部保留；在入队前过滤）");
 // 自动化判据用：捕获数低于这个值时工具**自己以非零退出**。
 // 为什么放在工具里而不是靠测试脚本数日志行：退出码是机器可判定的，
 // 而"数日志里出现了几次"既脆弱又会被日志格式改动打断。
@@ -347,6 +359,10 @@ volatile bool g_last_registers_valid = false;
 // 系统调用探针的开关、上限与观测计数（定义见下方"系统调用探针"一节）
 bool pb_syscall_enabled = true;
 UINT64 g_syscall_cap = 0;
+/// 系统调用事件每 N 条保留 1 条（1 = 全部保留）。**前置于入队**，见 knob 注释。
+UINT64 g_syscall_sample = 1;
+/// 因为采样而**有意跳过**的条数（与"溢出丢弃"是两件事，必须分开报）。
+volatile UINT64 g_syscall_sampled_out = 0;
 /// 捕获数下限（见 KnobRequireSyscalls / KnobRequireMem）。
 UINT64 g_required_syscalls = 0;
 UINT64 g_required_syscall_exits = 0;
@@ -936,6 +952,8 @@ struct ThreadStats {
   /// 这两种错误在事件流里都表现为"少了几条 trap_flag"，而"少了"与"本来就没有"
   /// 从事件流上看不出来——所以它必须有**每线程**的计数配合（见下面的 tf_* 字段）。
   bool virtual_tf;
+  /// 该线程的系统调用事件采样计数（每线程一份，见 g_syscall_sample）。
+  UINT64 syscall_sample_seen;
   /// 该线程累计的 TF 意图与处理结果（每线程一份，收尾时按线程打印）。
   UINT64 tf_sets;
   UINT64 tf_clears;
@@ -1039,6 +1057,26 @@ ThreadStats* stats_for(THREADID tid) {
 /// 正确修法已经明确：回调只做内存入队 + 由 Pin 内部线程冲刷（见
 /// docs/roadmap.md 的 M1 与 native/README.md 的"已知缺陷"一节）。
 /// 推一条事件：**只入队**。回调路径上除了下标的算术与内存拷贝，什么都不做。
+/// 前置过滤：系统调用事件按 `-pb_syscall_sample` 采样，**在入队之前**生效。
+///
+/// 返回 `false` 时调用方必须直接返回——那条事件**根本没进环形缓冲**，
+/// 所以它不会挤掉别人，也不会在缓冲里等待冲刷。
+///
+/// 采样按**线程**独立计数：两条线程不会互相吃掉对方的样本起点
+/// （共享一个计数器时，"另一条线程把它们那几次数掉了"会让某条线程的样本
+/// 位置整体偏移，而且看不出来）。
+bool syscall_event_kept(ThreadStats* stats) {
+  ++stats->syscall_sample_seen;
+  if (g_syscall_sample <= 1) {
+    return true;
+  }
+  if ((stats->syscall_sample_seen % g_syscall_sample) != 0) {
+    ++g_syscall_sampled_out;
+    return false;
+  }
+  return true;
+}
+
 void push_probe_event(ThreadStats* stats, UINT8 kind, THREADID tid, ADDRINT address,
                       const UINT64* args, UINT32 arg_count) {
   EventRing* ring = &stats->ring;
@@ -1172,7 +1210,9 @@ void OnSyscallEnter(THREADID tid, ADDRINT address, ADDRINT ssn, ADDRINT arg0,
   const UINT64 args[5] = {static_cast<UINT64>(ssn), static_cast<UINT64>(arg0),
                           static_cast<UINT64>(arg1), static_cast<UINT64>(arg2),
                           static_cast<UINT64>(arg3)};
-  push_probe_event(stats, 3 /* PB_EV_SYSCALL_ENTER */, tid, address, args, 5);
+  if (syscall_event_kept(stats)) {
+    push_probe_event(stats, 3 /* PB_EV_SYSCALL_ENTER */, tid, address, args, 5);
+  }
   stats->in_hook = false;
 
   // 软停止：只置位（一次比较），摘插装留给安全上下文。
@@ -1215,7 +1255,9 @@ void OnSyscallExit(THREADID tid, ADDRINT address, ADDRINT status) {
     ++g_syscall_exit_without_enter;
   }
   const UINT64 args[2] = {ssn, static_cast<UINT64>(status)};
-  push_probe_event(stats, 4 /* PB_EV_SYSCALL_EXIT */, tid, address, args, 2);
+  if (syscall_event_kept(stats)) {
+    push_probe_event(stats, 4 /* PB_EV_SYSCALL_EXIT */, tid, address, args, 2);
+  }
   stats->in_hook = false;
   if (g_syscall_cap != 0 && static_cast<UINT64>(g_syscall_captured) >= g_syscall_cap) {
     request_syscall_stop();
@@ -1814,6 +1856,15 @@ void OnFini(INT32 code, VOID* v) {
          static_cast<unsigned long long>(g_register_deliveries),
          static_cast<unsigned long long>(g_register_failures),
          static_cast<unsigned long long>(g_register_skipped));
+  // 采样的账**必须与溢出丢弃分开报**：两者都让事件变少，但一个是**有意的**
+  // （样本代表性下降），一个是**缺陷**（数据丢了）。混在一起报，
+  // 读日志的人无法判断"这次结论能不能用"。
+  if (g_syscall_sample > 1) {
+    report("  前置过滤：系统调用事件每 %llu 条保留 1 条，有意跳过 %llu 条"
+           "（这是采样，不是丢数据；要全部事件就把 -pb_syscall_sample 设成 1）",
+           static_cast<unsigned long long>(g_syscall_sample),
+           static_cast<unsigned long long>(g_syscall_sampled_out));
+  }
   report("  环形缓冲：已送出 %llu 条（含收尾兜底 %llu 条），溢出丢弃 %llu 条",
          static_cast<unsigned long long>(g_flushed_total + flushed_at_fini),
          static_cast<unsigned long long>(flushed_at_fini),
@@ -2046,6 +2097,13 @@ int main(int argc, char** argv) {
   pb_syscall_enabled = KnobSyscalls.Value() != 0;
 
   g_syscall_cap = parse_u64(KnobSyscallMax.Value().c_str(), 4096);
+  g_syscall_sample = parse_u64(KnobSyscallSample.Value().c_str(), 1);
+  if (g_syscall_sample == 0) {
+    // 0 不是"全部保留"的意思，而是没意义的比值：当成 1 并说明，别让
+    // "我写了 0 于是什么都没采到"变成一个要翻代码才能解释的现象。
+    report("系统调用采样比写成了 0（无意义），按 1 处理（全部保留）");
+    g_syscall_sample = 1;
+  }
   g_required_syscalls = parse_u64(KnobRequireSyscalls.Value().c_str(), 0);
   g_required_syscall_exits = parse_u64(KnobRequireSyscallExits.Value().c_str(), 0);
 
