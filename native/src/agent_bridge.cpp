@@ -50,6 +50,7 @@ using fn_attach = int32_t(PB_CALL*)(uint32_t);
 using fn_set_capabilities = int32_t(PB_CALL*)(uint32_t);
 using fn_continue = int32_t(PB_CALL*)();
 using fn_pause = int32_t(PB_CALL*)();
+using fn_single_step = int32_t(PB_CALL*)(uint32_t);
 using fn_drain_events = int32_t(PB_CALL*)(pb_event_raw*, uint32_t, uint32_t*);
 using fn_last_error = const char*(PB_CALL*)();
 using fn_allocate_sequence = uint64_t(PB_CALL*)();
@@ -74,6 +75,7 @@ struct AgentApi {
   fn_set_capabilities set_capabilities = nullptr;
   fn_continue resume = nullptr;
   fn_pause pause = nullptr;
+  fn_single_step single_step = nullptr;
   fn_drain_events drain_events = nullptr;
   fn_last_error last_error = nullptr;
   fn_allocate_sequence allocate_sequence = nullptr;
@@ -230,6 +232,8 @@ void load_agent(AgentApi* api) {
       resolve_symbol<fn_set_capabilities>(module, "pb_set_capabilities", &missing);
   api->resume = resolve_symbol<fn_continue>(module, "pb_continue", &missing);
   api->pause = resolve_symbol<fn_pause>(module, "pb_pause", &missing);
+  api->single_step =
+      resolve_symbol<fn_single_step>(module, "pb_single_step", &missing);
   api->drain_events = resolve_symbol<fn_drain_events>(module, "pb_drain_events", &missing);
   api->last_error = resolve_symbol<fn_last_error>(module, "pb_last_error", &missing);
   api->allocate_sequence =
@@ -375,6 +379,17 @@ PB_EXPORT int32_t PB_CALL pb_pause(void) {
     return status;
   }
   return agent().pause();
+}
+
+// 单步：与 `pb_pause` 同样的转发形状。它当前**明确未实现**（agent 侧返回
+// NOT_SUPPORTED），但 Hub 必须能**够到**它——否则调用方拿到的是
+// "符号缺失"，而那是"桥接层坏了"的语义，不是"这个能力还没做"。
+PB_EXPORT int32_t PB_CALL pb_single_step(uint32_t count) {
+  int32_t status = PB_STATUS_OK;
+  if (!require_agent(&status)) {
+    return status;
+  }
+  return agent().single_step(count);
 }
 
 PB_EXPORT int32_t PB_CALL pb_start_trace(const char* path, uint32_t fold) {

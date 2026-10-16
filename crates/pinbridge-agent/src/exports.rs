@@ -107,16 +107,10 @@ pub unsafe extern "C" fn pb_push_event(raw: *const PbEventRaw) -> c_int {
         });
     }
     // SAFETY: 上面已判空；调用方保证指针在本次调用期间有效
-    let mut event = unsafe { *raw };
-    // **序号 0 = "没填"，由 agent 分配一个。**
-    //
-    // 序号 0 不是合法的事件序号（分配器从 1 开始）。把 0 当成"未设置"而不是
-    // 原样入队，是因为轨迹侧折叠器有"序号严格递增"的不变量：调用方顺手传 0
-    // 会在记录里造成序号回退。实测过一次——几条用例并发时，
-    // 整个测试进程在那个 debug_assert 上 panic（现场离原因很远）。
-    if event.sequence == 0 {
-        event.sequence = pb_allocate_sequence();
-    }
+    let event = unsafe { *raw };
+    // 序号 0（"没填"）与"落后于已推送最大值"的序号都由 `AgentState::push_event`
+    // 统一处理：它在写入之前保证严格递增。这里不再做特例——
+    // 一条规则只写在一个地方，才不会出现"两处都改一半"。
     // ── 先入队**触发事件**，再产生派生事件 ──
     //
     // 顺序有两条约束，必须同时满足：
@@ -152,6 +146,11 @@ fn dispatch_to_scripts(event: &PbEventRaw) {
     let Some(kind) = EventKind::from_code(event.kind) else {
         return; // 未知类型：不是脚本要关心的东西
     };
+    // 暂停时不喂脚本：脚本看到的事件流必须与"能被取走的事件流"一致，
+    // 否则脚本的判断会基于调用方看不到的信息，事后无法复核。
+    if AgentHost::with(|state| state.is_paused()) {
+        return;
+    }
     let has_script =
         AgentHost::with(|state| !state.script_host().subscribers(event.kind).is_empty());
     if !has_script {
@@ -386,13 +385,18 @@ fn flush_breakpoint_hits() {
     }
 }
 
-/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。
+/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。/// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走 3=暂停期间跳过 4=是否暂停。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_stats(which: c_uint) -> u64 {
     AgentHost::with(|state| match which {
         0 => state.dropped(),
         1 => state.backlog() as u64,
-        _ => state.drained(),
+        2 => state.drained(),
+        // 暂停期间跳过的条数：**必须可查**，否则"暂停时到底丢了多少"
+        // 就成了一个只能靠猜的问题。
+        3 => state.paused_skipped(),
+        4 => u64::from(state.is_paused()),
+        _ => 0,
     })
 }
 
@@ -605,16 +609,80 @@ pub extern "C" fn pb_single_step(_count: c_uint) -> c_int {
     stub(Capability::SingleStep, "pb_single_step")
 }
 
-/// 继续执行（M0 桩）。
+/// 继续采集。
+///
+/// ## 语义：这是"**采集**的继续"，不是"目标线程的继续"
+///
+/// Pin 不是调试器：目标线程由目标自己调度，我们**没有**把它们停下来的能力
+/// （见 [docs/design/script-runtime.md](../../../docs/design/script-runtime.md)
+/// 里"暂停/继续的语义"一节）。所以这个接口做的是：
+///
+/// * **恢复**把事件写进轨迹、放进可被取走的队列、分发给脚本；
+/// * 与它成对的 [`pb_pause`] 则停下这三件事，并**计数**期间到达的事件。
+///
+/// 刻意**不做**成"看起来像调试器的冻结目标"：那需要停下所有线程（我们没有），
+/// 半吊子的实现会在目标的多线程场景里表现成随机崩溃或死锁，
+/// 而调用方还以为自己拿到的是一致快照。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_continue() -> c_int {
-    stub(Capability::ProcessControl, "pb_continue")
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::ProcessControl)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    let (changed, skipped) = AgentHost::with(|state| {
+        let changed = state.set_paused(false);
+        (changed, state.paused_skipped())
+    });
+    if !changed {
+        return AgentHost::with(|state| {
+            state.fail(Status::Ok, "pb_continue: 本来就在采集，重复调用没有影响")
+        });
+    }
+    // 恢复本身要留下痕迹：轨迹里出现"一段时间什么都没有"必须有解释。
+    emit_state_change(0, skipped);
+    AgentHost::with(|state| {
+        state.fail(
+            Status::Ok,
+            &format!("pb_continue: 已恢复采集（暂停期间跳过 {skipped} 条事件）"),
+        )
+    })
 }
 
-/// 中断执行（M0 桩）。
+/// 暂停采集（见 [`pb_continue`] 的语义说明）。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_pause() -> c_int {
-    stub(Capability::ProcessControl, "pb_pause")
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::ProcessControl)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    let changed = AgentHost::with(|state| state.set_paused(true));
+    if !changed {
+        return AgentHost::with(|state| {
+            state.fail(Status::Ok, "pb_pause: 本来就在暂停，重复调用没有影响")
+        });
+    }
+    // 这条事件必须在**进入暂停之前**入队，否则它自己会被跳过。
+    emit_state_change(1, 0);
+    AgentHost::with(|state| {
+        state.fail(
+            Status::Ok,
+            "pb_pause: 已暂停采集（事件仍会被计数，但不进轨迹、不入队、不喂脚本）",
+        )
+    })
+}
+
+/// 发出一条"状态变化"事件。
+///
+/// `state`: 1 = 已暂停，0 = 已恢复；`arg` 附带一个调用方用得上的数值
+/// （恢复时是"暂停期间跳过了多少条"）。
+///
+/// **它绕过暂停判定**（`push_event` 对 `StateChange` 例外）：不这样，
+/// 暂停开始的那条事件会被自己的暂停规则吃掉，轨迹里就只剩下一段空白。
+fn emit_state_change(state: u8, arg: u64) {
+    let mut raw = PbEventRaw::EMPTY;
+    raw.sequence = pb_allocate_sequence();
+    raw.kind = EventKind::StateChange.code();
+    raw.args[0] = u64::from(state);
+    raw.args[1] = arg;
+    let _ = AgentHost::with(|st| st.push(&raw).is_ok());
 }
 
 /// 加载脚本（M0 桩：能力校验已生效，CPython 宿主见 M1）。
@@ -1145,6 +1213,104 @@ pb.subscribe("syscall_enter", on_syscall)
         let byte = unsafe { std::ptr::read_volatile(address as *const u8) };
         assert_ne!(byte, 0xCC, "解除之后不能留下 int3");
     }
+    /// 暂停/继续的语义：事件被**计数后跳过**，状态变化自己留痕。
+    #[test]
+    fn pause_stops_collection_counts_it_and_continue_resumes() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+
+        // 1) 能力闸门
+        assert_eq!(
+            pb_set_capabilities(Capability::MemRead.bit()),
+            Status::Ok.code()
+        );
+        assert_eq!(
+            pb_pause(),
+            Status::CapabilityDenied.code(),
+            "没有 process_control 时必须拒绝"
+        );
+        assert_eq!(pb_set_capabilities(0xFFF), Status::Ok.code());
+
+        // 从"非暂停"开始（别的用例可能留下状态）
+        let _ = pb_continue();
+        let baseline = pb_stats(3);
+        assert_eq!(pb_stats(4), 0, "此时应当是采集状态");
+
+        // 2) 暂停 → 推 3 条 → 都不该进队列，但都要被计数
+        assert_eq!(pb_pause(), Status::Ok.code());
+        assert_eq!(pb_stats(4), 1, "应当处于暂停状态");
+        for index in 0..3u64 {
+            let mut raw = PbEventRaw::EMPTY;
+            raw.kind = EventKind::SyscallEnter.code();
+            raw.address = index;
+            // SAFETY: raw 指向本栈变量
+            assert_eq!(
+                unsafe { pb_push_event(&raw) },
+                Status::Ok.code(),
+                "暂停期间推送**不能报错**：探针回调不该因为分析师按了暂停而失败"
+            );
+        }
+        assert_eq!(pb_stats(3), baseline + 3, "跳过的事件必须被计数");
+
+        let mut buffer = [PbEventRaw::EMPTY; 16];
+        let mut written = 0u32;
+        // SAFETY: 缓冲区与计数都指向本栈变量
+        assert_eq!(
+            unsafe { pb_drain_events(buffer.as_mut_ptr(), 16, &mut written) },
+            Status::Ok.code()
+        );
+        let states: Vec<&PbEventRaw> = buffer[..written as usize]
+            .iter()
+            .filter(|raw| raw.kind == EventKind::StateChange.code())
+            .collect();
+        let pushes: Vec<&PbEventRaw> = buffer[..written as usize]
+            .iter()
+            .filter(|raw| raw.kind == EventKind::SyscallEnter.code())
+            .collect();
+        assert!(pushes.is_empty(), "暂停期间的事件不该出现在队列里");
+        assert_eq!(states.len(), 1, "暂停这件事本身要留下一条状态变化事件");
+        assert_eq!(states[0].args[0], 1, "1 = 已暂停");
+        println!("✓ 暂停：跳过 3 条、队列里只剩状态变化事件");
+
+        // 3) 重复暂停：不报错，但明确说"没有影响"
+        assert_eq!(pb_pause(), Status::Ok.code());
+        // SAFETY: 立刻拷贝
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("本来就在暂停"), "要说清是重复调用：{text}");
+
+        // 4) 继续 → 事件重新入队，状态变化里带上"跳过了多少"
+        assert_eq!(pb_continue(), Status::Ok.code());
+        assert_eq!(pb_stats(4), 0);
+        let mut raw = PbEventRaw::EMPTY;
+        raw.kind = EventKind::SyscallEnter.code();
+        raw.address = 0xAA;
+        // SAFETY: raw 指向本栈变量
+        assert_eq!(unsafe { pb_push_event(&raw) }, Status::Ok.code());
+        let mut written = 0u32;
+        // SAFETY: 同上
+        assert_eq!(
+            unsafe { pb_drain_events(buffer.as_mut_ptr(), 16, &mut written) },
+            Status::Ok.code()
+        );
+        let batch = &buffer[..written as usize];
+        assert!(
+            batch
+                .iter()
+                .any(|raw| raw.kind == EventKind::SyscallEnter.code() && raw.address == 0xAA),
+            "恢复之后事件必须重新入队"
+        );
+        let resumed = batch
+            .iter()
+            .find(|raw| raw.kind == EventKind::StateChange.code() && raw.args[0] == 0)
+            .expect("恢复也要留下状态变化事件");
+        assert_eq!(resumed.args[1], 3, "要带上暂停期间跳过的条数");
+        println!(
+            "✓ 恢复：事件重新入队，状态变化带上跳过数 {}",
+            resumed.args[1]
+        );
+    }
     /// 导出面：真实的内存读写（Hub 侧走的就是这几个导出）。
     ///
     /// 用 agent 自己的静态缓冲区当靶子：地址确定、不需要额外进程。
@@ -1331,9 +1497,17 @@ pb.subscribe("syscall_enter", on_syscall)
         let code = unsafe { pb_drain_events(out.as_mut_ptr(), 64, &mut count) };
         assert_eq!(code, Status::Ok.code());
         assert!(
-            out[..count as usize]
-                .iter()
-                .any(|raw| raw.to_event() == Some(event)),
+            out[..count as usize].iter().any(|raw| {
+                // 序号**不比**：agent 会保证严格递增，落后于已推送最大值的序号
+                // 会被改写（见 `AgentState::push_event`）。其余字段必须一致。
+                let Some(seen) = raw.to_event() else {
+                    return false;
+                };
+                seen.kind == event.kind
+                    && seen.address == event.address
+                    && seen.thread_id == event.thread_id
+                    && seen.args == event.args
+            }),
             "刚推的事件必须在取回的批次里（取到 {count} 条）"
         );
 

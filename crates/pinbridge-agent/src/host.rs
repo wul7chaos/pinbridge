@@ -58,6 +58,21 @@ pub struct AgentState {
     recorder: Option<LocalRecorder>,
     /// 已采集但尚未被 Hub 取走的条数（用于背压观测）。
     drained: u64,
+    /// 最近一次**推送**的序号。
+    ///
+    /// 与 `next_sequence` 的区别很重要：`next_sequence` 在**分配**时就前进，
+    /// 而"先分配、稍后推送"是文档化的用法。严格递增这条不变量要按
+    /// "最近一次推送"来判断——按 `next_sequence` 判断会把正常用法误判成落后
+    /// （实测过：每次推送都被无意义地 +1）。
+    last_pushed: u64,
+    /// 是否处于"暂停采集"状态（`pb_pause` / `pb_continue`）。
+    paused: bool,
+    /// 暂停期间到达、**被计数后跳过**的事件条数。
+    ///
+    /// 为什么必须有它：暂停时要丢事件，但"丢了多少"必须能被回答。
+    /// 静默丢弃会让"目标在暂停期间到底做了什么"变成无法回答的问题——
+    /// 而那正是分析里最容易出错的地方（看起来没问题，其实少了一段）。
+    paused_skipped: u64,
 }
 
 /// 目标进程内的录制器（不依赖 `pinbridge-hub`，避免 agent 把整个控制面拖进来）。
@@ -88,6 +103,9 @@ impl AgentState {
             budget: crate::script::ScriptBudget::new(crate::script::DEFAULT_CALL_BUDGET_MS),
             recorder: None,
             drained: 0,
+            last_pushed: 0,
+            paused: false,
+            paused_skipped: 0,
         }
     }
 
@@ -227,8 +245,21 @@ impl AgentState {
     }
 
     /// 标记附加状态。
+    ///
+    /// **附加是一次新的会话**：把上一次会话的"暂停"状态与计数带过来会让
+    /// "我刚附加上却收不到事件"变成一个需要翻代码才能解释的谜。
+    /// 实测过一次：某条用例把 agent 留在暂停状态，后面的用例取事件取到空，
+    /// 而错误信息里没有任何线索指向"暂停"。
     pub fn mark_attached(&mut self, pid: u32, attached: bool) {
         self.pid = pid;
+        if attached {
+            // **每次附加都重置会话状态**，而不是只在"未附加 → 附加"的跃迁上重置。
+            // 只做跃迁判断会漏掉最常见的一种：调用方已经附加着（或崩溃重连后
+            // 以为自己附加着），再次 `pb_attach` 只是想"重新开始"。
+            // 那时暂停状态会留着，表现为"刚附加上却收不到事件"。
+            self.paused = false;
+            self.paused_skipped = 0;
+        }
         self.attached = attached;
     }
 
@@ -247,13 +278,62 @@ impl AgentState {
     }
 
     /// 采集一条已构造好的事件。
-    pub fn push_event(&mut self, event: Event) -> Result<u64> {
+    ///
+    /// 暂停期间**仍然更新序号**（否则恢复后序号会与探针侧的期望错位），
+    /// 但既不写轨迹也不入队，只把条数记下来。
+    pub fn push_event(&mut self, mut event: Event) -> Result<u64> {
+        // **序号严格递增由这里保证，而不是靠调用方约定。**
+        //
+        // 原因：`pb_allocate_sequence` + 稍后 `pb_push_event` 是**被文档化的用法**
+        // （探针先拿号、再构造事件），而"稍后"意味着中间可能有别的活动分配了
+        // 更大的号。于是推送顺序与分配顺序可以不一致，记录侧的折叠器就会
+        // 看到"序号回退"并断言失败——实测过一次，现场离原因很远。
+        //
+        // 所以：调用方给的序号若没有严格大于已推送的最大值，就改用新分配的。
+        // 轨迹因此永远自洽；代价是"调用方给的号可能被改写"，
+        // 而这一点在 `.pbt` 里是可观测的（记录的号就是实际用的号）。
+        if event.sequence <= self.last_pushed {
+            event.sequence = self.last_pushed.max(self.next_sequence) + 1;
+        }
+        self.last_pushed = event.sequence;
         self.next_sequence = self.next_sequence.max(event.sequence);
+        if self.paused {
+            // 状态变化事件**例外**：暂停/恢复本身必须留下痕迹，
+            // 否则轨迹里会出现"有一段时间什么都没有"却没有任何解释。
+            if event.kind != EventKind::StateChange {
+                self.paused_skipped += 1;
+                return Ok(event.sequence);
+            }
+        }
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.write(&event)?;
         }
         let _ = self.events.send(event);
         Ok(event.sequence)
+    }
+
+    /// 是否处于暂停采集状态。
+    #[must_use]
+    pub const fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// 暂停期间被跳过的事件条数。
+    #[must_use]
+    pub const fn paused_skipped(&self) -> u64 {
+        self.paused_skipped
+    }
+
+    /// 切换暂停状态，返回"这次切换是不是真的改变了状态"。
+    ///
+    /// 返回布尔值而不是无条件成功：重复 `pb_pause()` 是调用方的记账错误，
+    /// 而"我以为暂停了 / 我以为还在跑"这类误解必须以可观测的方式暴露出来。
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        if self.paused == paused {
+            return false;
+        }
+        self.paused = paused;
+        true
     }
 
     /// 分配下一个序号（探针侧构造事件时使用）。
@@ -498,6 +578,16 @@ mod tests {
             0,
         ));
         assert_eq!(state.push(&raw).unwrap(), 3);
+
+        // 落后于已推送最大值的序号会被**改写**成下一个：严格递增由 agent 保证，
+        // 而不是靠调用方约定（"先分配、稍后推送"是文档化的用法，
+        // 中间别的活动会分配更大的号）。
+        let stale = PbEventRaw::from_event(&Event::new(2, EventKind::StateChange, 1, 0));
+        assert_eq!(
+            state.push(&stale).unwrap(),
+            4,
+            "落后的序号应当被改写成 4（当前最大是 3）"
+        );
     }
 
     #[test]

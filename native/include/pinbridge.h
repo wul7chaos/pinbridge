@@ -149,7 +149,7 @@ PB_EXPORT int32_t PB_CALL pb_memory_write(uint64_t address, const uint8_t* bytes
                                           uint32_t length);
 PB_EXPORT int32_t PB_CALL pb_set_breakpoint(uint64_t address);
 PB_EXPORT int32_t PB_CALL pb_clear_breakpoint(uint64_t address);
-PB_EXPORT int32_t PB_CALL pb_single_step(uint32_t count);
+PB_EXPORT int32_t PB_CALL pb_single_step(uint32_t count);  /* 桥接层也导出（转发给 agent） */
 PB_EXPORT int32_t PB_CALL pb_continue(void);
 PB_EXPORT int32_t PB_CALL pb_pause(void);
 PB_EXPORT int32_t PB_CALL pb_load_script(const char* name, const char* source);

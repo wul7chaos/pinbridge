@@ -155,17 +155,25 @@ fn hub_side_loader_drives_a_real_dll() {
         other => panic!("只读基线 pause 应当报能力不足，实际: {other:?}"),
     }
 
-    // ── 6. 能力足够之后：桩必须明确说"不支持"，而不是转而成功 ────────────
+    // ── 6. 能力足够之后：**未实现**的能力必须明确说"不支持"，而不是转而成功 ──
+    //
+    // 这里用单步当例子：暂停/继续已经是真实实现（采集语义）。单步明确不做
+    // 调试器语义（见 `pb_single_step` 的文档），所以它仍然是"有权限但未实现"。
     api.apply_capabilities(PbSet(0xFFFF_FFFF))
         .expect("下发全量能力位应当成功");
     let error = api
-        .pause()
-        .expect_err("M0 的 pause 是桩，必须明确失败而不是假装成功");
+        .single_step(1)
+        .expect_err("单步仍未实现，必须明确失败而不是假装成功");
     assert!(
         matches!(error, Error::TargetUnavailable(_)),
         "“不支持”必须映射成 TargetUnavailable（不是 Trace，否则排查方向会跑偏），实际: {error:?}"
     );
-    println!("✓ 有权限但实现为桩：{error}");
+    println!("✓ 有权限但未实现：{error}");
+
+    // 暂停/继续现在成真：过能力闸门后必须成功，而且状态可查。
+    api.pause().expect("有权限时 pause 应当成功");
+    println!("✓ 目标侧 pause 成真（采集语义）");
+    api.resume().expect("continue 应当成功");
 
     // ── 7. 桥接层的能力边界：没有 Pin 就不能启动目标 ──────────────────────
     let error = api

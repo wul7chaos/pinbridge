@@ -170,28 +170,43 @@ fn hub_client_drives_a_real_agent_over_a_real_socket() {
     // 落到 M0 的桩上——两道闸门必须给出**可区分**的错误码，否则使用者
     // 无法判断"我该去要权限"还是"这个功能还没做"。
     reset_agent(Capability::operator_default());
+    // 用**单步**当"有权限但未实现"的例子：暂停/继续已经是真实实现（采集语义），
+    // 而单步明确不做调试器语义（见 `pb_single_step` 的文档）。
     let error = client
-        .call(&AgentRequest::Pause)
-        .expect_err("M0 的 pause 是桩");
+        .call(&AgentRequest::SingleStep { count: 1 })
+        .expect_err("单步仍未实现");
     match error {
         ClientError::Rejected { code, message } => {
-            assert_eq!(code, "not_supported", "桩必须报 not_supported: {message}");
+            assert_eq!(
+                code, "not_supported",
+                "未实现必须报 not_supported: {message}"
+            );
             assert!(
-                message.contains("M0") || message.contains("未实现") || message.contains("Pin"),
+                message.contains("M0")
+                    || message.contains("未实现")
+                    || message.contains("Pin")
+                    || message.contains("M1"),
                 "不支持的说明要指出后续怎么办: {message}"
             );
-            println!("✓ 桩明确失败：{message}");
+            println!("✓ 未实现的能力明确失败：{message}");
         }
         other => panic!("期望 not_supported，实际: {other}"),
     }
+
+    // 暂停/继续现在是真实现：过能力闸门之后必须**成功**，并且状态可查。
+    client
+        .call(&AgentRequest::Pause)
+        .expect("有权限时 pause 应当成功");
+    println!("✓ 目标侧 pause 现在成真（采集语义）");
 
     drop(client);
     let handled = server.join().expect("服务端线程");
     // 精确计数而不是 `>=`：被客户端拦下的那条写请求**根本没有出门**，
     // 所以服务端应当恰好处理 5 条（ping / 被目标拒绝的写 / 版本不匹配的 ping /
     // drain / pause）。这条断言顺带证明了"客户端侧校验发生在发送之前"。
+    // ping / 被目标拒绝的写 / 版本不匹配的 ping / drain / 单步（未实现）/ 暂停
     assert_eq!(
-        handled, 5,
+        handled, 6,
         "服务端应当处理 5 条请求（客户端拦下的那条不该到达）"
     );
     println!("✓ 服务端共处理 {handled} 条请求");

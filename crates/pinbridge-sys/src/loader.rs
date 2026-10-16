@@ -62,6 +62,12 @@ pub struct Api {
     pub resume: unsafe extern "C" fn() -> c_int,
     /// `int32_t pb_pause(void)`
     pub pause: unsafe extern "C" fn() -> c_int,
+    /// `int32_t pb_single_step(uint32_t)`
+    ///
+    /// 解析出来只为把"**未实现**"这件事映射成明确的错误（而不是让调用方
+    /// 以为符号缺失）：单步在 PinBridge 的模型里没有调试器语义，见
+    /// agent 侧 `pb_single_step` 的文档。
+    pub single_step: unsafe extern "C" fn(u32) -> c_int,
     /// `int32_t pb_drain_events(PbEventRaw* out, uint32_t capacity, uint32_t* written)`
     pub drain_events: unsafe extern "C" fn(*mut PbEventRaw, c_uint, *mut c_uint) -> c_int,
     /// `int32_t pb_start_trace(const char* path, uint32_t fold)`
@@ -132,6 +138,7 @@ pub fn load(name: &str) -> Result<Api> {
             set_capabilities: resolve(handle, name, "pb_set_capabilities")?,
             resume: resolve(handle, name, "pb_continue")?,
             pause: resolve(handle, name, "pb_pause")?,
+            single_step: resolve(handle, name, "pb_single_step")?,
             drain_events: resolve(handle, name, "pb_drain_events")?,
             start_trace: resolve(handle, name, "pb_start_trace")?,
             stop_trace: resolve(handle, name, "pb_stop_trace")?,
@@ -286,6 +293,25 @@ impl Api {
         )
     }
 
+    /// 单步（`pb_single_step`）——**当前明确未实现**。
+    ///
+    /// 这条路存在的意义是让"有权限但未实现"与"能力不足"在调用方那里
+    /// **可区分**（对应 `Error::TargetUnavailable` 与 `Error::CapabilityDenied`）。
+    ///
+    /// # Errors
+    ///
+    /// - `CapabilityDenied`：没有 `single_step` 能力；
+    /// - `TargetUnavailable`：有权限但实现未落地（当前总是这一步）。
+    pub fn single_step(&self, count: u32) -> Result<()> {
+        // SAFETY: 函数指针已在加载时校验
+        let code = unsafe { (self.single_step)(count) };
+        crate::abi::check(
+            code,
+            "single_step",
+            Capability::SingleStep,
+            self.held_capabilities(),
+        )
+    }
     /// 开始**目标内录制**（`pb_start_trace`）。
     ///
     /// `fold` 打开时，重复事件会被折叠成 `Repeat` 记录（体积换精度）——

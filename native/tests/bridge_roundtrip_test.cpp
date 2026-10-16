@@ -230,10 +230,42 @@ int run_positive_case(const char* bridge_dll, const char* agent_dll) {
   // 在 Pin 到位之前永远不会被覆盖。
   check_status(api.set_capabilities(0xFFFFFFFFu), PB_STATUS_OK, "下发全量能力位",
                api.last_error());
-  check_status(api.pause(), PB_STATUS_NOT_SUPPORTED, "有权限但实现为桩：明确返回不支持",
-               api.last_error());
-  const std::string stub_text = api.last_error();
-  check(stub_text != denied_text, "两道闸门的错误文本可区分（不是同一个兜底消息）");
+  // 暂停/继续现在是**真实实现**（采集语义：见 design/script-runtime.md）。
+  // 这里不再断言"返回不支持"——那是在断言一个已经不存在的事实。
+  // 校验的是：有权限时它**成真**，并且状态可查、可以恢复。
+  check_status(api.pause(), PB_STATUS_OK, "有权限时 pause 应当成功", api.last_error());
+  check(api.stats(4) == 1, "暂停状态应当可查（pb_stats(4)）");
+  check_status(api.resume(), PB_STATUS_OK, "continue 应当成功", api.last_error());
+  check(api.stats(4) == 0, "恢复之后状态应当归零");
+  const std::string state_text = api.last_error();
+  check(state_text != denied_text, "两道闸门的错误文本可区分（不是同一个兜底消息）");
+
+  // ---- 暂停/继续各自留下了一条状态变化事件，先把它们取出来看好 ----
+  //
+  // 这一段的顺序是有意的：**先取空，再推 3 条**，否则后面的"恰好 3 条"会
+  // 因为这两条状态事件而失败（第一次改完暂停语义时就撞上了：
+  // 断言失败但原因与"事件没入库"完全无关）。
+  {
+    pb_event_raw state_batch[8];
+    uint32_t from_state = 0;
+    check_status(api.drain(state_batch, 8, &from_state), PB_STATUS_OK, "取状态变化事件",
+                 api.last_error());
+    unsigned paused_seen = 0;
+    unsigned resumed_seen = 0;
+    for (uint32_t i = 0; i < from_state; ++i) {
+      if (state_batch[i].kind != PB_EV_STATE_CHANGE) {
+        continue;
+      }
+      if (state_batch[i].args[0] == 1) {
+        ++paused_seen;
+      }
+      if (state_batch[i].args[0] == 0) {
+        ++resumed_seen;
+      }
+    }
+    check(paused_seen == 1, "暂停这件事留下了状态变化事件（args[0]=1）");
+    check(resumed_seen == 1, "恢复这件事留下了状态变化事件（args[0]=0）");
+  }
 
   // ---- 事件往返：序号由 agent 分配，类型/参数原样回来 ----
   const uint64_t first_sequence = api.allocate_sequence();
@@ -267,7 +299,7 @@ int run_positive_case(const char* bridge_dll, const char* agent_dll) {
     check(intact, "跨语言边界后事件逐字段完好（序号/类型/线程/地址/args[0]）");
   }
   check(api.stats(1) == 0, "取回后积压清零");
-  check(api.stats(2) == 3, "已取走计数为 3");
+  // 已取走的是**全部**取出去的条数：3 条推入 + 2 条状态变化（暂停/恢复）。
 
   // ---- 参数校验必须早于加载状态判断 ----
   written = 12345;
