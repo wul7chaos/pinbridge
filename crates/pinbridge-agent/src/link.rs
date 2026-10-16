@@ -724,17 +724,40 @@ mod tests {
             other => panic!("实际: {other:?}"),
         }
 
-        // 第二道闸门：实现。给出只读能力后，能力这关过了，桩必须说"不支持"。
-        exports::pb_set_capabilities(Capability::read_only_baseline().bits());
-        match dispatch(&AgentRequest::ReadMemory {
-            address: 0,
-            length: 4,
+        // 第二道闸门：实现。给出能力后，能力这关过了，
+        // 剩下的取决于**这个能力是否已经实现**。
+        // 用断点当例子：它仍是桩，因此必须明确说"不支持"。
+        // （内存读不能再当这个例子——它已是真实实现，对不可读地址返回的是
+        //   第三类结果："内部错误 + 具体原因"。）
+        // 给足全部能力：`ALL.len()` 位全开（用 `from_bits` 而不是手写常量，
+        // 免得新增能力时这里悄悄少给一位）。
+        let all = CapabilitySet::from_bits((1u32 << Capability::ALL.len()) - 1);
+        exports::pb_set_capabilities(all.bits());
+        match dispatch(&AgentRequest::SetBreakpoint {
+            address: 0x1000,
+            label: String::new(),
         }) {
             AgentResponse::Error { code, message } => {
                 assert_eq!(code, error_code::NOT_SUPPORTED, "实际: {message}");
                 assert!(
-                    message.contains("M0") || message.contains("未实现") || message.contains("Pin"),
+                    message.contains("Pin") || message.contains("未实现") || message.contains("M1"),
                     "不支持的说明要指出后续怎么办: {message}"
+                );
+            }
+            other => panic!("实际: {other:?}"),
+        }
+        // 第三类结果：能力够、实现有，但**目标侧的这次具体操作**失败。
+        // 这类必须与上面两类区分开——调用方的下一步动作完全不同
+        // （加能力 vs 换方案 vs 换地址）。
+        match dispatch(&AgentRequest::ReadMemory {
+            address: 0x1000,
+            length: 4,
+        }) {
+            AgentResponse::Error { code, message } => {
+                assert_eq!(code, error_code::INTERNAL, "实际: {message}");
+                assert!(
+                    message.contains("0x1000"),
+                    "失败原因要带上出问题的地址: {message}"
                 );
             }
             other => panic!("实际: {other:?}"),

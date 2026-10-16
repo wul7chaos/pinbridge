@@ -58,7 +58,7 @@ pub enum Availability {
 mod imp {
     use super::{Availability, CANDIDATE_DLLS, DLL_ENV};
     use pinbridge_core::error::{Error, Result};
-    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 
     // ── Win32（只声明用到的三个，避免引入 windows.h 与 Pin 的头文件冲突）──
     #[link(name = "kernel32")]
@@ -116,6 +116,34 @@ mod imp {
         PyErr_Print: unsafe extern "C" fn(),
         /// `PyObject* PyObject_Str(PyObject*)`（**新引用**）
         PyObject_Str: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        // ── 造一个"Rust 支撑的可调用对象"所需的那几个 ──
+        //
+        // 这是反向调用的关键：脚本要能**同步**要求宿主做事（`pb.read`），
+        // 而这要求宿主能给出一个真正的 Python 可调用对象。
+        // `PyCFunction_NewEx` 只依赖 `PyMethodDef`（4 个字段，布局稳定且公开），
+        // 比写 `PyModuleDef`（10 个字段）风险小得多。
+        /// `PyObject* PyCFunction_NewEx(PyMethodDef*, PyObject* self, PyObject* module)`
+        PyCFunction_NewEx:
+            unsafe extern "C" fn(*mut PyMethodDef, *mut c_void, *mut c_void) -> *mut c_void,
+        /// `PyObject* PyBytes_FromStringAndSize(const char*, Py_ssize_t)`（**新引用**）
+        PyBytes_FromStringAndSize: unsafe extern "C" fn(*const c_char, isize) -> *mut c_void,
+        /// `PyObject* PyTuple_GetItem(PyObject*, Py_ssize_t)`（借用）
+        PyTuple_GetItem: unsafe extern "C" fn(*mut c_void, isize) -> *mut c_void,
+        /// `Py_ssize_t PyTuple_Size(PyObject*)`
+        PyTuple_Size: unsafe extern "C" fn(*mut c_void) -> isize,
+        /// `unsigned long long PyLong_AsUnsignedLongLong(PyObject*)`
+        PyLong_AsUnsignedLongLong: unsafe extern "C" fn(*mut c_void) -> u64,
+        /// `void PyErr_SetString(PyObject* type, const char* message)`
+        PyErr_SetString: unsafe extern "C" fn(*mut c_void, *const c_char),
+        /// `PyObject* PyExc_RuntimeError`（异常类型，数据符号）
+        PyExc_RuntimeError: *mut *mut c_void,
+        /// `PyObject* PyExc_ValueError`（异常类型，数据符号）
+        PyExc_ValueError: *mut *mut c_void,
+        /// `PyObject* PyModule_GetDict(PyObject*)`（借用）
+        PyModule_GetDict: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        /// `int PyDict_SetItemString(PyObject*, const char*, PyObject*)`
+        PyDict_SetItemString:
+            unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> c_int,
     }
 
     // SAFETY: 这些指针由 DLL 持有；它们本身不访问线程局部状态。
@@ -123,6 +151,147 @@ mod imp {
     unsafe impl Send for PyApi {}
     unsafe impl Sync for PyApi {}
 
+    /// CPython 的方法表项（`PyMethodDef`）。4 个字段、布局公开且长期稳定。
+    ///
+    /// 只写这一个结构体、**不写 `PyModuleDef`**：后者字段多一倍，而它带来的能力
+    /// （注册一个模块）我们并不需要——我们只要一个可调用对象，然后自己把它
+    /// 塞进 `pb` 模块的字典里。
+    #[repr(C)]
+    struct PyMethodDef {
+        name: *const c_char,
+        method: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+        flags: c_int,
+        doc: *const c_char,
+    }
+
+    /// `METH_VARARGS`：方法收到一个参数元组。
+    const METH_VARARGS: c_int = 0x0001;
+
+    /// 让含裸指针的 `PyMethodDef` 能放进静态。
+    ///
+    /// 需要静态是因为 **CPython 只存指针、不拷贝** `PyMethodDef`：
+    /// 放在栈上会让可调用对象持有一个悬空的方法表。
+    struct SyncMethodDef(PyMethodDef);
+    // SAFETY: 内容在进程生命周期内不变，只读共享没有数据竞争。
+    unsafe impl Sync for SyncMethodDef {}
+
+    /// 回调路径要用的函数表。**刻意不经过宿主的互斥锁**。
+    ///
+    /// 为什么需要第二份：分发的加锁顺序是"先锁宿主 → 再取 GIL"，而回调是在
+    /// **已经持有 GIL** 时被调用的。如果回调再去抢同一个互斥锁，两条路径的
+    /// 加锁顺序就相反了——A 持有 GIL 等锁、B 持有锁等 GIL，经典死锁。
+    /// 函数表本身不可变，所以另存一份静态给回调直接读。
+    static CALLBACK_API: std::sync::OnceLock<PyApi> = std::sync::OnceLock::new();
+
+    /// `_pb_read_native(address, length) -> bytes`：脚本侧的内存读。
+    ///
+    /// 能力校验发生在**这里**（调用 `pb_memory_read`），而不是在 Python 侧：
+    /// 脚本可以随手改 Python 里的任何东西，闸门必须在够不着的那一侧。
+    unsafe extern "C" fn pb_read_native(_self: *mut c_void, args: *mut c_void) -> *mut c_void {
+        let Some(api) = CALLBACK_API.get() else {
+            // 连函数表都没有：无法构造异常，返回空指针（Python 侧会看到失败）。
+            return std::ptr::null_mut();
+        };
+        let fail = |message: &str| -> *mut c_void {
+            let text = c_string(message).unwrap_or_default();
+            // SAFETY: 异常类型是 DLL 里的数据符号；解除引用得到 PyObject*。
+            let kind = unsafe { *api.PyExc_RuntimeError };
+            // SAFETY: kind 是异常类型；text 在本调用期间存活。
+            unsafe { (api.PyErr_SetString)(kind, text.as_ptr()) };
+            std::ptr::null_mut()
+        };
+        if args.is_null() {
+            return fail("pb.read 需要两个参数：地址与长度");
+        }
+        // SAFETY: args 是参数元组（METH_VARARGS 约定）。
+        let count = unsafe { (api.PyTuple_Size)(args) };
+        if count != 2 {
+            return fail(&format!(
+                "pb.read 需要两个参数（地址、长度），收到 {count} 个"
+            ));
+        }
+        // SAFETY: 索引 0/1 在范围内，返回借用引用。
+        let (address_object, length_object) = unsafe {
+            (
+                (api.PyTuple_GetItem)(args, 0),
+                (api.PyTuple_GetItem)(args, 1),
+            )
+        };
+        if address_object.is_null() || length_object.is_null() {
+            return fail("pb.read 的参数取不到");
+        }
+        // SAFETY: 两个对象都非空；`PyLong_AsUnsignedLongLong` 对非整数会设异常
+        // 并返回 (unsigned long long)-1，因此低于长度校验要挡住它。
+        let (address, length) = unsafe {
+            (
+                (api.PyLong_AsUnsignedLongLong)(address_object),
+                (api.PyLong_AsUnsignedLongLong)(length_object),
+            )
+        };
+        if length == u64::MAX || address == u64::MAX {
+            // `PyLong_AsUnsignedLongLong` 对非整数会设异常并返回 (unsigned long long)-1。
+            // 这里把它换成一个说清"要整数"的 ValueError——否则脚本看到的会是
+            // 一句与真实原因无关的转换错误。
+            // SAFETY: 异常类型是 DLL 里的数据符号；消息是 NUL 结尾的字面量。
+            unsafe {
+                (api.PyErr_SetString)(
+                    *api.PyExc_ValueError,
+                    c"pb.read 的地址/长度必须是整数".as_ptr(),
+                );
+            }
+            return std::ptr::null_mut();
+        }
+        if length > MAX_SCRIPT_READ_BYTES {
+            return fail(&format!(
+                "pb.read 单次上限 {MAX_SCRIPT_READ_BYTES} 字节（收到 {length}）；\
+                 大范围请分段读或改用 snapshot"
+            ));
+        }
+        let mut buffer = vec![0u8; length as usize];
+        let mut written: c_uint = 0;
+        // SAFETY: buffer 有 length 字节；written 指向本栈变量。
+        // **走 agent 自己的导出**，于是能力闸门、地址校验、错误文本
+        // 与 Hub 侧调用完全同一条路（不给脚本开小门）。
+        let code = unsafe {
+            crate::exports::pb_memory_read(
+                address,
+                length as c_uint,
+                buffer.as_mut_ptr(),
+                length as c_uint,
+                &raw mut written,
+            )
+        };
+        if code != 0 {
+            // 失败原因由导出面写在 last_error 里（带地址与 Windows 错误码）。
+            // SAFETY: pb_last_error 返回 DLL 内 NUL 结尾的字符串。
+            let reason = unsafe {
+                std::ffi::CStr::from_ptr(crate::exports::pb_last_error())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            return fail(&reason);
+        }
+        buffer.truncate(written as usize);
+        // SAFETY: buffer 的指针与长度一致；返回值是新引用（由调用方持有）。
+        unsafe {
+            (api.PyBytes_FromStringAndSize)(buffer.as_ptr().cast::<c_char>(), buffer.len() as isize)
+        }
+    }
+
+    /// 脚本单次 `pb.read` 的上限。
+    ///
+    /// 比链路层的上限大得多（脚本是"在里面"读，不用把数据搬过 socket），
+    /// 但仍要有：没有上限的话一次手滑的 `pb.read(addr, 1<<40)` 会试图分配
+    /// 一个天文数字的缓冲区，把目标进程的内存直接吃光。
+    const MAX_SCRIPT_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// `_pb_read_native` 的方法表（必须是静态：CPython 只存指针）。
+    static READ_NATIVE_DEF: SyncMethodDef = SyncMethodDef(PyMethodDef {
+        name: c"_pb_read_native".as_ptr(),
+        method: pb_read_native,
+        flags: METH_VARARGS,
+        doc: c"read target memory: read(address, length) -> bytes".as_ptr(),
+    });
     /// 一个"新引用"的 RAII 持有者：离开作用域时 `Py_DecRef`。
     ///
     /// 为什么必须有它：CPython 的引用计数一旦漏掉就变成内存泄漏，
@@ -194,11 +363,16 @@ _pb = _types.ModuleType("pb")
 _pb.log = _pb_log
 _pb.mark = _pb_mark
 _pb.subscribe = _pb_subscribe
+# read 由 Rust 提供（`_pb_read_native`），因为读内存必须过能力闸门——
+# 闸门在 Rust 侧才够不着（脚本能改 Python 里的任何东西）。
+_pb.read = _pb_read_native
 _pb.__doc__ = "PinBridge 目标侧接口（由 agent 注入，不是安装到环境里的包）"
 _sys.modules["pb"] = _pb
 
 def _pb_drain_json():
-    payload = _json.dumps(_PB_OUTBOX)
+    # ensure_ascii=False：日志里的中文不该被转成 \uXXXX——
+    # 这些文本是给人和 AI 读的，转义只会让它更难读。
+    payload = _json.dumps(_PB_OUTBOX, ensure_ascii=False)
     del _PB_OUTBOX[:]
     return payload
 
@@ -301,6 +475,21 @@ def _pb_dispatch(combined_json):
             let bytes_size = must!("PyBytes_Size");
             let dec_ref = must!("Py_DecRef");
             let object_str = must!("PyObject_Str");
+            // 异常类型是**数据符号**：取到的是"指向 PyObject* 的指针"。
+            let exc_runtime_error = GetProcAddress(module, c"PyExc_RuntimeError".as_ptr());
+            let exc_value_error = GetProcAddress(module, c"PyExc_ValueError".as_ptr());
+            if exc_runtime_error.is_null() || exc_value_error.is_null() {
+                FreeLibrary(module);
+                return None;
+            }
+            let cfunction_new = must!("PyCFunction_NewEx");
+            let bytes_from_string_and_size = must!("PyBytes_FromStringAndSize");
+            let tuple_get_item = must!("PyTuple_GetItem");
+            let tuple_size = must!("PyTuple_Size");
+            let long_as_unsigned = must!("PyLong_AsUnsignedLongLong");
+            let err_set_string = must!("PyErr_SetString");
+            let module_get_dict = must!("PyModule_GetDict");
+            let dict_set_item_string = must!("PyDict_SetItemString");
             let err_print = must!("PyErr_Print");
             // 可选：3.13 之前没有这个符号。
             let is_finalizing =
@@ -386,6 +575,44 @@ def _pb_dispatch(combined_json):
                     *mut c_void,
                     unsafe extern "C" fn(*mut c_void) -> *mut c_void,
                 >(object_str),
+                PyCFunction_NewEx: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut PyMethodDef, *mut c_void, *mut c_void) -> *mut c_void,
+                >(cfunction_new),
+                PyBytes_FromStringAndSize: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*const c_char, isize) -> *mut c_void,
+                >(bytes_from_string_and_size),
+                PyTuple_GetItem: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, isize) -> *mut c_void,
+                >(tuple_get_item),
+                PyTuple_Size: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> isize,
+                >(tuple_size),
+                PyLong_AsUnsignedLongLong: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> u64,
+                >(long_as_unsigned),
+                PyErr_SetString: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, *const c_char),
+                >(err_set_string),
+                // 数据符号：`GetProcAddress` 给的是"那个变量的地址"，
+                // 我们要的是"变量里存的值"（指向异常类型的 `PyObject*`）。
+                // 用 `cast` 而不是 `transmute`：这是一次指针类型转换，
+                // 不是跨类型重解释。
+                PyExc_RuntimeError: exc_runtime_error.cast::<*mut c_void>(),
+                PyExc_ValueError: exc_value_error.cast::<*mut c_void>(),
+                PyModule_GetDict: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+                >(module_get_dict),
+                PyDict_SetItemString: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> c_int,
+                >(dict_set_item_string),
             })
         }
     }
@@ -480,6 +707,17 @@ def _pb_dispatch(combined_json):
                 // 因为**我们永远不 finalize**（见 Drop 的说明），它不需要被恢复使用。
                 saved_thread = unsafe { (api.PyEval_SaveThread)() };
             }
+            // 回调路径要用的第二份函数表（见 `CALLBACK_API` 的说明）。
+            //
+            // 这里再 `LoadLibraryA` 一次同一份 DLL：拿到的是一个**独立的引用**，
+            // 也就避免了"回调必须去抢宿主互斥锁"这条死锁路径。
+            // 设置失败（例如另一条线程先设上了）就把这份丢掉——DLL 的引用计数
+            // 会退回，不影响任何东西。
+            if CALLBACK_API.get().is_none() {
+                if let Some(extra) = try_load(&library) {
+                    let _ = CALLBACK_API.set(extra);
+                }
+            }
             Ok(Self {
                 api: Some(api),
                 library,
@@ -534,7 +772,63 @@ def _pb_dispatch(combined_json):
         ///
         /// 幂等：重复调用只会覆盖同名入口。
         pub(crate) fn bootstrap(&self) -> Result<()> {
+            self.install_host_callables()?;
             self.run(BOOTSTRAP)
+        }
+
+        /// 把 Rust 支撑的可调用对象放进 `__main__`，再让引导脚本把它接到
+        /// `pb` 模块上。
+        ///
+        /// 分工是刻意的：**对外长什么样由 Python 决定**（名字、docstring、
+        /// 包装逻辑都可以在 Python 里改），Rust 只提供最小的原生函数。
+        fn install_host_callables(&self) -> Result<()> {
+            let api = self.api()?;
+            // SAFETY: 全程持有 GIL；返回值全部交给 `Owned`。
+            let gil = unsafe { (api.PyGILState_Ensure)() };
+            let result = (|| -> Result<()> {
+                // 静态方法表只用作参数：`PyCFunction_NewEx` 只存指针，不拷贝，
+                // 所以它必须活到进程结束（见 `READ_NATIVE_DEF` 的说明）。
+                let callable = Owned::new(
+                    api,
+                    // SAFETY: 方法表是静态的，会活到进程结束；self/module 传空。
+                    unsafe {
+                        (api.PyCFunction_NewEx)(
+                            std::ptr::addr_of!(READ_NATIVE_DEF.0).cast_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                );
+                if callable.is_null() {
+                    // SAFETY: 打印并清掉 CPython 侧的错误信息。
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script("构造原生可调用对象失败".into()));
+                }
+                // SAFETY: `PyImport_AddModule` 返回借用引用。
+                let main = unsafe { (api.PyImport_AddModule)(c"__main__".as_ptr()) };
+                if main.is_null() {
+                    return Err(Error::Script("取不到 __main__ 模块".into()));
+                }
+                // SAFETY: main 有效；返回借用引用。
+                let dict = unsafe { (api.PyModule_GetDict)(main) };
+                if dict.is_null() {
+                    return Err(Error::Script("取不到 __main__ 的字典".into()));
+                }
+                // `PyDict_SetItemString` 会自己 incref（不偷引用），
+                // 所以 `callable` 仍然由 `Owned` 负责释放。
+                // SAFETY: dict/callable 有效，键是 NUL 结尾的字面量。
+                let code = unsafe {
+                    (api.PyDict_SetItemString)(dict, c"_pb_read_native".as_ptr(), callable.object())
+                };
+                if code != 0 {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script("把原生可调用对象放进 __main__ 失败".into()));
+                }
+                Ok(())
+            })();
+            // SAFETY: gil 来自上面的 Ensure。
+            unsafe { (api.PyGILState_Release)(gil) };
+            result
         }
 
         /// 调用 `__main__` 里的一个函数，可选传一个字符串参数，返回其字符串结果。
@@ -1085,6 +1379,99 @@ pb.log("script loaded")
             .expect("分发到无人订阅的事件名也应当成功");
         assert_eq!(none, 0, "没有订阅者时应当返回 0");
         println!("✓ 未订阅事件名返回 0（不假装分发过）");
+    }
+    /// `pb.read` 端到端：脚本读一段**真实的目标内存**，把读到的魔数报回来。
+    ///
+    /// 地址通过 `__main__` 的一个全局变量交给脚本——这正是 AI 会遇到的形态：
+    /// 地址来自别处（模块列表、事件、上一次读取），脚本拿它去读。
+    #[test]
+    fn pb_read_returns_real_target_memory() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        // 1) 准备一段真实内存（agent 自己的地址空间里）并写进魔数
+        static mut TARGET_BUFFER: [u8; 16] = [0u8; 16];
+        let address = std::ptr::addr_of_mut!(TARGET_BUFFER).cast::<u8>() as u64;
+        crate::memory::write_process(address, b"PBREAD42").expect("写测试缓冲区应当成功");
+
+        // 2) 给脚本一个能力集（含 mem_read），再加载脚本
+        let capability_ok = crate::exports::pb_set_capabilities(
+            pinbridge_core::capability::Capability::read_only_baseline().bits(),
+        );
+        assert_eq!(capability_ok, 0, "设置能力应当成功");
+
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+        // 地址作为全局注入：脚本从 globals 里拿
+        host.run(&format!("PB_TARGET_ADDRESS = {address}"))
+            .expect("注入地址应当成功");
+        host.run(
+            r#"
+import pb
+
+data = pb.read(PB_TARGET_ADDRESS, 8)
+pb.mark("magic", int.from_bytes(data, "little"))
+"#,
+        )
+        .expect("脚本读内存应当成功");
+
+        let drained = host.drain_outputs().expect("drain 应当成功");
+        println!("✓ 脚本读到的内存：{drained}");
+        let expected: u64 = u64::from_le_bytes(*b"PBREAD42");
+        assert!(
+            drained.contains(&format!("[2, {expected},")),
+            "脚本应当把读到的 8 字节按小端报回来（期望 {expected}）：{drained}"
+        );
+    }
+
+    /// 没有 `mem_read` 能力时，`pb.read` 必须**抛异常**，而不是返回空数据。
+    ///
+    /// 返回空数据会让脚本把"没权限"当成"这段内存是零"——那是**静默的错误结论**，
+    /// 比报错危险得多。
+    #[test]
+    fn pb_read_is_gated_by_capability_and_says_so() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        // 清空能力（含 mem_read）
+        let cleared = crate::exports::pb_set_capabilities(0);
+        assert_eq!(cleared, 0);
+
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+        let outcome = host.run(
+            r#"
+import pb
+
+try:
+    pb.read(0x1000, 4)
+    raise AssertionError("没有 mem_read 却读成功了")
+except RuntimeError as exc:
+    pb.log("denied: %s" % exc)
+"#,
+        );
+        // 脚本自己处理了异常，所以 run 应当成功；关键看它记录下来的原因。
+        outcome.expect("脚本应当能捕获并记录拒绝原因");
+        let drained = host.drain_outputs().expect("drain 应当成功");
+        println!("✓ 能力拒绝被脚本看见：{drained}");
+        assert!(
+            drained.contains("denied"),
+            "脚本应当记录下拒绝原因：{drained}"
+        );
+        assert!(
+            drained.to_lowercase().contains("capability")
+                || drained.contains("能力")
+                || drained.contains("mem_read"),
+            "拒绝原因必须点明是能力不足：{drained}"
+        );
+        // 恢复：别的用例还要用解释器
+        let _ = crate::exports::pb_set_capabilities(
+            pinbridge_core::capability::Capability::read_only_baseline().bits(),
+        );
     }
     #[test]
     fn missing_library_is_an_actionable_error_not_a_fallback() {

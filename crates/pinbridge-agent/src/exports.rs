@@ -334,14 +334,24 @@ pub extern "C" fn pb_kind_name(code: c_uint) -> *const c_char {
     }
 }
 
-/// 读目标内存（M0 桩）。
+/// 读目标内存。
+///
+/// ## 为什么用 `ReadProcessMemory`，而不是直接解引用
+///
+/// agent 就在目标进程里，`*(addr as *const u8)` 看着最直接，但它对**不可读地址**
+/// 是把目标打崩（访问违例），而不是返回错误。被分析的程序里到处是未映射页、
+/// 保护页、只在某个瞬间可读的区域——"读之前不知道能不能读"是常态。
+///
+/// `ReadProcessMemory(GetCurrentProcess(), …)` 会先做范围校验：
+/// 读不了就返回 FALSE + 错误码，进程不受影响。代价是一次内核调用，
+/// 换来的是一条**可失败的**读取路径。
 ///
 /// # Safety
 ///
 /// `out` 必须是指向 `out_capacity` 字节的可写缓冲区（或 `NULL`）。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pb_memory_read(
-    _address: u64,
+    address: u64,
     length: c_uint,
     out: *mut u8,
     out_capacity: c_uint,
@@ -365,7 +375,26 @@ pub unsafe extern "C" fn pb_memory_read(
     }
     // SAFETY: out_written 已判空
     unsafe { *out_written = 0 };
-    stub(Capability::MemRead, "pb_memory_read")
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::MemRead)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    // SAFETY: out 非空且容量 >= length（上面已校验）；out 指向 length 字节可写区。
+    let buffer = unsafe { std::slice::from_raw_parts_mut(out, length as usize) };
+    match crate::memory::read_process(address, buffer) {
+        Ok(read) => {
+            // SAFETY: out_written 已判空
+            unsafe { *out_written = read as c_uint };
+            Status::Ok.code()
+        }
+        Err(reason) => AgentHost::with(|state| {
+            // 读失败的原因必须带**地址**：调用方（尤其是 AI）需要知道
+            // 是"这个地址读不了"还是"权限/能力不够"，两者的下一步动作完全不同。
+            state.fail(
+                Status::Internal,
+                &format!("pb_memory_read: 读 0x{address:x}（{length} 字节）失败——{reason}"),
+            )
+        }),
+    }
 }
 
 /// 写目标内存（M0 桩）。
@@ -374,13 +403,36 @@ pub unsafe extern "C" fn pb_memory_read(
 ///
 /// `bytes` 必须指向 `length` 字节的可读缓冲区（或 `NULL`）。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pb_memory_write(_address: u64, bytes: *const u8, length: c_uint) -> c_int {
+pub unsafe extern "C" fn pb_memory_write(address: u64, bytes: *const u8, length: c_uint) -> c_int {
     if bytes.is_null() && length != 0 {
         return AgentHost::with(|state| {
             state.fail(Status::InvalidArgument, "pb_memory_write: bytes 为空指针")
         });
     }
-    stub(Capability::MemWrite, "pb_memory_write")
+    if let Err(error) = AgentHost::with(|state| state.require(Capability::MemWrite)) {
+        return AgentHost::with(|state| state.fail(Status::CapabilityDenied, &error.to_string()));
+    }
+    // SAFETY: bytes 非空（length==0 时读 0 字节，指针不参与运算）
+    let source = unsafe { std::slice::from_raw_parts(bytes, length as usize) };
+    match crate::memory::write_process(address, source) {
+        Ok(written) if written == length as usize => Status::Ok.code(),
+        // 部分写入必须**当作失败**报出来：调用方以为整段都写进去了，
+        // 而实际只写了前半截——这类错误在后续某个时刻才显形，最难查。
+        Ok(written) => AgentHost::with(|state| {
+            state.fail(
+                Status::Internal,
+                &format!(
+                    "pb_memory_write: 只写入了 {written}/{length} 字节（部分写入按失败处理）",
+                ),
+            )
+        }),
+        Err(reason) => AgentHost::with(|state| {
+            state.fail(
+                Status::Internal,
+                &format!("pb_memory_write: 写 0x{address:x}（{length} 字节）失败——{reason}"),
+            )
+        }),
+    }
 }
 
 /// 下断点（M0 桩）。
@@ -748,6 +800,62 @@ pb.subscribe("syscall_enter", on_syscall)
         assert_eq!(ours[0].args[1], 0x50, "报回来的值必须就是事件里的 args[0]");
         println!("✓ 脚本被事件驱动，输出进了事件流：{:?}", ours[0]);
     }
+    /// 导出面：真实的内存读写（Hub 侧走的就是这几个导出）。
+    ///
+    /// 用 agent 自己的静态缓冲区当靶子：地址确定、不需要额外进程。
+    #[test]
+    fn memory_read_and_write_go_through_the_real_path() {
+        static mut BUFFER: [u8; 32] = [0u8; 32];
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        let address = std::ptr::addr_of_mut!(BUFFER).cast::<u8>() as u64;
+
+        // 1) 没有能力：写必须被拦下，**且不能真的写进去**
+        assert_eq!(pb_set_capabilities(0), Status::Ok.code());
+        let pattern = b"PBRW-EXPORT";
+        // SAFETY: pattern 有 pattern.len() 字节
+        let denied = unsafe { pb_memory_write(address, pattern.as_ptr(), 11) };
+        assert_eq!(denied, Status::CapabilityDenied.code(), "没能力时必须拒绝");
+        // SAFETY: 地址指向本测试的静态缓冲区
+        let untouched = unsafe { *std::ptr::addr_of!(BUFFER) };
+        assert_eq!(untouched, [0u8; 32], "被拒绝的写绝不能真的落下去");
+
+        // 2) 给读写能力：写进去，再读回来
+        let bits = Capability::MemRead.bit() | Capability::MemWrite.bit();
+        assert_eq!(pb_set_capabilities(bits), Status::Ok.code());
+        // SAFETY: 同上
+        assert_eq!(
+            unsafe { pb_memory_write(address, pattern.as_ptr(), 11) },
+            Status::Ok.code(),
+            "有 mem_write 时写应当成功"
+        );
+        let mut buffer = [0u8; 11];
+        let mut written = 0u32;
+        // SAFETY: buffer 有 11 字节，written 指向本栈变量
+        assert_eq!(
+            unsafe { pb_memory_read(address, 11, buffer.as_mut_ptr(), 11, &mut written) },
+            Status::Ok.code()
+        );
+        assert_eq!(written, 11);
+        assert_eq!(&buffer, pattern, "读回来的必须就是写进去的");
+        println!("✓ 导出面读写可用：{:?}", String::from_utf8_lossy(&buffer));
+
+        // 3) 不可读地址：必须是**错误**而不是崩溃（这条路径以前是直接解引用）
+        let mut sink = [0u8; 8];
+        // SAFETY: sink 有 8 字节
+        let code =
+            unsafe { pb_memory_read(0xDEAD_BEEF_0000, 8, sink.as_mut_ptr(), 8, &raw mut written) };
+        assert_eq!(code, Status::Internal.code(), "不可读地址应当报错");
+        // SAFETY: 立刻拷贝
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(
+            text.contains("0xdeadbeef0000"),
+            "错误文本要带上地址：{text}"
+        );
+        println!("✓ 不可读地址报错且带地址：{text}");
+    }
     /// 策略检查必须**先于**解释器：这条顺序让"注入前拦截"在没有 Python 的
     /// 机器上也成立，而且违规脚本的报错不会掺进"Python 没装"这种无关信息。
     #[test]
@@ -819,14 +927,20 @@ pb.subscribe("syscall_enter", on_syscall)
         let code = unsafe { pb_memory_read(0x1000, 4, buffer.as_mut_ptr(), 16, &mut written) };
         assert_eq!(code, Status::CapabilityDenied.code(), "无能力时必须被拒");
 
-        // 3) 给足能力 → 桩实现返回 not_supported（而不是静默成功）
+        // 3) 给足能力 → 真实读取。这里故意用一个几乎不可能被映射的地址：
+        //    要求是"**失败并说清原因**"，而不是静默成功。
+        //    （真实可读地址的往返在 `memory_read_and_write_go_through_the_real_path` 里测。）
         assert_eq!(pb_set_capabilities(u32::MAX), Status::Ok.code());
         let code = unsafe { pb_memory_read(0x1000, 4, buffer.as_mut_ptr(), 16, &mut written) };
         assert_eq!(
             code,
-            Status::NotSupported.code(),
-            "M0 桩必须显式失败，不能假装成功"
+            Status::Internal.code(),
+            "不可读地址必须显式失败，不能假装成功"
         );
+        // SAFETY: 立刻拷贝成 String
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("0x1000"), "失败原因要带上地址：{text}");
+        assert!(text.contains("Windows 错误"), "要带上系统错误码：{text}");
 
         // 4) 越界参数
         let code = unsafe { pb_memory_read(0x1000, 32, buffer.as_mut_ptr(), 16, &mut written) };

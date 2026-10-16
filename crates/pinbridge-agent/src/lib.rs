@@ -36,6 +36,7 @@
 pub mod exports;
 pub mod host;
 pub mod link;
+pub mod memory;
 pub mod modules;
 pub mod python_host;
 pub mod script;
