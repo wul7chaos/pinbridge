@@ -115,6 +115,35 @@ fn attach(session: SessionId, script: ScriptId) -> Result<()>;
 
 * 模块级文档（`//!`）要说清这个模块**不做什么**，这比说它做什么更有用。
 
+## 平台相关的 `cfg`
+
+本项目的条件编译集中在少数几处（`pinbridge-sys` 的加载器、
+`pinbridge-client` 的回环检查），但**它们带来一类宿主平台抓不到的 lint**：
+
+> 某个 `use` 只被 `#[cfg(windows)]` 的代码用到。在 Windows 上它有用，
+> 在 Linux 上就是 `unused_imports` —— 而 CI 的 `-D warnings` 会直接失败。
+
+对策（两条，都要做）：
+
+```powershell
+# 1. 把"只被某个平台用到的项"改成条件导入，而不是无条件导入
+#[cfg(windows)]
+use crate::abi::PB_ABI_VERSION;
+
+# 2. 本地也跑一遍跨平台 lint（需要先 rustup target add x86_64-unknown-linux-gnu）
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+```
+
+`scripts/verify.ps1` 已经内置了第 2 条（装了 linux 目标就自动跑）。
+
+**测试模块也要注意**：`use super::*` 不会带进 `#[cfg(windows)]` 的导入，
+所以测试里要显式 `use crate::abi::PB_ABI_VERSION;`，
+否则测试只在非宿主平台上编译失败。
+
+> 这条规则是一次真实 CI 失败换来的：`pinbridge-sys` 的
+> `PB_ABI_VERSION` 无条件导入，Windows 本地 clippy 全绿，
+> Ubuntu 上 clippy 直接红。
+
 ## 测试
 
 * 单测放在同文件 `#[cfg(test)] mod tests`；跨模块行为放 `tests/`；

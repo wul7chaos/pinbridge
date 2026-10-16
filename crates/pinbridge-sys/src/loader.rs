@@ -17,7 +17,13 @@ use std::os::raw::{c_char, c_int, c_uint};
 
 use pinbridge_core::error::{Error, Result};
 
-use crate::abi::{PbEventRaw, PbSet, Status, PB_ABI_VERSION};
+use crate::abi::{PbEventRaw, PbSet, Status};
+// 注意：`PB_ABI_VERSION` 只在 `#[cfg(windows)]` 的 `load()` 里用到，
+// 因此**不能**在文件顶部无条件导入——那会让非 Windows 构建因 unused_imports 失败。
+// （这条就是 CI 的 Linux 任务抓出来的；本地靠
+//  `cargo clippy --target x86_64-unknown-linux-gnu` 复现。）
+#[cfg(windows)]
+use crate::abi::PB_ABI_VERSION;
 
 /// `pinbridge.dll` 的 ABI 函数签名表。
 ///
@@ -173,6 +179,9 @@ use pinbridge_core::capability::CapabilitySet;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 显式导入而不是依赖 `use super::*`：上面的同名导入是 `#[cfg(windows)]` 的，
+    // 而测试要在所有平台上都能编译（CI 的 Linux 任务会跑这些测试）。
+    use crate::abi::PB_ABI_VERSION;
 
     #[test]
     fn missing_dll_is_a_clear_error_not_a_panic() {

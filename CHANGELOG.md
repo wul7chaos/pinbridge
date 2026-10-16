@@ -24,6 +24,14 @@
 
 M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与验证方式先钉死"。
 
+### 修复
+- `pinbridge-sys` 的 `PB_ABI_VERSION` 无条件导入：Windows 本地 clippy 全绿，
+  Ubuntu 上因 `unused_imports` 直接失败。改为 `#[cfg(windows)]` 条件导入，
+  测试模块显式导入；并把「跨平台 lint」加进 `scripts/verify.ps1` /
+  `verify.sh` 与 `docs/dev/coding-standards-rust.md`。
+- `commit-msg` 钩子的标题长度按字节计算导致合法中文标题被误判为超长；
+  改为按 UTF-8 结构计算显示列（中文 2 列），不依赖 locale。
+
 ### 新增
 - Rust 工作区（9 个 crate）：`core` / `proto` / `trace` / `hub` /
   `client` / `sys` / `agent` / `mcp` / `cli`，依赖方向单向。

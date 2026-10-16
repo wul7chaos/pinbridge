@@ -31,6 +31,16 @@ step() {
 step "cargo fmt --check" "运行 cargo fmt --all" cargo fmt --all -- --check
 step "cargo clippy -D warnings" "按提示修代码，不要改 lint 配置" \
   cargo clippy --workspace --all-targets -- -D warnings
+# 跨平台 lint：Windows 上必须额外跑一遍 linux 目标，否则 cfg 分支里的问题
+# 会等到 CI 的 ubuntu 任务才暴露（scripts/verify.ps1 里有对应的说明）。
+if [ "$(uname -s)" = "MINGW64_NT-"* ] || [ "${OS:-}" = "Windows_NT" ]; then
+  if rustup target list --installed 2>/dev/null | grep -q '^x86_64-unknown-linux-gnu$'; then
+    step "cargo clippy --target x86_64-unknown-linux-gnu" "检查只在非 Windows 暴露的 lint" \
+      cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  else
+    echo "· 未安装 linux 目标，跳过跨平台 lint（rustup target add x86_64-unknown-linux-gnu）"
+  fi
+fi
 step "cargo test --workspace" "先看第一个失败的用例" cargo test --workspace
 step "端到端自检（pinbridge demo）" "检查 demo 断在哪一步" \
   cargo run --quiet -p pinbridge-cli -- demo --trace-dir "${TMPDIR:-/tmp}/pinbridge-verify"

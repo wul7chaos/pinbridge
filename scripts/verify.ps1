@@ -54,6 +54,19 @@ try {
         Step 'cargo clippy -D warnings' {
             cargo clippy --workspace --all-targets -- -D warnings
         } '按提示修代码；如需豁免，必须在 Cargo.toml 的 lint 表里写明理由'
+
+        # Windows 上有一条 clippy 类别**本机抓不到**：只在非 Windows 平台暴露的问题
+        # （典型例子：某个 `use` 只被 `#[cfg(windows)]` 的代码用到 → Linux 上 unused_imports）。
+        # 这类问题会等到 CI 的 ubuntu 任务才炸。装了 linux 目标时顺手在这里拦掉。
+        $linuxTarget = (rustup target list --installed 2>$null) -contains 'x86_64-unknown-linux-gnu'
+        if ($linuxTarget) {
+            Step 'cargo clippy --target x86_64-unknown-linux-gnu' {
+                cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+            } '检查只在非 Windows 平台暴露的 lint（cfg 分支里的未使用导入等）'
+        } else {
+            Write-Host "· 未安装 x86_64-unknown-linux-gnu 目标，跳过跨平台 lint" -ForegroundColor Yellow
+            Write-Host "  建议执行：rustup target add x86_64-unknown-linux-gnu（CI 会跑，但本地拦更早）" -ForegroundColor Yellow
+        }
     }
 
     Step 'cargo test --workspace' { cargo test --workspace } '先看第一个失败的用例，不要一次改多处'
