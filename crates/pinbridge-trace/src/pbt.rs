@@ -703,6 +703,97 @@ mod tests {
         }
     }
 
+    /// 写端缓冲：把写入的字节追加到共享 Vec（不落文件）。
+    struct SharedSink {
+        data: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.data.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// **边录边读**：写入方还在写的时候，读者就能读到"已完整的部分"。
+    ///
+    /// 这是流式回传最核心的契约：读取方不必等 `finish`。判据三条，缺一条都会让
+    /// "能读"变成"读到的东西不可信"：
+    ///   1. 提交标记存在，且它的 `last_sequence` **正好**是已落盘的条数
+    ///      （不是"大概"——读者要拿它当安全边界）；
+    ///   2. 写入方继续写之后，**同一个读端实例**能读到新增的记录；
+    ///   3. 新增记录的第一条序号**接得上**（错位会让序号跳变，
+    ///      而错位后的数据看起来仍然像正常记录）。
+    #[test]
+    fn a_reader_sees_a_complete_prefix_while_the_writer_is_still_writing() {
+        let shared = Rc::new(RefCell::new(Vec::new()));
+        let mut writer = PbtWriter::create(
+            SharedSink {
+                data: Rc::clone(&shared),
+            },
+            0,
+        )
+        .expect("建立写入器");
+        writer.meta("{\"target\":\"stream\"}").expect("写 meta");
+        for i in 1..=3u64 {
+            writer
+                .write_record(&Event::new(i, EventKind::SyscallEnter, 7, 0x1400_0000 + i))
+                .expect("写记录");
+        }
+        writer.flush().expect("提交标记");
+
+        // 读端从**当前**字节开始读（独立读取器，与写入方共享同一份字节）。
+        let mut reader = PbtReader::open_streaming(SharedRead {
+            data: Rc::clone(&shared),
+            pos: 0,
+        })
+        .expect("流式打开");
+
+        let first = reader.read_all().expect("读第一批");
+        assert_eq!(first.len(), 3, "提交标记之前的记录必须可读");
+        let marker = reader
+            .summary()
+            .expect("读汇总")
+            .expect("flush 应当已经写下提交标记");
+        assert_eq!(
+            marker.last_sequence, 3,
+            "提交标记的边界要正好是已落盘的条数"
+        );
+        assert_eq!(marker.records, 3);
+
+        // 写入方继续写第二批。
+        for i in 4..=6u64 {
+            writer
+                .write_record(&Event::new(i, EventKind::SyscallEnter, 7, 0x1400_0000 + i))
+                .expect("写记录");
+        }
+        writer.flush().expect("提交标记");
+
+        let second = reader.read_all().expect("读第二批");
+        assert_eq!(second.len(), 3, "同一读端实例必须能读到新增记录");
+        assert_eq!(second[0].sequence, 4, "序号必须接得上（错位会在这里暴露）");
+        assert_eq!(
+            reader
+                .summary()
+                .expect("读汇总")
+                .expect("第二个标记")
+                .last_sequence,
+            6
+        );
+
+        // 收尾：最终标记是权威的那个，且 END 之后不再有记录。
+        let (_, final_summary) = writer.finish().expect("收尾");
+        assert!(reader.read_all().expect("读到 END").is_empty());
+        assert_eq!(
+            reader.summary().expect("读汇总").expect("最终标记"),
+            final_summary,
+            "多个提交标记时**最后一个胜出**"
+        );
+    }
+
     /// 造一份**只有提交标记、没有收尾**的字节流：模拟"录制还在进行"。
     ///
     /// 与 `complete_trace_bytes` 的区别很重要：完整轨迹里有**两个**
