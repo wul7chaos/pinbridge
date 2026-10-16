@@ -81,7 +81,8 @@
 | ~~指令模板匹配（pattern_hit）~~ | ✅ 已完成：`-pb_pattern "id:name:hex"`，只扫主模块可执行段，命中点按**指令地址范围**匹配，`?` 通配、每模板上限可调（截断必报）。实测靶子带 8 字节魔数、调 500 次 → **命中 500 次**；`ctest -R pin_tool_pattern_hit` |
 | ~~TF 单步虚拟化（`flags_virtualize`）~~ | ✅ 已完成：`-pb_tf off\|watch\|virtualize`。`popfq`/`iretq` 在**栈上副本**里剥掉真实 TF，`pushfq` 在 AFTER 点把虚拟 TF 补回读副本。实测四档签名可证伪：单独跑靶子 `real_steps=50`；Pin 下不虚拟化则进程以 `0x80000004` 终止；virtualize 下 **`real_steps=0 tf_reads=50`**（目标确信自己在单步，其实没有）。`ctest -R tf` 三档覆盖 |
 
-| agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 策略层已就绪，缺的是运行时 |
+| ~~agent 内嵌 CPython（解释器宿主）~~ | ✅ 已完成：**运行时动态加载**（`LoadLibraryA` + `GetProcAddress`，`python3.dll` → `python314.dll`，可用 `PINBRIDGE_PYTHON_DLL` 指定）。链接导入库会让 agent 在没装 Python 的机器上**整个加载不了**，所以不链接。实测在进程内跑 `assert 6*7==42`、异常路径明确报错、指定不存在的库时不静默回退 |
+| `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ 解释器宿主已就绪；`pb_load_script` 会精确报"解释器已就绪（库名），但模块与回调分发尚未实现" |
 | 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |
 | 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |
 | ~~Hub 侧加载器解析 `pb_start_trace`/`pb_stop_trace`~~ | ✅ 已完成：`pinbridge-sys` 增加 `start_trace`/`stop_trace`（符号解析 + 参数校验 + 能力/状态码翻译），端到端测试**真的加载 DLL 并录出一份 `PBT1` 魔数的 `.pbt`** |

@@ -313,7 +313,48 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
             state.fail(Status::InvalidArgument, "pb_load_script: 脚本名或正文为空")
         });
     }
-    stub(Capability::ScriptLoad, "pb_load_script")
+    // 能力与策略检查都在**碰解释器之前**：一个没有 script_load 的调用方
+    // 不该触发"加载 30 MB 的解释器"这种副作用，更不该因此拿到"Python 没装"
+    // 这种与它无关的错误。
+    // 复用 stub() 来生成"能力不足"的文本，避免两处说法不一致。
+    if AgentHost::with(|state| state.require(Capability::ScriptLoad).is_err()) {
+        return stub(Capability::ScriptLoad, "pb_load_script");
+    }
+    // 策略检查（静态文本）：它不需要解释器，因此能在没有 Python 的机器上
+    // 先生效——这是刻意的，"注入前拦截"不该依赖运行时的存在。
+    if let Err(violation) = crate::script::ScriptPolicy::check(&script_source) {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::InvalidArgument,
+                &format!(
+                    "pb_load_script: 策略拒绝第 {} 行（{}）：{}",
+                    violation.line, violation.token, violation.reason
+                ),
+            )
+        });
+    }
+    // 到这里才碰解释器。三种结局，都**明确**说清：
+    //   1. 没有解释器          → not_supported + "装 Python 或指定 PINBRIDGE_PYTHON_DLL"
+    //   2. 有解释器、模块未实现 → not_supported + "解释器已就绪（xxx），pb 模块与回调分发待实现"
+    //   3. 解释器能跑脚本       → 下一步：注册脚本并分发回调
+    match crate::python_host::library_description() {
+        Ok(described) => AgentHost::with(|state| {
+            state.fail(
+                Status::NotSupported,
+                &format!(
+                    "pb_load_script: 脚本已通过策略检查，解释器已就绪（{described}）；\
+                     但 `pb` 模块（subscribe/log/mark/read）与探针回调分发尚未实现，\
+                     因此脚本不会被注册。见 docs/design/script-runtime.md 的落地顺序。"
+                ),
+            )
+        }),
+        Err(error) => AgentHost::with(|state| {
+            state.fail(
+                Status::NotSupported,
+                &format!("pb_load_script: 策略检查已通过，但解释器不可用——{error}"),
+            )
+        }),
+    }
 }
 
 /// 开始录制轨迹（M0 已可用）。
@@ -442,6 +483,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 策略检查必须**先于**解释器：这条顺序让"注入前拦截"在没有 Python 的
+    /// 机器上也成立，而且违规脚本的报错不会掺进"Python 没装"这种无关信息。
+    #[test]
+    fn script_policy_runs_before_the_interpreter() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        // 只给脚本能力，不给别的：这样"被拦下"的原因只可能是策略或解释器。
+        assert_eq!(
+            pb_set_capabilities(Capability::ScriptLoad.bit()),
+            Status::Ok.code()
+        );
+        let name = std::ffi::CString::new("demo").unwrap();
+        let violating = std::ffi::CString::new("import os\nos.system('calc')\n").unwrap();
+        // SAFETY: 两个 CString 在本调用期间存活
+        let code = unsafe { pb_load_script(name.as_ptr(), violating.as_ptr()) };
+        assert_eq!(
+            code,
+            Status::InvalidArgument.code(),
+            "策略违规必须是 invalid_argument（不是 not_supported）"
+        );
+        // SAFETY: pb_last_error 返回 DLL 内的 NUL 结尾字符串，立刻拷贝成本地 String
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("策略拒绝"), "错误必须点名是策略拒绝：{text}");
+        assert!(
+            !text.contains("解释器"),
+            "策略拒绝的文本里不该出现解释器（那说明顺序反了）：{text}"
+        );
+        println!("✓ 策略先于解释器：{text}");
+
+        // 干净的脚本：这里才轮到解释器。语言/平台差异都由这一层表达，
+        // 测试只要求"状态码是 not_supported 且原因明确指向解释器"。
+        let clean = std::ffi::CString::new("value = 1 + 1\nassert value == 2\n").unwrap();
+        // SAFETY: 同上
+        let code = unsafe { pb_load_script(name.as_ptr(), clean.as_ptr()) };
+        assert_eq!(
+            code,
+            Status::NotSupported.code(),
+            "脚本注册尚未实现，必须是 not_supported"
+        );
+        // SAFETY: 同上
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("解释器"), "原因必须指向解释器这一层：{text}");
+        println!("✓ 干净脚本走到解释器这一步：{text}");
+    }
     #[test]
     fn abi_surface_smoke() {
         let _guard = crate::host::GLOBAL_STATE_LOCK
