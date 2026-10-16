@@ -44,6 +44,16 @@ param(
     [switch]$WithPin
 )
 
+# 带 Pin 的构建用**独立的构建目录**，而且必须在 `$configArgs` 组装之前决定。
+#
+# 起因是一次真实的时间浪费：`verify.ps1`（不带 Pin）会重新配置 native/build 并把
+# PINBRIDGE_WITH_PIN 置 OFF，于是随后"带 Pin 的构建"其实什么都没编译，跑起来
+# 还是旧的 DLL——表现为旋钮"unknown option"。两个用途共用一个构建目录，
+# 谁最后跑谁说了算；这种事必须靠目录隔离，不能靠记忆。
+if ($WithPin -and -not $PSBoundParameters.ContainsKey('BuildDir')) {
+    $BuildDir = 'native/build-pin'
+}
+
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
@@ -133,6 +143,19 @@ if ($WithPin) {
     $configArgs += "-DPIN_ROOT=$pinRoot"
 } else {
     $configArgs += "-DPINBRIDGE_WITH_PIN=OFF"
+}
+
+# 缓存与本次请求不一致时**说出来**：CMake 会按 -D 重新配置，但"我明明加了
+# -WithPin 怎么还是没编"这种困惑不该靠人自己发现。这里直接比对缓存值。
+$cacheFile = Join-Path $BuildDir 'CMakeCache.txt'
+if (Test-Path $cacheFile) {
+    $cached = (Select-String -Path $cacheFile -Pattern '^PINBRIDGE_WITH_PIN:BOOL=(\w+)' |
+        Select-Object -First 1).Matches[0].Groups[1].Value
+    $want = if ($WithPin) { 'ON' } else { 'OFF' }
+    if ($cached -and $cached -ne $want) {
+        Write-Host "注意：$BuildDir 之前的缓存是 PINBRIDGE_WITH_PIN=$cached，本次按 $want 重新配置" -ForegroundColor Yellow
+        Write-Host "      （带 Pin 与不带 Pin 用不同构建目录，避免互相覆盖）" -ForegroundColor DarkGray
+    }
 }
     Info "配置：cmake $($configArgs -join ' ')"
     & $cmake @configArgs 2>&1 | Select-String -Pattern 'agent DLL|WARNING|Error|error' | Select-Object -First 5

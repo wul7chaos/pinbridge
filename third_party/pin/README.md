@@ -112,6 +112,26 @@ DynamoRIO（BSD、官方支持 AMD64）、QBDI、TinyInst——换基座只需�
 8. Pin 的包含顺序会引入它自带的 STL/CRT，实测 `std::vector::data()` 与
    `std::uint64_t` 在那个编译单元里解析不到——用 Pin 自己的 `UINT64`/`UINT32`。
 
+## 用 Pin 做"高频探针"的两个硬约束（实测）
+
+这两条是我们在做系统调用探针时踩出来的，写在这里因为它们**与 Pin 本身有关**，
+不是我们代码里的偶发 bug：
+
+1. **回调里不要调用外部的 DLL**（哪怕是自己的）。在系统调用回调上下文里调用
+   桥接层会稳定崩溃：`RECEIVED_ACCESS_FAULT, Access Address = 0x8`，
+   故障 IP 落在被调模块的静态 CRT 区域，栈上毫无线索。把回调改成"零外部调用"
+   就完全正常（3/3），恢复调用立刻崩（2/2）。正确做法是回调只做内存入队，
+   由 `PIN_SpawnInternalThread` 的内部线程（非回调上下文、不被插桩）冲刷。
+2. **`INS_IsSysret` 在 Windows 上可能匹配不到**：我们的收尾统计里 `exit=0`，
+   即进入系统调用的探针命中了、返回路径的探针一次都没命中。返回路径不只
+   `sysret` 一种，别只挂它。
+
+另外：`RTN_InsertCall(IPOINT_AFTER)`、`RTN_FindByAddress`、
+`RTN_IsSafeForProbedInsertion` 都要求 `PIN_StartProgramProbed()`——
+用 `PIN_StartProgram()` 启动时会直接报
+"This functionality is usable only via PIN_StartProgramProbed()"。
+想要"函数返回"这类信号，要么换 probed 模式，要么在指令级上自己判断。
+
 ## 不用 Pin 时会怎样
 
 `native/CMakeLists.txt` 的 `PINBRIDGE_WITH_PIN` 默认 **OFF**。

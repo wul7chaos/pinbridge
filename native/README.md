@@ -93,7 +93,43 @@ cd native/build/dist                                     # dist 是自包含目�
 旋钮：`-pb_trace <path>`、`-pb_bridge <path>`（默认按名字找同目录）、
 `-pb_caps all|ro`（默认 ro＝只读基线 257）、`-pb_events <n>`。
 
+### 已知缺陷：系统调用探针在高频路径上不可靠（默认关闭）
+
+`-pb_syscalls 1` 打开后会崩，Pin 报：
+
+```
+E: UPC Dispatcher: Unhandled internal exception in Pin or tool.
+   Exception Code: RECEIVED_ACCESS_FAULT. Access Address = 0x000000008.
+```
+
+故障 IP 落在 `pinbridge_bridge.dll` 映像内、导出表**之前**（即静态 CRT 区域），
+栈上没有任何线索。
+
+**定位过程与结论（可复现）**：
+
+| 实验 | 结果 |
+|------|------|
+| 回调里**零外部调用**（只计数、不入队） | 3/3 正常，跑完全程（捕获 enter=448） |
+| 恢复在回调里调用桥接层 | 2/2 崩溃 |
+| 只去掉 push_event、保留 allocate_sequence | 仍崩 |
+| 排除自身模块（桥接层/agent 不插桩） | 仍崩（**这是必须做的正确性修复，但不是本崩溃的原因**） |
+| 钉住模块（GET_MODULE_HANDLE_EX_FLAG_PIN） | 仍崩 |
+| 错误缓冲从 thread_local 改为普通静态量 | 仍崩（同样必须做：静态 CRT 的 TLS 在 DLL 卸载后不可用） |
+
+所以根因是**"在系统调用回调上下文里调用外部 DLL"本身**，与事件量只是弱相关
+（`--syscalls 30` 也复现过）。因此：
+
+* **`-pb_syscalls` 默认为 0**：把一个已知会崩的功能默认打开，不叫"可用"；
+* 入口点探针不受影响（一辈子只命中一次，且在程序早期）；
+* 正确修法已经明确：**回调只做内存入队**（一次比较 + 一次拷贝，不碰外部代码），
+  由 `PIN_SpawnInternalThread` 起的内部线程跨边界推事件——内部线程不是回调
+  上下文，也不被插桩。内存访问/模板匹配这两类高频探针都必须走同一条路。
+
+另外：`INS_IsSysret` 在当前 Windows 目标上**没有匹配到**（收尾统计里 `exit=0`），
+退出事件要另找机制（`sysret` 只是返回路径之一）。
+
 ### 验收
+
 
 ```powershell
 ctest --test-dir native/build -R pin_tool_instruments_a_target --output-on-failure

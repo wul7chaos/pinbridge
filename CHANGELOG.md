@@ -24,6 +24,40 @@
 
 M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与验证方式先钉死"。
 
+### 新增（M1：系统调用探针的插装与记账，**默认关闭**）
+- Pin tool 增加系统调用探针：识别 `syscall` / `sysret` 指令（实测 59–60 个插装点），
+  采集 SSN 与前四个参数（x64 的第一个参数在 **R10**，不是 RCX），
+  带 `-pb_syscall_max` 上限、重入保护、以及"重入跳过/推事件失败/槽位溢出"
+  三项记账（不允许静默丢事件）。
+- 自写测试靶子扩成三档：默认（入口探针）、`--syscalls N`（N 次真实系统调用）、
+  `--spin N`（**纯用户态、零系统调用**，作为反向对照：如果它也能产出一堆系统调用
+  事件，那"捕获到事件"就不再是证据）。
+- 构建工作流：`-WithPin` 改用**独立构建目录**（`native/build-pin`）。起因是一次真实
+  的时间浪费——`verify.ps1` 会把 `native/build` 重新配置成不带 Pin，于是随后的
+  "带 Pin 构建"其实什么都没编译，跑的还是旧 DLL（表现为旋钮"unknown option"）。
+
+### 修复（这一轮真正的收获：三个"跑起来才暴露"的缺陷）
+- **在系统调用回调里调用外部 DLL 会崩**（`RECEIVED_ACCESS_FAULT,
+  Access Address = 0x8`，故障 IP 在桥接层静态 CRT 区域内）。定位到根因并给出
+  可复现判据：回调零外部调用 → 3/3 正常；恢复调用 → 2/2 崩溃。因此系统调用探针
+  **默认关闭**，修法（回调只入队 + Pin 内部线程冲刷）记入路线图。
+- **桥接层的错误缓冲用了 `thread_local`**：本层用静态 CRT（/MT），DLL 卸载后
+  线程私有数据被释放，之后访问 `thread_local` 就是"TlsGetValue 返回 null 再取
+  偏移 8"。改成普通静态量；同时把"卸载中不触碰 CRT"写进转发前置检查。
+- **桥接层漏了两个 tool ABI 导出**（`pb_start_trace`/`pb_stop_trace`）：
+  头文件声明了、agent 实现了、桥接层没转发，于是"让目标自己录一份轨迹"
+  这条路径在桥接拓扑下不可达，而失败信息只说"导出面不完整"。
+- **轨迹元数据键名 `abel_version` 是错别字**（应为 `abi_version`）：不会立刻报错，
+  只会让读取方永远拿不到 ABI 版本。加回归测试。
+- 把"自己模块"排除出插桩范围：桥接层与 agent 是 `LoadLibraryA` 装进**目标进程**的，
+  Pin 会把它们当成目标的一部分一起插桩，于是我们自己的系统调用会从我们自己的
+  回调里再触发探针。
+
+### 实测澄清（写进 ADR 0010 与 third_party/pin/README）
+- AMD（Ryzen 7 9700X）上 Pin 3.31 的启动/插桩/事件回传链路**是通的**；
+- `RTN_InsertCall(IPOINT_AFTER)`/`RTN_FindByAddress` 等需要 `PIN_StartProgramProbed()`；
+- `INS_IsSysret` 在当前 Windows 目标上没匹配到（`exit=0`）。
+
 ### 新增（M0.5：Hub ↔ agent 回环链路）
 - `pinbridge-agent/src/link.rs`：目标侧的**回环链路服务端**。它不自己判断权限，
   而是转发给 `exports::pb_*`——两条入口（C ABI 与回环链路）因此不可能对

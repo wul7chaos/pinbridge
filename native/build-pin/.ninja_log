@@ -1,0 +1,19 @@
+# ninja log v7
+25	90	8138474714771210	CMakeFiles/abi_selfcheck_test.dir/tests/abi_selfcheck_test.cpp.obj	99466939c25c5939
+35	119	8138474714856319	CMakeFiles/pb_sample_target.dir/tests/sample_target.cpp.obj	3fb54b074f79d289
+16	194	8138474714674653	CMakeFiles/pinbridge_bridge.dir/src/abi_selfcheck.cpp.obj	38ffb4c9fdea926d
+7	202	8138474714584581	CMakeFiles/pinbridge_abi_selfcheck.dir/src/abi_selfcheck.cpp.obj	d2f78ba89fd08acc
+202	247	8138474716532281	pinbridge_abi_selfcheck.lib	7c4b3fba88074212
+119	295	8138474715706190	pb_sample_target.exe	9953a7aa4b97d468
+247	402	8138474716982559	abi_selfcheck_test.exe	278517f33a9806ab
+30	587	8138474714816360	CMakeFiles/bridge_roundtrip_test.dir/tests/bridge_roundtrip_test.cpp.obj	732e64937a466e
+6	571	8138479176926644	CMakeFiles/pinbridge_bridge.dir/src/agent_bridge.cpp.obj	9b2cdaaa62630c54
+573	735	8138479182590514	pinbridge_bridge.dll	68f7583d430ce150
+573	735	8138479182590514	pinbridge_bridge.lib	68f7583d430ce150
+14	170	8138475062944340	bridge_roundtrip_test.exe	7ce3a6abe5f7fd83
+6	345	8138482408551931	CMakeFiles/pinbridge.dir/src/pinbridge_tool.cpp.obj	d0483bdacdf8e5fa
+347	711	8138482411957053	dist/pinbridge.dll	23c40b2e06155491
+347	711	8138482411957053	pinbridge.lib	23c40b2e06155491
+5	348	8138482556905518	CMakeFiles/pinbridge.dir/src/pinbridge_tool.cpp.obj	d0483bdacdf8e5fa
+350	695	8138482560356125	dist/pinbridge.dll	23c40b2e06155491
+350	695	8138482560356125	pinbridge.lib	23c40b2e06155491

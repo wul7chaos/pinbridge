@@ -89,9 +89,19 @@ struct AgentApi {
 /// 本 DLL 自己的模块句柄（用于推导同目录的 agent 路径）。
 HMODULE g_bridge_module = nullptr;
 
-/// 错误文本缓冲。`pb_last_error` 返回的指针必须在下一次写错误之前有效，
-/// 因此用 thread_local：两个线程各自的错误不会互相覆盖。
-thread_local char g_error[1024] = {0};
+/// 错误文本缓冲。`pb_last_error` 返回的指针必须在下一次写错误之前有效。
+///
+/// ── 为什么**不能**用 thread_local ──────────────────────────────────────
+/// 本 DLL 用静态 CRT（/MT），`thread_local` 会走 CRT 的**线程私有数据（PTD）**。
+/// 而进程退出时会 `FreeLibrary` 我们，CRT 的私有数据随之被释放——此时再去访问
+/// 任何 `thread_local`，底层就是"`TlsGetValue` 返回 null，再取偏移 8"，
+/// 于是得到 `RECEIVED_ACCESS_FAULT, Access Address = 0x8`，
+/// 而崩溃 IP 落在本 DLL 的映像里、栈上毫无线索（**实测踩过**，见下面 g_detaching
+/// 的说明：系统调用探针在退出期仍会命中，所以这条路径真的会被走到）。
+///
+/// 换成普通静态缓冲：容量不变、语义不变（多线程下"最后一条错误"本来就只保证
+/// 覆盖顺序，不保证归属），但**不再依赖任何会随卸载消失的东西**。
+static char g_error[1024] = {0};
 
 void set_error(const char* format, ...) {
   va_list args;
@@ -241,14 +251,50 @@ void load_agent(AgentApi* api) {
 }
 
 AgentApi& agent() {
-  static AgentApi instance;
+  // ── 为什么用堆上单例而不是函数内静态对象 ─────────────────────────────
+  // 函数内静态对象（`static AgentApi instance;`）会在 **DLL 卸载时被析构**。
+  // 而"卸载之后还会被调用"这件事是真实存在的：目标进程退出时会 FreeLibrary
+  // 我们的 DLL，但系统调用插装此刻**仍在命中**（`NtTerminateProcess` 本身
+  // 就是一次系统调用）。于是回调走进了已经析构的对象——`AgentApi` 里的
+  // `std::string detail` 内部指针已被释放，读它就得到
+  // `RECEIVED_ACCESS_FAULT, Access Address = 0x8` 这种"空指针 + 偏移"。
+  //
+  // 实测证据：故障 IP 固定在桥接层 `+0x19fa`（同一台机器上每次都一样），
+  // 只在系统调用探针下出现，且总在目标打印完最后一行之后。
+  //
+  // 因此：这个对象**故意不析构**（进程退出时由系统回收）。用一个"指针"
+  // 形式的函数内静态量：它的初始化是常量初始化，没有析构、也没有 guard 变量。
+  static AgentApi* instance = new AgentApi();
   static std::once_flag once;
-  std::call_once(once, []() { load_agent(&instance); });
-  return instance;
+  // 不捕获 `instance`：静态存储期的变量**不能**被 lambda 捕获
+  // （MSVC: "简单捕获必须是含自动存储持续时间的变量"），
+  // 而静态变量本来就能在 lambda 体里直接引用。
+  std::call_once(once, []() { load_agent(instance); });
+  return *instance;
 }
+
+/// 桥接层正在卸载。
+///
+/// `DllMain(DLL_PROCESS_DETACH)` 时置位。之后任何调用都**明确报错**而不是
+/// 去碰可能已经不可用的东西——"能被调用"与"调用有意义"是两件事，
+/// 前者我们无法阻止（宿主可能随时调），后者我们必须说清楚。
+bool g_detaching = false;
 
 /// 统一的“转发前置检查”：加载失败时把原因写进错误文本并返回对应状态码。
 bool require_agent(int32_t* status) {
+  if (g_detaching) {
+    // ── 卸载中：**什么都不碰** ────────────────────────────────────────
+    // 这里不写错误文本，是有实测依据的：`g_error` 是 `thread_local`，
+    // 而 DLL 卸载之后每个线程的 CRT 私有数据已经释放。此时**任何 CRT 调用**
+    // （`vsnprintf`，甚至访问 `thread_local` 本身）都会走到空指针上，
+    // 表现为 `RECEIVED_ACCESS_FAULT, Access Address = 0x8`
+    // ——那正是"TlsGetValue 返回 null，再取偏移 8"的形状，而且崩溃 IP 会
+    // 落在本 DLL 的映像里，栈上看不出任何线索。
+    //
+    // 所以：只写调用方给我的 out 参数（在它的栈上），别的一律不动。
+    *status = PB_STATUS_NOT_ATTACHED;
+    return false;
+  }
   const AgentApi& api = agent();
   if (api.usable()) {
     return true;
@@ -273,6 +319,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
     g_bridge_module = instance;
+  } else if (reason == DLL_PROCESS_DETACH) {
+    // 立刻置位：之后任何转发调用都会得到明确错误（见 require_agent）。
+    g_detaching = true;
   }
   return TRUE;
 }

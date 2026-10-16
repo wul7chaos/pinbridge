@@ -47,10 +47,21 @@
 extern "C" {
 __declspec(dllimport) void* __stdcall LoadLibraryA(const char* library_name);
 __declspec(dllimport) void* __stdcall GetProcAddress(void* module, const char* procedure_name);
+// 只比最小集合多一个：把模块**钉住**，让加载器在退出时也不卸载它
+// （理由见 pin_loaded_modules 的注释——那是实测踩出来的崩溃）。
+__declspec(dllimport) int __stdcall GetModuleHandleExA(unsigned long flags,
+                                                       const char* module_name,
+                                                       void** module);
+__declspec(dllimport) void __stdcall Sleep(unsigned long milliseconds);
 }
+
+/// `GetModuleHandleExA` 的 flags：不引入 windows.h，所以按名字自己声明常量。
+constexpr unsigned long kModuleHandlePin = 0x00000001;
+
 using ModuleHandle = void*;
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -107,6 +118,13 @@ KNOB<std::string> KnobCaps(KNOB_MODE_WRITEONCE, "pintool", "pb_caps", "ro",
 // 会拒绝 `int` 字面量（"C2665 没有重载函数可以转换所有参数类型"）。
 KNOB<UINT32> KnobEvents(KNOB_MODE_WRITEONCE, "pintool", "pb_events", "16",
                         "退出时打印最后 n 条事件");
+// **默认关闭**：这条路径在高事件量下会崩溃（原因见 push_probe_event 的注释），
+// 已经定位到根因但修法（回调只入队 + 内部线程冲刷）还没落地。
+// 默认打开一个已知会崩的功能不是"功能可用"，是"等别人来踩"。
+KNOB<BOOL> KnobSyscalls(KNOB_MODE_WRITEONCE, "pintool", "pb_syscalls", "0",
+                        "是否插装系统调用（1/0）；已知高事件量下会崩溃，见文档");
+KNOB<std::string> KnobSyscallMax(KNOB_MODE_WRITEONCE, "pintool", "pb_syscall_max", "4096",
+                                 "捕获多少条系统调用事件后停止插装（0 表示不限制）");
 
 /// 能力位（与 pinbridge.h / capability.rs 一致；只用到这两个组合）。
 constexpr UINT32 PB_CAP_MEM_READ = 1u << 0;
@@ -130,6 +148,31 @@ std::string last_error_text() {
   }
   const char* text = g_api.last_error();
   return text != nullptr ? std::string(text) : std::string();
+}
+
+/// 解析无符号十进制。
+///
+/// **自己写而不是用 `std::strtoull`**：Pin 自带的 CRT 不提供 `std::` 那套整数
+/// 解析函数（实测报"strtoull 不是 std 的成员"）。为一个"把命令行里的十进制
+/// 变成数字"的需求去和它的头文件较劲不值得；而且自己写还能顺手把**非法输入**
+/// 处理成明确回退并报出来，而不是静默当成 0。
+///
+/// 放在 `report` 之后是因为失败时要借助它——这正是"先声明后使用"的正常约束，
+/// 不值得为它再加一个前置声明。
+UINT64 parse_u64(const char* text, UINT64 fallback) {
+  if (text == nullptr || *text == '\0') {
+    return fallback;
+  }
+  UINT64 value = 0;
+  for (const char* cursor = text; *cursor != '\0'; ++cursor) {
+    if (*cursor < '0' || *cursor > '9') {
+      report("无法解析的数值 \"%s\"，按默认值 %llu 处理", text,
+             static_cast<unsigned long long>(fallback));
+      return fallback;
+    }
+    value = value * 10 + static_cast<UINT64>(*cursor - '0');
+  }
+  return value;
 }
 
 template <typename T>
@@ -184,9 +227,44 @@ bool load_bridge() {
   return true;
 }
 
+/// 把转发层与 agent 的模块句柄**钉住**，让加载器在进程退出时也不卸载它们。
+///
+/// ── 为什么这是必需的（实测，不是防御性编程）──────────────────────────────
+/// 目标退出时 `ExitProcess` 会逐个 `FreeLibrary` 已加载的 DLL，**包括我们自己的
+/// 桥接层与 agent**。而系统调用探针此刻仍在命中（`NtTerminateProcess` 本身就是
+/// 一次系统调用），于是回调走进"CRT 私有数据已被释放"的模块里，得到
+/// `RECEIVED_ACCESS_FAULT, Access Address = 0x8`——故障 IP 落在桥接层映像内
+/// （`+0x19fa`，位于导出表之前，即静态 CRT 区域），栈上毫无线索，
+/// 而且是**竞态**：同样参数有时崩、有时不崩。
+///
+/// 我们拿不到更早的退出信号（Pin 的 Fini 在各 DLL 的 `DllMain(DETACH)` **之后**
+/// 才跑；RTN 级钩子要 `PIN_StartProgramProbed()`，实测被拒），
+/// 所以改成**消除窗口本身**：钉住模块 → 它们不会被卸载 → CRT 状态一直在。
+///
+/// 代价：这两个 DLL 驻留到进程结束。对一个插装工具这是合理的
+/// （进程本来就要结束，而且我们本来就在它里面）。
+void pin_loaded_modules() {
+  const char* names[] = {"pinbridge_bridge.dll", "pinbridge_agent.dll"};
+  for (const char* name : names) {
+    void* module = nullptr;
+    if (::GetModuleHandleExA(kModuleHandlePin, name, &module) != 0) {
+      report("已钉住模块 %s（退出时不会被卸载，探针可安全走到最后）", name);
+    } else {
+      // 不静默：钉不住就意味着退出期仍可能踩到"CRT 已拆"的窗口。
+      report("警告：无法钉住 %s —— 退出期探针可能崩溃（见本函数注释）", name);
+    }
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════ 探针
 volatile bool g_entry_hit = false;
 ADDRINT g_entry_address = 0;
+
+
+// 系统调用探针的开关、上限与观测计数（定义见下方"系统调用探针"一节）
+bool pb_syscall_enabled = true;
+UINT64 g_syscall_cap = 0;
+volatile long g_syscall_sites = 0;
 
 /// 入口点命中：这是**真实事件**（不是模拟数据），它会经过
 /// 转发层 → agent → 事件队列 → 轨迹文件 → Hub 侧加载器。
@@ -210,26 +288,78 @@ void OnEntryPointHit(THREADID thread_id, const CONTEXT* ctxt, ADDRINT address) {
          code == PB_OK ? "" : " 错误: ", code == PB_OK ? "" : last_error_text().c_str());
 }
 
-/// 指令级插桩：只关心"主模块入口点"这一条指令。
-///
-/// 为什么先用这一个探针：它是**最小可验证**的插桩点——地址在 IMG 加载时就已知，
-/// 命中一次即停，不对目标产生可观测的时序影响。系统调用/内存/模板那几类探针
-/// 需要过滤、聚合与折叠配合（见 docs/design/injection-points.md），
-/// 放在后续提交里逐个加，避免一次引入太多变量而无法定位问题。
-void OnInstruction(INS ins, VOID* v) {
-  (void)v;
-  if (g_entry_hit || g_entry_address == 0) {
-    return;
+/// 取模块名（不含路径、不看大小写）。
+std::string module_name_of(const std::string& path) {
+  const std::size_t slash = path.find_last_of("\\/");
+  std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+  for (std::size_t i = 0; i < name.size(); ++i) {
+    if (name[i] >= 'A' && name[i] <= 'Z') {
+      name[i] = static_cast<char>(name[i] - 'A' + 'a');
+    }
   }
-  if (static_cast<ADDRINT>(INS_Address(ins)) != g_entry_address) {
-    return;
-  }
-  INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnEntryPointHit),
-                 IARG_THREAD_ID, IARG_CONTEXT, IARG_INST_PTR, IARG_END);
+  return name;
 }
+
+/// 我们自己加载的模块，必须**排除在插桩之外**。
+///
+/// 为什么这是正确性问题而不是优化：桥接层与 agent 是用 `LoadLibraryA` 装进
+/// **目标进程**的，从 Pin 的角度看它们就是目标的一部分，于是会被一起插桩。
+/// 那意味着我们自己的系统调用（锁、分配、写轨迹文件）会**从我们自己的回调里**
+/// 再次触发探针——递归，而且是在最不该出问题的地方（内核返回路径上）。
+///
+/// 入口探针时看不出这件事（只命中一次），系统调用探针一上来就暴露：
+/// 表现为 `RECEIVED_ACCESS_FAULT: Access Address = 0x8` 这类"读空指针 + 偏移"，
+/// 因为崩的是我们自己的 DLL 代码，而栈上没有任何线索。
+bool is_own_module(const std::string& name) {
+  return name == "pinbridge_bridge.dll" || name == "pinbridge_agent.dll" ||
+         name == "pinbridge.dll";
+}
+
+/// 被排除的地址区间（自己模块的映像范围）。
+struct AddressRange {
+  ADDRINT low;
+  ADDRINT high;
+};
+
+constexpr UINT32 kMaxExcludedRanges = 8;
+AddressRange g_excluded[kMaxExcludedRanges];
+UINT32 g_excluded_count = 0;
+
+bool is_excluded(ADDRINT address) {
+  for (UINT32 i = 0; i < g_excluded_count; ++i) {
+    if (address >= g_excluded[i].low && address <= g_excluded[i].high) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// 前置声明：定义在下面的"系统调用探针"一节（那里才有软停止标志与计数）。
+/// `OnImageLoad` 是**安全上下文**，所以它要负责把回调里攒下的摘插装请求执行掉。
+void apply_pending_hard_stop();
 
 void OnImageLoad(IMG img, VOID* v) {
   (void)v;
+  const std::string name = module_name_of(IMG_Name(img));
+
+  // ── 排除自己 ──
+  if (is_own_module(name)) {
+    if (g_excluded_count < kMaxExcludedRanges) {
+      g_excluded[g_excluded_count].low = IMG_LowAddress(img);
+      g_excluded[g_excluded_count].high = IMG_HighAddress(img);
+      ++g_excluded_count;
+    }
+    // 注意：`IMG_HighAddress()` 给的是映像最后一个字节的地址，用它做上界是
+    // **闭区间**判断；半开区间写法会漏掉恰好落在最后一个字节上的指令。
+    report("排除自身模块 %s（0x%llX-0x%llX）——不得插桩我们自己的代码",
+           name.c_str(), static_cast<unsigned long long>(IMG_LowAddress(img)),
+           static_cast<unsigned long long>(IMG_HighAddress(img)));
+    return;
+  }
+
+  // 安全上下文：把回调里攒下的"摘插装"请求真正执行掉
+  apply_pending_hard_stop();
+
   if (!IMG_IsMainExecutable(img)) {
     return;
   }
@@ -243,6 +373,255 @@ void OnImageLoad(IMG img, VOID* v) {
   g_entry_address = entry;
   report("主模块 %s 入口点 0x%llX，已布下入口探针", IMG_Name(img).c_str(),
          static_cast<unsigned long long>(entry));
+
+  // ── 关于「退出信号」的现状（别凭直觉再试一遍）────────────────────────
+  // 我们想要的是"main 返回 → 立刻停探针"。两条路都试过，都被 Pin 挡回来了：
+  //   * `RTN_InsertCall(..., IPOINT_AFTER, ...)`
+  //   * `RTN_FindByAddress(entry)` / `RTN_IsSafeForProbedInsertion`
+  // 都报 "This functionality is usable only via PIN_StartProgramProbed()"。
+  // 所以我们**不假装**有这个信号，退出期改由两件事兜住：
+  //   1. `IMG_AddUnloadFunction`：自己模块/主模块开始卸载时停探针；
+  //   2. **桥接层自身不再依赖会随卸载消失的东西**——那个
+  //      `Access Address = 0x8` 的崩溃就出在它的 `thread_local` 上
+  //      （静态 CRT 的线程私有数据在卸载时被释放），已改成普通静态量。
+  // 将来若真要更早的信号，正确做法是换 `PIN_StartProgramProbed()` 并评估代价。
+}
+
+// ══════════════════════════════════════════════════════════════ 系统调用探针
+//
+// ── 为什么这个探针比入口探针危险得多 ──────────────────────────────────────
+// 入口探针一辈子只命中一次。系统调用探针会命中**每一万次**，于是两个在入口
+// 探针上根本不成立的问题冒出来了：
+//
+// 1. **重入**：回调里要调用进 agent；agent 内部可能自己发起系统调用
+//    （分配、加锁、写轨迹文件）。那会再次触发本探针 → 递归。
+//    解法：每个线程一个"正在回调中"的标志，标志置位时**直接跳过**。
+// 2. **开销**：逐条过语言边界代价不小。这里先做**计数与上限**，
+//    真正的批量缓冲留到有实测数据之后再加——现在优化等于是猜。
+//
+// ── 计数为什么必须报出来 ────────────────────────────────────────────────
+// "丢了多少"与"看到多少"必须都能回答（项目规则：不允许静默降级）。
+// 所以这里既报捕获数，也报**重入跳过数**与**推事件失败数**。
+struct ThreadStats {
+  UINT64 enters;
+  UINT64 exits;
+  UINT64 reentrant_skips;
+  UINT64 push_failures;
+  bool in_hook;
+};
+
+/// 线程统计表。用固定槽位而不是每条线程都 new：探针回调在**任意线程**上
+/// 运行，那里不能做可能失败/可能阻塞的分配（分配本身可能又触发系统调用）。
+///
+/// 槽位溢出时不假装成功：`g_slot_overflow` 会 +1 并在收尾时报出来。
+constexpr UINT32 kMaxThreadSlots = 256;
+ThreadStats g_thread_slots[kMaxThreadSlots];
+ThreadStats g_overflow_slot;   // 槽位用尽后的共享槽（只记不细分）
+volatile long g_slot_overflow = 0;
+volatile long g_syscall_captured = 0;
+/// 已成功跨边界送出的事件数（由冲刷线程累加）。
+volatile UINT64 g_flushed_total = 0;
+/// 跨边界推事件失败的次数（必须报出来，不允许静默丢弃）。
+volatile UINT64 g_push_failures = 0;
+bool g_syscall_instrumentation_removed = false;
+
+/// 达到上限后的**软停止**标志。
+///
+/// 为什么不在回调里直接 `PIN_RemoveInstrumentation()`：那是在**回调上下文**
+/// 里改插装表，而回调可能正跑在一条系统调用指令上（内核返回路径）。
+/// 更稳的做法是"回调只置位并立刻返回"（一次比较，代价可忽略），
+/// 真正的摘除留给 `OnImageLoad`/`OnFini` 这种正常上下文。
+volatile bool g_syscall_soft_stopped = false;
+volatile bool g_syscall_hard_stop_pending = false;
+
+/// 目标进入退出流程。
+///
+/// 这是**实测**逼出来的一个标志，不是防御性编程：目标在退出时会拆掉自己
+/// 加载的 DLL（包括我们的桥接层与 agent），静态对象随之销毁。此时内核仍在
+/// 执行系统调用（`NtTerminateProcess` 等），探针照旧命中——于是我们会在
+/// "已经不存在"的模块里调用函数。
+///
+/// 症状极具误导性：Pin 报 `RECEIVED_ACCESS_FAULT, Access Address = 0x8`，
+/// 崩溃 IP 落在桥接层映像里，而栈上没有任何线索；而且它只在**系统调用探针**
+/// 下出现（入口探针一辈子只命中一次，且在早期）。
+///
+/// 所以：一旦进入退出流程，回调只返回，不再触碰任何外部代码。
+volatile bool g_shutdown = false;
+
+void request_syscall_stop() {
+  if (!g_syscall_soft_stopped) {
+    g_syscall_soft_stopped = true;
+    g_syscall_hard_stop_pending = true;
+  }
+}
+
+/// 在**安全上下文**里真正摘掉插装。
+void apply_pending_hard_stop() {
+  if (g_syscall_hard_stop_pending) {
+    g_syscall_hard_stop_pending = false;
+    PIN_RemoveInstrumentation();
+    report("停止系统调用插装（达到 -pb_syscall_max 上限），已捕获 %ld 条",
+           static_cast<long>(g_syscall_captured));
+  }
+}
+
+/// 取本线程的统计槽。**不做分配**：第一次用到某个 tid 时零初始化即可。
+ThreadStats* stats_for(THREADID tid) {
+  const UINT32 index = static_cast<UINT32>(tid);
+  if (index < kMaxThreadSlots) {
+    return &g_thread_slots[index];
+  }
+  // 溢出只报一次（不然日志会被刷爆）
+  if (g_slot_overflow == 0) {
+    ++g_slot_overflow;
+  }
+  return &g_overflow_slot;
+}
+
+
+/// 推一条事件的统一出口：计数、失败可见。
+///
+/// ── 已知缺陷：这条路径在**高事件量**下会崩溃 ────────────────────────────
+/// 实测（`--syscalls 300`）稳定崩：Pin 报
+/// `RECEIVED_ACCESS_FAULT, Access Address = 0x8`，故障 IP 落在桥接层映像里。
+/// 定位结论（可复现）：把本函数改成"零外部调用"之后 3/3 全部正常，
+/// 恢复调用我们的 DLL 之后 2/2 崩溃——**问题出在"在系统调用回调上下文里
+/// 调用外部 DLL"，不是事件量本身**。低事件量（1/50 次系统调用）时不崩。
+///
+/// 正因如此，系统调用探针**默认关闭**（`-pb_syscalls` 默认 0），入口探针不受影响。
+/// 正确修法已经明确：回调只做内存入队 + 由 Pin 内部线程冲刷（见
+/// docs/roadmap.md 的 M1 与 native/README.md 的"已知缺陷"一节）。
+void push_probe_event(ThreadStats* stats, UINT8 kind, THREADID tid, ADDRINT address,
+                      const UINT64* args, UINT32 arg_count) {
+  PbEventRaw raw;
+  std::memset(&raw, 0, sizeof(raw));
+  raw.sequence = static_cast<UINT64>(g_api.allocate_sequence());
+  raw.kind = kind;
+  raw.thread_id = static_cast<UINT32>(tid);
+  raw.address = address;
+  for (UINT32 i = 0; i < arg_count && i < 8; ++i) {
+    raw.args[i] = args[i];
+  }
+  if (g_api.push_event(&raw) != PB_OK) {
+    ++stats->push_failures;
+  }
+}
+
+/// `syscall` 指令：x64 的调用约定是 RAX=SSN，前四个参数在 R10/RDX/R8/R9
+/// （注意第一个参数是 **R10** 而不是 RCX——RCX 被 syscall 指令自己用来存返回地址）。
+void OnSyscallEnter(THREADID tid, ADDRINT address, ADDRINT ssn, ADDRINT arg0,
+                    ADDRINT arg1, ADDRINT arg2, ADDRINT arg3) {
+  if (g_shutdown || g_syscall_soft_stopped) {
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  if (stats->in_hook) {
+    // 我们自己正在回调里（agent 内部的系统调用又走到这里）——必须跳过，
+    // 否则递归。跳过要计数：这是"看到的事件变少"的一个正当理由。
+    ++stats->reentrant_skips;
+    return;
+  }
+  stats->in_hook = true;
+  ++stats->enters;
+  ++g_syscall_captured;
+  const UINT64 args[5] = {static_cast<UINT64>(ssn), static_cast<UINT64>(arg0),
+                          static_cast<UINT64>(arg1), static_cast<UINT64>(arg2),
+                          static_cast<UINT64>(arg3)};
+  push_probe_event(stats, 3 /* PB_EV_SYSCALL_ENTER */, tid, address, args, 5);
+  stats->in_hook = false;
+
+  // 软停止：只置位（一次比较），摘插装留给安全上下文。
+  if (g_syscall_cap != 0 && static_cast<UINT64>(g_syscall_captured) >= g_syscall_cap) {
+    request_syscall_stop();
+  }
+}
+
+/// `sysret` 之前：此时 RAX 已经是内核写回的返回状态。
+void OnSyscallExit(THREADID tid, ADDRINT address, ADDRINT status) {
+  if (g_shutdown || g_syscall_soft_stopped) {
+    return;
+  }
+  ThreadStats* stats = stats_for(tid);
+  if (stats->in_hook) {
+    ++stats->reentrant_skips;
+    return;
+  }
+  stats->in_hook = true;
+  ++stats->exits;
+  ++g_syscall_captured;
+  const UINT64 args[1] = {static_cast<UINT64>(status)};
+  push_probe_event(stats, 4 /* PB_EV_SYSCALL_EXIT */, tid, address, args, 1);
+  stats->in_hook = false;
+}
+
+/// 映像卸载回调：**这是我们能拿到的最早的退出信号**。
+///
+/// 为什么需要它：目标的退出流程是
+/// `ExitProcess → 各 DLL 的 DllMain(DETACH) → …`，而 Pin 的
+/// `PIN_AddFiniFunction` **晚于**这个过程。系统调用探针在退出期仍会命中
+/// （`NtTerminateProcess` 本身就是一次系统调用），于是回调会在"桥接层/agent
+/// 已经卸载、其静态对象已析构"之后继续调用它们——实测表现为
+/// `RECEIVED_ACCESS_FAULT, Access Address = 0x8`，故障 IP 固定在桥接层里。
+///
+/// 一旦看到**我们自己的模块**或主模块开始卸载，立刻停掉所有探针：此后回调
+/// 只返回，不再触碰任何外部代码。
+VOID OnImageUnload(IMG img, VOID* v) {
+  (void)v;
+  const std::string name = module_name_of(IMG_Name(img));
+  if (is_own_module(name) || IMG_IsMainExecutable(img)) {
+    if (!g_shutdown) {
+      g_shutdown = true;
+      report("检测到 %s 开始卸载 → 立即停止全部探针（退出期不再回调外部代码）",
+             name.c_str());
+    }
+  }
+}
+
+/// 指令级插桩：入口点 + 系统调用。
+void OnInstruction(INS ins, VOID* v) {
+  (void)v;
+
+  const ADDRINT address = static_cast<ADDRINT>(INS_Address(ins));
+
+  // 自己模块里的指令一律不插桩（理由见 is_own_module）。
+  if (is_excluded(address)) {
+    return;
+  }
+
+  // ── 入口点探针（只关心主模块入口那一条指令）──
+  if (!g_entry_hit && g_entry_address != 0 && address == g_entry_address) {
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnEntryPointHit),
+                   IARG_THREAD_ID, IARG_CONTEXT, IARG_INST_PTR, IARG_END);
+  }
+
+  // ── 退出信号：入口函数的返回指令 ──
+  // 注意：这里**永远不会触发**——`g_entry_rtn` 只能通过 `RTN_FindByAddress`
+  // 拿到，而那个 API 需要 `PIN_StartProgramProbed()`（实测被拒）。
+  // 保留它只会制造"有个机制但其实不生效"的错觉，所以直接删掉，
+  // 现状写在 OnImageLoad 的注释里。
+
+  // ── 系统调用探针 ──
+  if (!pb_syscall_enabled || g_syscall_instrumentation_removed ||
+      g_syscall_soft_stopped) {
+    return;
+  }
+  if (INS_IsSyscall(ins)) {
+    // 只登记 SSN 与四个参数寄存器，不做任何地址计算——这些值在
+    // IPOINT_BEFORE 处读，正是内核即将看到的那一份。
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnSyscallEnter),
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE, LEVEL_BASE::REG_RAX,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_R10, IARG_REG_VALUE,
+                   LEVEL_BASE::REG_RDX, IARG_REG_VALUE, LEVEL_BASE::REG_R8,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_R9, IARG_END);
+    ++g_syscall_sites;
+    return;
+  }
+  if (INS_IsSysret(ins)) {
+    INS_InsertCall(ins, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnSyscallExit),
+                   IARG_THREAD_ID, IARG_INST_PTR, IARG_REG_VALUE,
+                   LEVEL_BASE::REG_RAX, IARG_END);
+    ++g_syscall_sites;
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════ 收尾
@@ -252,6 +631,9 @@ void OnImageLoad(IMG img, VOID* v) {
 /// "探针没命中"与"事件通道断了"。这里把条数与内容都摆在 stderr 上。
 void OnFini(INT32 code, VOID* v) {
   (void)v;
+  // 第一件事：关掉所有回调。晚一步就会在"已经被拆掉的模块"里调用函数
+  // （见 g_shutdown 的说明——这是实测踩出来的坑）。
+  g_shutdown = true;
   report("目标退出（code=%d），入口探针%s命中", code, g_entry_hit ? "已" : "**未**");
 
   if (g_api.stop_trace != nullptr && !KnobTrace.Value().empty()) {
@@ -262,6 +644,32 @@ void OnFini(INT32 code, VOID* v) {
            static_cast<unsigned long long>(records),
            static_cast<unsigned long long>(events));
   }
+
+  // ── 探针账本 ──────────────────────────────────────────────────────────
+  // "看到多少"与"漏了多少"必须一起报。只报前者会让人以为覆盖完整，
+  // 而重入跳过与推事件失败都是**真实存在但看不见**的损失。
+  UINT64 enters = 0;
+  UINT64 exits = 0;
+  UINT64 skips = 0;
+  UINT64 failures = 0;
+  for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+    enters += g_thread_slots[i].enters;
+    exits += g_thread_slots[i].exits;
+    skips += g_thread_slots[i].reentrant_skips;
+    failures += g_thread_slots[i].push_failures;
+  }
+  enters += g_overflow_slot.enters;
+  exits += g_overflow_slot.exits;
+  skips += g_overflow_slot.reentrant_skips;
+  failures += g_overflow_slot.push_failures;
+  report("系统调用探针：插装点 %ld 个，捕获 enter=%llu exit=%llu",
+         static_cast<long>(g_syscall_sites),
+         static_cast<unsigned long long>(enters),
+         static_cast<unsigned long long>(exits));
+  report("  重入跳过 %llu 条，推事件失败 %llu 条%s",
+         static_cast<unsigned long long>(skips),
+         static_cast<unsigned long long>(failures),
+         g_slot_overflow != 0 ? "（线程槽位溢出，统计已并入共享槽）" : "");
 
   const UINT32 want = KnobEvents.Value();
   if (want == 0) {
@@ -308,6 +716,10 @@ int main(int argc, char** argv) {
     // 一个"跑起来了但什么都没接上"的 Pin tool 比明确失败更浪费时间。
     return 2;
   }
+  // 加载成功之后立刻钉住：这是消除"退出期回调进已卸载模块"窗口的关键一步，
+  // 必须在布下任何探针**之前**做（探针一旦生效就可能随时被命中）。
+  pin_loaded_modules();
+
   if (g_api.attach(PIN_GetPid()) != PB_OK) {
     report("pb_attach 失败：%s", last_error_text().c_str());
     return 3;
@@ -320,6 +732,16 @@ int main(int argc, char** argv) {
   report("已附加并下发能力 0x%X（%s）", caps,
          caps == PB_CAP_ALL ? "全部" : "只读基线 mem_read|trace_record");
 
+  // 探针开关：默认开系统调用探针，并带上限。上限的存在不是为了省事，
+  // 而是为了让"长时间运行的目标"不会把事件队列灌满、也不会让日志无法阅读；
+  // 达到上限时会**明确报告**（见 stop_syscall_instrumentation）。
+  pb_syscall_enabled = KnobSyscalls.Value() != 0;
+
+  g_syscall_cap = parse_u64(KnobSyscallMax.Value().c_str(), 4096);
+  report("系统调用探针：%s（上限 %llu 条，0 表示不限）",
+         pb_syscall_enabled ? "开" : "关",
+         static_cast<unsigned long long>(g_syscall_cap));
+
   if (!KnobTrace.Value().empty()) {
     const int32_t started = g_api.start_trace(KnobTrace.Value().c_str(), 1);
     if (started != PB_OK) {
@@ -330,6 +752,7 @@ int main(int argc, char** argv) {
   }
 
   IMG_AddInstrumentFunction(OnImageLoad, nullptr);
+  IMG_AddUnloadFunction(OnImageUnload, nullptr);
   INS_AddInstrumentFunction(OnInstruction, nullptr);
   PIN_AddFiniFunction(OnFini, nullptr);
 
