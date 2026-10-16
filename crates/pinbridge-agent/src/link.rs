@@ -34,6 +34,7 @@ use pinbridge_proto::agent_link::{error_code, AgentRequest, AgentResponse, Event
 use pinbridge_sys::abi::{PbEventRaw, Status};
 
 use crate::exports;
+use crate::host::AgentHost;
 
 /// 单帧上限。与 Hub 侧共用同一个常量，避免两边各自"觉得"够大。
 pub const MAX_FRAME_BYTES: usize = pinbridge_proto::MAX_FRAME_BYTES;
@@ -252,7 +253,7 @@ pub fn dispatch(request: &AgentRequest) -> AgentResponse {
         AgentRequest::RunTo { .. } => not_supported("run_to"),
         AgentRequest::LoadScript { name, source, .. } => dispatch_load_script(name, source),
         // 卸载需要脚本运行时（M1）；M0 连加载都还是桩，卸载更没有意义。
-        AgentRequest::UnloadScript { .. } => not_supported("unload_script"),
+        AgentRequest::UnloadScript { script } => dispatch_unload_script(*script),
         AgentRequest::DrainEvents {
             from,
             limit,
@@ -300,6 +301,53 @@ fn dispatch_ping(wire_version: u16) -> AgentResponse {
         arch: std::env::consts::ARCH.to_string(),
         capabilities: pinbridge_core::CapabilitySet::from_bits(exports::pb_get_capabilities()),
     }
+}
+
+/// 卸载脚本：状态机迁移到 `Unloaded`，并**清掉它在解释器里留下的处理器**。
+///
+/// 为什么要清：`pb.subscribe` 只追加。不清的话旧处理器仍然会被调用——
+/// 表现为"我明明卸载了脚本，行为却还在"，没有任何错误信息。
+/// 这与断点必须能被"清"是同一个道理：只给"下"不给"收"的接口
+/// 会让使用者在换策略时只能重启会话。
+fn dispatch_unload_script(script: u64) -> AgentResponse {
+    let name: Option<String> = AgentHost::with(|state| {
+        state
+            .script_host_mut()
+            .get(script)
+            .map(|entry| entry.name.clone())
+    });
+    let Some(name) = name else {
+        return AgentResponse::Error {
+            code: error_code::INVALID_ARGUMENT.into(),
+            message: format!("unload_script: 没有脚本 {script}"),
+        };
+    };
+    let code = AgentHost::call(|state| state.script_host_mut().unregister(script).map(|_| ()));
+    if code != Status::Ok.code() {
+        // "已经卸载过了"是**调用方记错了**，不是内部故障：
+        // 报 `invalid_argument` 才能让调用方去核对它自己的账，
+        // 报 `internal` 会让它去查我们。
+        return AgentResponse::Error {
+            code: error_code::INVALID_ARGUMENT.into(),
+            message: format!("unload_script: 脚本 {script}（{name}）无法卸载（可能已经卸载过）"),
+        };
+    }
+    // 清处理器失败不该让卸载"看起来失败"：状态机已经迁移完成，卸载确实发生了。
+    // 但必须说清清理**没成功**——否则"旧处理器还在被调用"就没人知道了。
+    // 协议里的 `Script` 应答只有 id，所以这条说明写进 `last_error`。
+    let note = match crate::python_host::drop_handlers(&name) {
+        Ok(0) => format!("脚本 {script}（{name}）已卸载；它没有留下处理器"),
+        Ok(count) => format!("脚本 {script}（{name}）已卸载；清掉 {count} 个处理器"),
+        Err(error) => format!(
+            "脚本 {script}（{name}）已卸载，但清理解释器里的处理器失败：{error}（旧处理器可能仍会被调用）"
+        ),
+    };
+    AgentHost::with(|state| {
+        // 用 Ok 状态写说明：这是一条**成功的**操作附带的细节，
+        // 不是错误（把它写成错误会让调用方以为卸载失败了）。
+        let _ = state.fail(Status::Ok, &note);
+    });
+    AgentResponse::Script { script }
 }
 
 fn dispatch_read_memory(address: u64, length: u32) -> AgentResponse {
@@ -761,13 +809,47 @@ mod tests {
         }
     }
 
+    /// 卸载脚本：状态机迁移 + 清掉它在解释器里留下的处理器。
+    ///
+    /// 没有解释器的环境下（CI 的 ubuntu 任务）只能验证状态机那半；
+    /// 清理那半由 `python_host` 侧的用例覆盖。
+    #[test]
+    fn unloading_a_script_marks_it_and_reports_what_was_cleaned() {
+        let _guard = lock_and_reset(Capability::operator_default());
+        // 直接登记一个脚本（链路侧的 load 走的是导出面那条路，这里只测卸载）
+        let id = AgentHost::with(|state| {
+            state
+                .script_host_mut()
+                .register("unload-me", "value = 1\n", Vec::new())
+                .expect("登记应当成功")
+                .id
+        });
+        match dispatch(&AgentRequest::UnloadScript { script: id }) {
+            AgentResponse::Script { script } => assert_eq!(script, id),
+            other => panic!("实际: {other:?}"),
+        }
+        // 状态机：已经卸载的不能再卸一次
+        match dispatch(&AgentRequest::UnloadScript { script: id }) {
+            AgentResponse::Error { code, .. } => {
+                assert_eq!(code, error_code::INVALID_ARGUMENT, "重复卸载必须报错");
+            }
+            other => panic!("实际: {other:?}"),
+        }
+        // 不存在的脚本：同样明确报错，而不是静默成功
+        match dispatch(&AgentRequest::UnloadScript { script: 9999 }) {
+            AgentResponse::Error { code, message } => {
+                assert_eq!(code, error_code::INVALID_ARGUMENT);
+                assert!(message.contains("9999"), "要说清是哪个脚本：{message}");
+            }
+            other => panic!("实际: {other:?}"),
+        }
+    }
     #[test]
     fn unimplemented_requests_say_so_explicitly() {
         let _guard = lock_and_reset(Capability::operator_default());
         for request in [
             AgentRequest::ReadRegisters { thread: 0 },
             AgentRequest::RunTo { address: 0x1000 },
-            AgentRequest::UnloadScript { script: 1 },
         ] {
             match dispatch(&request) {
                 AgentResponse::Error { code, message } => {

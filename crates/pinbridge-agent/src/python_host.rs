@@ -141,6 +141,11 @@ mod imp {
         PyExc_ValueError: *mut *mut c_void,
         /// `PyObject* PyModule_GetDict(PyObject*)`（借用）
         PyModule_GetDict: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        /// `int PyThreadState_SetAsyncExc(unsigned long id, PyObject* exc)`（**新引用**由调用方负责）
+        PyThreadState_SetAsyncExc:
+            unsafe extern "C" fn(std::os::raw::c_ulong, *mut c_void) -> c_int,
+        /// `unsigned long PyThread_get_thread_ident(void)`
+        PyThread_get_thread_ident: unsafe extern "C" fn() -> std::os::raw::c_ulong,
         /// `int PyDict_SetItemString(PyObject*, const char*, PyObject*)`
         PyDict_SetItemString:
             unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> c_int,
@@ -151,6 +156,130 @@ mod imp {
     unsafe impl Send for PyApi {}
     unsafe impl Sync for PyApi {}
 
+    /// 超时异常类的引用（进程生命周期内一直有效）。
+    ///
+    /// 存的是 `PyObject*` 的地址而不是结构体：我们只把它转手交给
+    /// `PyThreadState_SetAsyncExc`，从不解引用。持有它不释放是刻意的——
+    /// 它就是 `__main__` 里的 `_PBTimeout` 类，随进程一起消失。
+    static TIMEOUT_CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    /// 预算到点时要注入的异常类。
+    fn timeout_class() -> Option<*mut c_void> {
+        TIMEOUT_CLASS.get().map(|address| *address as *mut c_void)
+    }
+
+    /// 看门狗状态。
+    #[derive(Debug, Default)]
+    struct Watch {
+        /// 每次"装预算"递增。看门狗据此判断自己是否还在为当前这次调用工作。
+        generation: u64,
+        /// 这次调用的目标线程与截止时间。
+        target: Option<(std::os::raw::c_ulong, std::time::Instant)>,
+        /// 看门狗是否已经注入过异常（= 这次调用超时了）。
+        fired: bool,
+    }
+
+    /// 看门狗：一个常驻线程 + 条件变量。
+    ///
+    /// 为什么不每次调用起一个线程：回调是热路径（一个事件一次分发），
+    /// 每次起线程的开销比脚本本身还大。
+    #[derive(Debug)]
+    struct Watchdog {
+        inner: std::sync::Mutex<Watch>,
+        signal: std::sync::Condvar,
+    }
+
+    fn watchdog() -> &'static Watchdog {
+        static WATCHDOG: std::sync::OnceLock<Watchdog> = std::sync::OnceLock::new();
+        WATCHDOG.get_or_init(|| {
+            let dog = Watchdog {
+                inner: std::sync::Mutex::new(Watch::default()),
+                signal: std::sync::Condvar::new(),
+            };
+            // 常驻线程：它只做一件事——睡到截止时间，然后注入异常。
+            std::thread::Builder::new()
+                .name("pinbridge-watchdog".into())
+                .spawn(watchdog_loop)
+                .map(|_| ())
+                .ok();
+            dog
+        })
+    }
+
+    /// 看门狗线程主体。
+    fn watchdog_loop() {
+        let dog = watchdog();
+        let mut seen: u64 = 0;
+        loop {
+            let (generation, target) = {
+                let Ok(mut guard) = dog.inner.lock() else {
+                    return;
+                };
+                while guard.generation == seen {
+                    match dog.signal.wait(guard) {
+                        Ok(next) => guard = next,
+                        Err(_) => return,
+                    }
+                }
+                seen = guard.generation;
+                (seen, guard.target)
+            };
+            let Some((ident, deadline)) = target else {
+                continue;
+            };
+            // 睡到截止时间。分段检查"还是不是同一代"，避免把一次已经结束的
+            // 调用的预算算到下一次调用头上。
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline - now;
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+                let Ok(guard) = dog.inner.lock() else { return };
+                if guard.generation != generation {
+                    break; // 这次调用已经结束了
+                }
+            }
+            let Ok(mut guard) = dog.inner.lock() else {
+                return;
+            };
+            if guard.generation != generation || guard.target.is_none() {
+                continue; // 已经 disarm，不该再注入
+            }
+            guard.fired = true;
+            guard.target = None; // 只注入一次
+            drop(guard);
+            inject_timeout(ident);
+        }
+    }
+
+    /// 把超时异常异步注入目标线程。
+    ///
+    /// 用 `PyThreadState_SetAsyncExc` 而不是 `sys.settrace`：后者要维护解释器的
+    /// 线程跟踪状态，而那种状态在"超时中断过一次"之后会留下痕迹，
+    /// 导致后续的 `settrace` **收不到行事件**（看门狗静默失效，脚本继续死循环）。
+    /// 实测过这个坑：两条预算用例单独跑都过，一起跑就挂死。
+    fn inject_timeout(ident: std::os::raw::c_ulong) {
+        let Some(api) = CALLBACK_API.get() else {
+            return;
+        };
+        let Some(class) = timeout_class() else {
+            return;
+        };
+        // SAFETY: 注入需要持有 GIL；这里成对可取可放。
+        let gil = unsafe { (api.PyGILState_Ensure)() };
+        // SAFETY: class 是 `__main__` 里长期有效的异常类；ident 来自
+        // `PyThread_get_thread_ident`（同一进程里的线程）。
+        // 返回值 1 = 注入成功，0 = 没找到那个线程（例如它已经结束）。
+        // 不检查返回值就"以为注入过了"会让超时变成静默失效。
+        let code = unsafe { (api.PyThreadState_SetAsyncExc)(ident, class) };
+        if code == 0 {
+            eprintln!("[pinbridge] 超时注入失败：解释器里已经没有线程 {ident}（它可能已经结束）");
+        }
+        // SAFETY: gil 来自上面的 Ensure。
+        unsafe { (api.PyGILState_Release)(gil) };
+    }
     /// CPython 的方法表项（`PyMethodDef`）。4 个字段、布局公开且长期稳定。
     ///
     /// 只写这一个结构体、**不写 `PyModuleDef`**：后者字段多一倍，而它带来的能力
@@ -292,6 +421,23 @@ mod imp {
         flags: METH_VARARGS,
         doc: c"read target memory: read(address, length) -> bytes".as_ptr(),
     });
+    /// 一次脚本执行的结果。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RunOutcome {
+        /// 正常跑完。
+        Completed,
+        /// 超出时间预算，已被看门狗中断。
+        TimedOut,
+    }
+
+    /// 一次事件分发的结果。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum DispatchOutcome {
+        /// 正常完成，值是被调用的订阅者数量。
+        Called(u32),
+        /// 超出时间预算，已被中断。
+        TimedOut,
+    }
     /// 一个"新引用"的 RAII 持有者：离开作用域时 `Py_DecRef`。
     ///
     /// 为什么必须有它：CPython 的引用计数一旦漏掉就变成内存泄漏，
@@ -338,7 +484,7 @@ mod imp {
     /// `pb.mark(name, address)`，事件对象用 `SimpleNamespace`（`ev.address`、
     /// `ev.args` 这种属性访问方式与文档里的示例一致）。
     const BOOTSTRAP: &str = r#"
-import json as _json, sys as _sys, types as _types
+import json as _json, sys as _sys, time as _time, types as _types
 
 _PB_OUTBOX = []
 _PB_SUBSCRIBERS = {}
@@ -352,12 +498,39 @@ def _pb_log(text):
 def _pb_mark(name, address=0):
     _pb_emit(2, int(address), str(name))
 
+# 当前正在执行的脚本标记。订阅时把处理器与它绑在一起，
+# 于是"换脚本/卸载"能只清掉那一个脚本留下的处理器。
+_PB_TAG = ""
+
+def _pb_set_script_tag(tag):
+    global _PB_TAG
+    _PB_TAG = str(tag)
+
 def _pb_subscribe(event_name, handler=None):
     name = str(event_name)
     handlers = _PB_SUBSCRIBERS.setdefault(name, [])
     if handler is not None:
-        handlers.append(handler)
+        handlers.append((_PB_TAG, handler))
     _pb_emit(3, len(handlers), name)
+
+def _pb_drop_handlers(tag):
+    """清掉某个脚本标记留下的全部处理器，返回清掉的条数。
+
+    为什么必须有它：`pb.subscribe` 只追加。换脚本或卸载时如果不清掉旧的处理器，
+    它们**仍然会被调用**——表现为"我明明改了脚本，行为却还是旧的"，
+    这是最难查的一类问题（没有任何错误，只有不对的结果）。
+    """
+    tag = str(tag)
+    removed = 0
+    for name in list(_PB_SUBSCRIBERS.keys()):
+        kept = [item for item in _PB_SUBSCRIBERS[name] if item[0] != tag]
+        removed += len(_PB_SUBSCRIBERS[name]) - len(kept)
+        _PB_SUBSCRIBERS[name] = kept
+    return removed
+
+def _pb_handler_count():
+    """当前登记的处理器总数（测试与诊断用）。"""
+    return sum(len(items) for items in _PB_SUBSCRIBERS.values())
 
 _pb = _types.ModuleType("pb")
 _pb.log = _pb_log
@@ -368,6 +541,23 @@ _pb.subscribe = _pb_subscribe
 _pb.read = _pb_read_native
 _pb.__doc__ = "PinBridge 目标侧接口（由 agent 注入，不是安装到环境里的包）"
 _sys.modules["pb"] = _pb
+
+class _PBTimeout(Exception):
+    """脚本超出时间预算时抛出（由宿主的看门狗线程异步注入）。
+
+    实现说明：预算**不用 `sys.settrace`** 实现。原因有两条，都是实测得到的：
+
+    * 超时中断过一次之后，解释器的线程跟踪状态会留下痕迹，之后再次
+      `sys.settrace` 可能**收不到行事件**——看门狗于是静默失效，脚本继续死循环；
+    * 关掉看门狗这一步本身也会被跟踪，于是"清理"和"看门狗生效"互相打架。
+
+    现在由宿主起一个看门狗线程，到点用 `PyThreadState_SetAsyncExc` 把本异常
+    注入目标线程。它不依赖任何解释器跟踪状态，也就没有上述两个问题。
+    """
+
+def _pb_timeout_class():
+    """把超时异常类交给宿主（宿主注入时要用同一个类）。"""
+    return _PBTimeout
 
 def _pb_drain_json():
     # ensure_ascii=False：日志里的中文不该被转成 \uXXXX——
@@ -383,8 +573,8 @@ def _pb_dispatch(combined_json):
     if not handlers:
         return 0
     event = _types.SimpleNamespace(**combined.get("payload") or {})
-    for handler in handlers:
-        handler(event)
+    for item in list(handlers):
+        item[1](event)
     return len(handlers)
 "#;
     impl Drop for PyApi {
@@ -490,6 +680,8 @@ def _pb_dispatch(combined_json):
             let err_set_string = must!("PyErr_SetString");
             let module_get_dict = must!("PyModule_GetDict");
             let dict_set_item_string = must!("PyDict_SetItemString");
+            let thread_state_set_async_exc = must!("PyThreadState_SetAsyncExc");
+            let thread_get_thread_ident = must!("PyThread_get_thread_ident");
             let err_print = must!("PyErr_Print");
             // 可选：3.13 之前没有这个符号。
             let is_finalizing =
@@ -609,6 +801,14 @@ def _pb_dispatch(combined_json):
                     *mut c_void,
                     unsafe extern "C" fn(*mut c_void) -> *mut c_void,
                 >(module_get_dict),
+                PyThreadState_SetAsyncExc: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(std::os::raw::c_ulong, *mut c_void) -> c_int,
+                >(thread_state_set_async_exc),
+                PyThread_get_thread_ident: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn() -> std::os::raw::c_ulong,
+                >(thread_get_thread_ident),
                 PyDict_SetItemString: std::mem::transmute::<
                     *mut c_void,
                     unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> c_int,
@@ -773,7 +973,57 @@ def _pb_dispatch(combined_json):
         /// 幂等：重复调用只会覆盖同名入口。
         pub(crate) fn bootstrap(&self) -> Result<()> {
             self.install_host_callables()?;
-            self.run(BOOTSTRAP)
+            self.run(BOOTSTRAP)?;
+            self.remember_timeout_class()
+        }
+
+        /// 把 `_PBTimeout` 类的引用记下来（看门狗注入时要用同一个类）。
+        ///
+        /// 只取一次：类由 `__main__` 持有、随进程结束消失，所以我们**不**减引用
+        /// （减了会让一个还活着的对象被回收）。
+        fn remember_timeout_class(&self) -> Result<()> {
+            if TIMEOUT_CLASS.get().is_some() {
+                return Ok(());
+            }
+            let api = self.api()?;
+            // SAFETY: 全程持有 GIL。
+            let gil = unsafe { (api.PyGILState_Ensure)() };
+            let fetched = (|| -> Result<usize> {
+                // SAFETY: main 返回借用引用。
+                let main = unsafe { (api.PyImport_AddModule)(c"__main__".as_ptr()) };
+                if main.is_null() {
+                    return Err(Error::Script("取不到 __main__".into()));
+                }
+                // SAFETY: 返回新引用，交给 `Owned`。
+                let getter = Owned::new(api, unsafe {
+                    (api.PyObject_GetAttrString)(main, c"_pb_timeout_class".as_ptr())
+                });
+                if getter.is_null() {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script("引导脚本没有提供 _pb_timeout_class".into()));
+                }
+                // **零参数也必须给一个空元组**：`PyObject_Call` 的 args 不允许
+                // 是 NULL（传 NULL 会把解释器打崩——实测过一次）。kwargs 才可以是 NULL。
+                // SAFETY: 空的参数元组；返回值是新引用（就是那个类对象，我们留着）。
+                let empty = Owned::new(api, unsafe { (api.PyTuple_New)(0) });
+                if empty.is_null() {
+                    return Err(Error::Script("构造空参数元组失败".into()));
+                }
+                // SAFETY: getter 可调用；empty 是合法元组；kwargs 传 NULL 表示没有关键字参数。
+                let class = unsafe {
+                    (api.PyObject_Call)(getter.object(), empty.object(), std::ptr::null_mut())
+                };
+                if class.is_null() {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script("取超时异常类失败".into()));
+                }
+                Ok(class as usize)
+            })();
+            // SAFETY: gil 来自上面的 Ensure。
+            unsafe { (api.PyGILState_Release)(gil) };
+            let address = fetched?;
+            let _ = TIMEOUT_CLASS.set(address);
+            Ok(())
         }
 
         /// 把 Rust 支撑的可调用对象放进 `__main__`，再让引导脚本把它接到
@@ -929,6 +1179,132 @@ def _pb_dispatch(combined_json):
             result
         }
 
+        /// 带时间预算地执行一段脚本。
+        ///
+        /// 返回 `TimedOut` 而不是普通错误：调用方要能区分"脚本写错了"与
+        /// "脚本太慢/死循环了"——两者的处置完全不同（改脚本 vs 加预算/换算法）。
+        ///
+        /// 预算用**行级跟踪**（`sys.settrace`）实现：Python 里死循环不会自己
+        /// 让出控制权，而跟踪函数每个行事件都会被调用一次，于是"只有一行的死循环"
+        /// 也一定能被检查到。代价是脚本执行期间的额外开销——所以只在脚本运行时
+        /// 打开，运行结束（含出错）立刻关掉。
+        pub(crate) fn run_with_budget(&self, source: &str, budget_ms: u64) -> Result<RunOutcome> {
+            let generation = self.arm_budget(budget_ms)?;
+            let ran = self.run(source);
+            // **无论成功失败都要撤掉预算**：留着会让看门狗把一次已经结束的
+            // 调用的超时算到后面某次调用头上。
+            let fired = self.disarm_budget(generation)?;
+            match ran {
+                Ok(()) => Ok(if fired {
+                    RunOutcome::TimedOut
+                } else {
+                    RunOutcome::Completed
+                }),
+                // 超时是**以异常的形式**从解释器里冒出来的（看门狗抛 `_PBTimeout`），
+                // 所以这里必须问一次"是不是超时"再决定怎么报：
+                // 直接把它当普通脚本错误返回，AI 会把"死循环被中断"误读成"脚本有 bug"，
+                // 然后去改一段本来没错的代码。
+                // 超时是**以异常的形式**从解释器里冒出来的（看门狗注入的
+                // `_PBTimeout`），所以这里必须看一次"看门狗有没有开过枪"再决定
+                // 怎么报：直接当普通脚本错误返回，AI 会把"死循环被中断"
+                // 误读成"脚本有 bug"，然后去改一段本来没错的代码。
+                Err(error) => {
+                    if fired {
+                        Ok(RunOutcome::TimedOut)
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        }
+
+        /// 带时间预算地把事件分发给脚本。
+        pub(crate) fn dispatch_with_budget(
+            &self,
+            event_name: &str,
+            payload_json: &str,
+            budget_ms: u64,
+        ) -> Result<DispatchOutcome> {
+            let generation = self.arm_budget(budget_ms)?;
+            let dispatched = self.dispatch(event_name, payload_json);
+            let fired = self.disarm_budget(generation)?;
+            // 超时：脚本已经被中断，"被调用过几个订阅者"这件事不再重要，
+            // 重要的是如实报告它超时了。
+            if fired {
+                return Ok(DispatchOutcome::TimedOut);
+            }
+            dispatched.map(DispatchOutcome::Called)
+        }
+
+        /// 给接下来执行的脚本打标记，并清掉**同一个标记**留下的旧处理器。
+        ///
+        /// 顺序是刻意的：先清旧的、再执行新的，于是"同名脚本换版本"的效果是
+        /// 旧行为完全消失、新行为生效——而不是两套处理器同时活着。
+        pub(crate) fn set_script_tag(&self, tag: &str) -> Result<()> {
+            self.call_json("_pb_set_script_tag", Some(tag))
+                .map(|_| ())?;
+            // 清掉这个标记的旧处理器（首次加载时是空操作）。
+            self.call_json("_pb_drop_handlers", Some(tag)).map(|_| ())?;
+            Ok(())
+        }
+
+        /// 清掉某个标记留下的处理器（卸载脚本时用）。
+        pub(crate) fn drop_handlers(&self, tag: &str) -> Result<u32> {
+            let counted = self.call_json("_pb_drop_handlers", Some(tag))?;
+            Ok(counted.trim().parse().unwrap_or(0))
+        }
+
+        /// 当前登记的处理器总数。
+        pub(crate) fn handler_count(&self) -> Result<u32> {
+            let counted = self.call_json("_pb_handler_count", None)?;
+            Ok(counted.trim().parse().unwrap_or(0))
+        }
+        /// 装预算并清掉上一次的超时计数。
+        /// 装预算，返回本次调用的"代号"（disarm 时用它对账）。
+        fn arm_budget(&self, budget_ms: u64) -> Result<u64> {
+            if budget_ms == 0 {
+                return Ok(0); // 0 = 不限制
+            }
+            let api = self.api()?;
+            // SAFETY: 取当前线程的解释器标识，只在同进程内使用。
+            let ident = unsafe { (api.PyThread_get_thread_ident)() };
+            let dog = watchdog();
+            let mut guard = dog
+                .inner
+                .lock()
+                .map_err(|_| Error::Script("看门狗锁中毒".into()))?;
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.fired = false;
+            guard.target = Some((
+                ident,
+                std::time::Instant::now() + std::time::Duration::from_millis(budget_ms),
+            ));
+            let generation = guard.generation;
+            drop(guard);
+            dog.signal.notify_all();
+            Ok(generation)
+        }
+
+        /// 撤掉预算；返回**这次调用是否被看门狗注入过超时**。
+        ///
+        /// 超时与否由看门狗自己的状态回答，不再问解释器：这样"超时判定"
+        /// 不依赖任何 Python 侧状态，也就不会出现"清理与判定互相打架"。
+        fn disarm_budget(&self, generation: u64) -> Result<bool> {
+            if generation == 0 {
+                return Ok(false);
+            }
+            let dog = watchdog();
+            let mut guard = dog
+                .inner
+                .lock()
+                .map_err(|_| Error::Script("看门狗锁中毒".into()))?;
+            let fired = guard.generation == generation && guard.fired;
+            if guard.generation == generation {
+                guard.target = None;
+            }
+            Ok(fired)
+        }
+
         /// 取走脚本产生的输出（JSON 数组），并清空脚本侧队列。
         pub(crate) fn drain_outputs(&self) -> Result<String> {
             self.call_json("_pb_drain_json", None)
@@ -977,6 +1353,17 @@ def _pb_dispatch(combined_json):
             // SAFETY: code 以 NUL 结尾且在本调用期间存活；解释器已初始化；
             // 当前线程已持有 GIL。
             let status = unsafe { (api.PyRun_SimpleString)(code.as_ptr()) };
+            if status != 0 {
+                // **打印并清掉**待处理异常。`PyErr_Print` 两件事都做：
+                // 把 CPython 的堆栈（带行号）打到 stderr，并清空当前异常。
+                //
+                // 清空这一步是必需的、不是可选的：异常留着的话，调用方**随后**
+                // 任何一次回到解释器的调用（例如"把看门狗关掉"）都会失败。
+                // 实测过一次：`sys.settrace` 的看门狗因此留在了那条线程上，
+                // 之后在这条线程上跑的每个脚本每一行都抛超时，整个测试套件挂死。
+                // SAFETY: 只读取并清空当前线程的异常状态。
+                unsafe { (api.PyErr_Print)() };
+            }
             // SAFETY: gil 来自上面的 Ensure。
             unsafe { (api.PyGILState_Release)(gil) };
             if status != 0 {
@@ -1110,6 +1497,78 @@ def _pb_dispatch(combined_json):
         guard.run(source)
     }
 
+    /// 带时间预算地执行一段脚本（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用或脚本自身出错时出错；超时通过返回值表达
+    /// （`TimedOut`），不走错误通道——调用方需要能区分这两件事。
+    pub fn run_source_with_budget(source: &str, budget_ms: u64) -> Result<super::HostRunOutcome> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.run_with_budget(source, budget_ms).map(Into::into)
+    }
+
+    /// 带时间预算地把事件分发给脚本（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用或脚本抛异常时出错。
+    pub fn dispatch_with_budget(
+        event_name: &str,
+        payload_json: &str,
+        budget_ms: u64,
+    ) -> Result<super::HostDispatchOutcome> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard
+            .dispatch_with_budget(event_name, payload_json, budget_ms)
+            .map(Into::into)
+    }
+
+    /// 给脚本打标记并清掉同名脚本留下的旧处理器（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用时出错。
+    pub fn set_script_tag(tag: &str) -> Result<()> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.set_script_tag(tag)
+    }
+
+    /// 清掉某个脚本留下的处理器，返回清掉的条数（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用时出错。
+    pub fn drop_handlers(tag: &str) -> Result<u32> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.drop_handlers(tag)
+    }
+
+    /// 当前登记的处理器总数（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用时出错。
+    pub fn handler_count() -> Result<u32> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.handler_count()
+    }
+
     /// 取走脚本产生的输出（JSON 文本）。
     ///
     /// # Errors
@@ -1222,11 +1681,95 @@ mod imp {
         Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
     }
 
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn set_script_tag(_tag: &str) -> Result<()> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn drop_handlers(_tag: &str) -> Result<u32> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn handler_count() -> Result<u32> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn run_source_with_budget(_source: &str, _budget_ms: u64) -> Result<super::HostRunOutcome> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn dispatch_with_budget(
+        _event_name: &str,
+        _payload_json: &str,
+        _budget_ms: u64,
+    ) -> Result<super::HostDispatchOutcome> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
     /// 非 Windows 平台的统一原因文本。
     const NOT_SUPPORTED: &str = "当前平台未实现 CPython 动态加载（M1 只支持 Windows）";
 }
 
-pub use imp::{bootstrap, dispatch, drain_outputs, library_description, probe, run_source};
+/// 脚本执行结果（跨平台统一）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRunOutcome {
+    /// 正常跑完。
+    Completed,
+    /// 超出时间预算，已被中断。
+    TimedOut,
+}
+
+/// 事件分发结果（跨平台统一）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDispatchOutcome {
+    /// 正常完成，值是被调用的订阅者数量。
+    Called(u32),
+    /// 超出时间预算，已被中断。
+    TimedOut,
+}
+
+// 只有 Windows 的实现才有内部结果类型，转换也只在那个平台上存在。
+// （非 Windows 侧的统一入口直接返回"不支持"，压根不会走到转换。）
+#[cfg(windows)]
+mod outcome_bridge {
+    use super::{imp, HostDispatchOutcome, HostRunOutcome};
+
+    impl From<imp::RunOutcome> for HostRunOutcome {
+        fn from(value: imp::RunOutcome) -> Self {
+            match value {
+                imp::RunOutcome::Completed => Self::Completed,
+                imp::RunOutcome::TimedOut => Self::TimedOut,
+            }
+        }
+    }
+
+    impl From<imp::DispatchOutcome> for HostDispatchOutcome {
+        fn from(value: imp::DispatchOutcome) -> Self {
+            match value {
+                imp::DispatchOutcome::Called(count) => Self::Called(count),
+                imp::DispatchOutcome::TimedOut => Self::TimedOut,
+            }
+        }
+    }
+}
+
+pub use imp::{
+    bootstrap, dispatch, dispatch_with_budget, drain_outputs, drop_handlers, handler_count,
+    library_description, probe, run_source, run_source_with_budget, set_script_tag,
+};
 
 /// 当前平台是否实现了 CPython 宿主。
 #[must_use]
@@ -1236,6 +1779,7 @@ pub const fn supported() -> bool {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use super::imp::{DispatchOutcome, RunOutcome};
     use super::*;
 
     /// 串行化：CPython **不能**在同一进程里并发初始化/收尾，
@@ -1379,6 +1923,115 @@ pb.log("script loaded")
             .expect("分发到无人订阅的事件名也应当成功");
         assert_eq!(none, 0, "没有订阅者时应当返回 0");
         println!("✓ 未订阅事件名返回 0（不假装分发过）");
+    }
+    /// 死循环脚本必须**在预算内被中断**，而且之后解释器仍然可用
+    /// （"目标仍可继续"）。
+    #[test]
+    fn a_dead_loop_script_is_interrupted_within_its_budget() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+
+        // 只有一行的死循环：这正是不用"调用级"跟踪而用**行级**跟踪的原因。
+        let started = std::time::Instant::now();
+        let outcome = host
+            .run_with_budget("while True:\n    pass\n", 120)
+            .expect("超时不是错误，是一种结果");
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, RunOutcome::TimedOut, "必须报超时");
+        // 预算 120 ms，允许调度与解释器启动的余量；关键是不能无限等下去。
+        assert!(
+            elapsed.as_millis() < 5_000,
+            "应当在预算附近被中断，实际 {elapsed:?}"
+        );
+        println!("✓ 死循环被中断：{elapsed:?}");
+
+        // 目标仍可继续：解释器还能正常跑别的脚本
+        host.run("assert 2 + 2 == 4")
+            .expect("中断之后解释器应当仍可用");
+        println!("✓ 中断之后解释器仍可用");
+
+        // 超时计数是一次性的：取走之后再跑正常脚本不该被当成超时
+        let again = host
+            .run_with_budget("value = 6 * 7\nassert value == 42\n", 5_000)
+            .expect("正常脚本应当成功");
+        assert_eq!(again, RunOutcome::Completed);
+        println!("✓ 超时计数不会污染下一次执行");
+
+        // 预算为 0 = 不限制：长一点的正常脚本不该被误杀
+        let unlimited = host
+            .run_with_budget("total = 0\nfor i in range(200000):\n    total += i\n", 0)
+            .expect("不限制预算时应当成功");
+        assert_eq!(unlimited, RunOutcome::Completed);
+        println!("✓ 预算 0 = 不限制");
+    }
+
+    /// 分发路径的预算：回调里的死循环也要被中断。
+    #[test]
+    fn a_looping_callback_is_interrupted_too() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+        // 第一次注册也要打标记：下面靠"同名标记"把这次留下的处理器清掉。
+        host.set_script_tag("swapped").expect("打标记应当成功");
+        host.run(
+            r#"
+import pb
+
+def on_syscall(ev):
+    while True:
+        pass
+
+pb.subscribe("syscall_enter", on_syscall)
+"#,
+        )
+        .expect("注册脚本应当成功");
+
+        let payload =
+            serde_json::json!({ "address": 4096, "args": [1, 0, 0, 0, 0, 0, 0, 0] }).to_string();
+        let outcome = host
+            .dispatch_with_budget("syscall_enter", &payload, 120)
+            .expect("超时不是错误");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::TimedOut,
+            "回调里的死循环必须被中断"
+        );
+        println!("✓ 回调里的死循环被中断");
+
+        // 中断之后仍然可用：换一个不循环的处理器。
+        //
+        // 这里必须先 `set_script_tag`：它清掉**同名脚本**留下的旧处理器。
+        // 不清的话旧的那个死循环处理器仍在订阅表里，下一次分发还会超时——
+        // 而且没有任何错误信息，只有"改了脚本却没生效"的结果。
+        host.set_script_tag("swapped").expect("打标记应当成功");
+        host.run(
+            r#"
+import pb
+
+def on_syscall(ev):
+    pb.log("ok")
+
+pb.subscribe("syscall_enter", on_syscall)
+"#,
+        )
+        .expect("重新注册应当成功");
+        let outcome = host
+            .dispatch_with_budget("syscall_enter", &payload, 2_000)
+            .expect("分发应当成功");
+        assert!(
+            matches!(outcome, DispatchOutcome::Called(count) if count >= 1),
+            "实际: {outcome:?}"
+        );
+        println!("✓ 中断之后分发仍然可用");
     }
     /// `pb.read` 端到端：脚本读一段**真实的目标内存**，把读到的魔数报回来。
     ///

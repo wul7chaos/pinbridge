@@ -84,8 +84,10 @@
 | ~~agent 内嵌 CPython（解释器宿主）~~ | ✅ 已完成：**运行时动态加载**（`LoadLibraryA` + `GetProcAddress`，`python3.dll` → `python314.dll`，可用 `PINBRIDGE_PYTHON_DLL` 指定）。链接导入库会让 agent 在没装 Python 的机器上**整个加载不了**，所以不链接。实测在进程内跑 `assert 6*7==42`、异常路径明确报错、指定不存在的库时不静默回退 |
 | ~~`pb` 模块（subscribe / log / mark）~~ | ✅ 纯 Python 注入（不写 C 模块：结构体布局写错就是目标里的随机崩溃）。队列编码 `[kind, value, text]`；两个窄入口 `_pb_drain_json` / `_pb_dispatch` |
 | ~~探针回调分发（事件 → 脚本函数）~~ | ✅ `pb_push_event` **先分发再入队**（让脚本输出紧跟触发它的事件）；事件名与 `EventKind::name()` 同一张表；订阅了未知事件名会报错而不是静默 |
-| `pb.read` / `pb.snapshot` / `pb.defer` | ⏳ 需要反向调用（脚本要求 agent 做事），与当前单向数据流相反，要先把闸门做进去 |
-| 脚本执行时间预算的**强制**中断（超时 → `TimedOut`） | ⏳ 记账已完成（`ScriptBudget`），强制需要解释器配合 |
+| ~~`pb.read`~~ | ✅ 已完成（反向调用） |
+| ~~脚本换版本/卸载时收回处理器~~ | ✅ 订阅与脚本标记绑定，`UnloadScript` 从桩变实现——否则旧处理器仍在被调用，表现为"我改了脚本行为却还是旧的" |
+| `pb.snapshot` / `pb.defer` | ⏳ 机制已就绪（反向调用打通），缺的是语义定义 |
+| ~~脚本执行时间预算的**强制**中断（超时 → `TimedOut`）~~ | ✅ 看门狗线程 + `PyThreadState_SetAsyncExc` 异步注入（**不用 `sys.settrace`**：实测"超时中断过一次之后再次 settrace 收不到行事件"，看门狗会静默失效）。超时 → `Status::Timeout` + 不注册 + 标记 `TimedOut` + 审计行。已知边界：阻塞式 C 调用打断不了 |
 | ~~真实内存读写~~ | ✅ 已完成：`ReadProcessMemory` / `WriteProcessMemory`（**不解引用**：不可读地址要能"失败"，而不是把目标打崩；也**不临时改保护属性**——那会改变目标状态）。部分写入按失败处理；错误文本带地址 + Windows 错误码。实测：写 11 字节读回一致、不可读地址报错不崩、被拒绝的写不落盘 |
 | ~~脚本侧 `pb.read`~~ | ✅ 已完成：反向调用（`PyCFunction_NewEx` + 静态 `PyMethodDef`），能力闸门在 Rust 侧，拒绝抛 `RuntimeError` 而不是返回空数据。实测脚本读到真实内存并用 `mark` 报回魔数 |
 | ~~断点~~ | ✅ 已完成：软件断点（`0xCC` + 向量化异常处理器）。**命中一次后自动解除**（那段"恢复→单步→重装"的舞蹈在多线程目标里有真实竞态，而我们没有停下目标线程的能力——见 [design/breakpoints.md](design/breakpoints.md)）。地址打错会**报错而不是打崩目标**。实测：命中一次并记录线程号、函数仍正常返回、原字节已写回 |
@@ -116,7 +118,8 @@
 | `pin -t pinbridge.dll -- TARGET.exe` 能跑起来并产出事件 | 手工验证 |
 | 一段脚本能被加载、被回调、产生 `script_output` 事件 | 用例 |
 | 尝试 `import os` 被拒且留下审计 | 用例 |
-| 死循环脚本在预算内被终止，目标仍可继续 | 用例 |
+| ~~死循环脚本在预算内被终止，目标仍可继续~~ | ✅ 用例（`a_dead_loop_script_is_stopped_inside_its_budget_and_the_target_keeps_working`） |
+| ~~尝试 `import os` 被拒且留下审计~~ | ✅ 用例（拒绝与超时都写 `.pbt` 的 AUDIT 块） |
 | 真实内存读写/断点/单步/继续/暂停 | 手工验证清单 |
 
 **M1 的关键风险**：

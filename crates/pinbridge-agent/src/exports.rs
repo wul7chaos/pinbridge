@@ -143,13 +143,42 @@ fn dispatch_to_scripts(event: &PbEventRaw) {
         "args": event.args,
     })
     .to_string();
-    let outcome = crate::python_host::dispatch(kind.name(), &payload);
+    let budget_ms = AgentHost::with(|state| state.call_budget_ms());
+    let started = std::time::Instant::now();
+    let outcome = crate::python_host::dispatch_with_budget(kind.name(), &payload, budget_ms);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
-        Ok(called) => {
+        Ok(crate::python_host::HostDispatchOutcome::Called(called)) => {
             if called != 0 {
                 let (outputs, _) = collect_script_outputs();
                 emit_script_outputs(&outputs);
             }
+        }
+        Ok(crate::python_host::HostDispatchOutcome::TimedOut) => {
+            // 超时发生在"这一次分发"里，而 Python 侧只按事件名分发，
+            // 我们**无法确定是哪个订阅者循环了**。与其猜一个，不如如实说清，
+            // 并把该事件的全部订阅者标记为 timed_out——保守的一侧是"先别再把
+            // 事件喂给它们"，因为再喂一次只会再超时一次。
+            let affected = AgentHost::with(|state| {
+                let ids: Vec<u64> = state
+                    .script_host_mut()
+                    .subscribers(event.kind)
+                    .iter()
+                    .map(|script| script.id)
+                    .collect();
+                for id in &ids {
+                    let _ = state.mark_script_timed_out(*id);
+                    let _ = state.record_script_timing(*id, elapsed_ms);
+                }
+                ids
+            });
+            AgentHost::with(|state| {
+                state.note_audit(&format!(
+                    "script_timeout: 分发 {} 超出预算 {budget_ms} ms（实测 {elapsed_ms} ms），\
+                     订阅者 {affected:?} 全部标记为 timed_out（无法定位具体是哪一个循环了）",
+                    kind.name()
+                ));
+            });
         }
         // 脚本出错**不能让探针失败**：记录到 last_error 里就够了。
         // 否则一个写错的脚本会把整条插装链路带崩，而那与"探针是否工作"无关。
@@ -577,6 +606,13 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
     // 策略检查（静态文本）：它不需要解释器，因此能在没有 Python 的机器上
     // 先生效——这是刻意的，"注入前拦截"不该依赖运行时的存在。
     if let Err(violation) = crate::script::ScriptPolicy::check(&script_source) {
+        // 拒绝要留审计：事后必须能回答"这条处置有没有发生过、对哪个脚本"。
+        AgentHost::with(|state| {
+            state.note_audit(&format!(
+                "script_policy_denied: {script_name} 第 {} 行命中 {}（{}）",
+                violation.line, violation.token, violation.reason
+            ));
+        });
         return AgentHost::with(|state| {
             state.fail(
                 Status::InvalidArgument,
@@ -600,20 +636,46 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
         });
     }
     // 跑脚本：这一步之后脚本里的 `pb.subscribe(...)` 才真正注册上。
+    //
+    // **带时间预算**：Python 里的死循环不会自己让出控制权，所以执行前装上
+    // 行级看门狗（见 `PythonHost::run_with_budget` 的说明）。
     let described = crate::python_host::library_description().unwrap_or_default();
-    let run = {
-        // 用 `dispatch` 之外的一条窄路径：这里需要"执行这段源码"，
-        // 所以走宿主自己的 run（同样持 GIL）。
-        crate::python_host::run_source(&script_source)
-    };
-    if let Err(error) = run {
-        return AgentHost::with(|state| {
-            state.fail(
-                Status::Internal,
-                &format!("pb_load_script: 脚本执行失败——{error}"),
-            )
-        });
+    let budget_ms = AgentHost::with(|state| state.call_budget_ms());
+    let started = std::time::Instant::now();
+    let run = crate::python_host::run_source_with_budget(&script_source, budget_ms);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match run {
+        Ok(crate::python_host::HostRunOutcome::Completed) => {}
+        Ok(crate::python_host::HostRunOutcome::TimedOut) => {
+            AgentHost::with(|state| {
+                state.note_audit(&format!(
+                    "script_timeout: {script_name} 在加载期超出预算 {budget_ms} ms（实测 {elapsed_ms} ms），已中断"
+                ));
+            });
+            return AgentHost::with(|state| {
+                state.fail(
+                    Status::Timeout,
+                    &format!(
+                        "pb_load_script: 脚本 {script_name} 超出时间预算 {budget_ms} ms（实测 {elapsed_ms} ms），\
+                         已被中断且**不会注册**；目标进程不受影响。\
+                         死循环/长循环请改成分片执行，或调大预算。"
+                    ),
+                )
+            });
+        }
+        Err(error) => {
+            return AgentHost::with(|state| {
+                state.fail(
+                    Status::Internal,
+                    &format!("pb_load_script: 脚本执行失败——{error}"),
+                )
+            });
+        }
     }
+    // 正常完成：记一次耗时（记账与强制是两件事，两个都要有）。
+    AgentHost::with(|state| {
+        let _ = state.record_script_timing(0, elapsed_ms);
+    });
     // 登记脚本（名称 + 源码哈希 + 状态），并把它订阅的事件类型记下来。
     // 取回加载期输出，并从里面读出**脚本实际订阅了哪些事件**。
     //
@@ -864,6 +926,60 @@ pb.subscribe("syscall_enter", on_syscall)
         );
         assert_eq!(ours[0].args[1], 0x50, "报回来的值必须就是事件里的 args[0]");
         println!("✓ 脚本被事件驱动，输出进了事件流：{:?}", ours[0]);
+    }
+    /// **M1 验收标准**：死循环脚本在预算内被终止，目标仍可继续。
+    ///
+    /// （roadmap 的 M1 验收表里这一条要求"用例"。）
+    #[test]
+    fn a_dead_loop_script_is_stopped_inside_its_budget_and_the_target_keeps_working() {
+        let _guard = crate::host::GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(pb_attach(1), Status::Ok.code());
+        assert_eq!(
+            pb_set_capabilities(Capability::ScriptLoad.bit() | Capability::MemRead.bit()),
+            Status::Ok.code()
+        );
+        let name = std::ffi::CString::new("looper").unwrap();
+        let source = std::ffi::CString::new("import pb\n\nwhile True:\n    pass\n").unwrap();
+        let started = std::time::Instant::now();
+        // SAFETY: 两个 CString 在本调用期间存活
+        let code = unsafe { pb_load_script(name.as_ptr(), source.as_ptr()) };
+        let elapsed = started.elapsed();
+        if code == Status::NotSupported.code() {
+            // 没装 Python 的环境（CI 的 ubuntu 任务）：跳过但要说清原因。
+            // SAFETY: 立刻拷贝
+            let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+            assert!(text.contains("解释器"), "跳过时必须说清原因：{text}");
+            println!("跳过：{text}");
+            return;
+        }
+        assert_eq!(code, Status::Timeout.code(), "必须报超时而不是别的错误");
+        assert!(
+            elapsed.as_secs() < 30,
+            "必须在预算附近被终止，实际 {elapsed:?}"
+        );
+        // SAFETY: 立刻拷贝
+        let text = unsafe { cstr_to_string(pb_last_error()) }.unwrap_or_default();
+        assert!(text.contains("超出时间预算"), "原因要说得清楚：{text}");
+        assert!(text.contains("不会注册"), "要说清它没有被登记：{text}");
+        println!("✓ 死循环被终止（{elapsed:?}）：{text}");
+
+        // "目标仍可继续"：后续导出照常工作，事件照常流转
+        assert_ne!(pb_get_capabilities(), 0, "会话状态没被破坏");
+        let sequence = pb_allocate_sequence();
+        assert!(sequence > 0, "序号分配器仍可用");
+        let mut raw = PbEventRaw::EMPTY;
+        raw.kind = EventKind::BreakpointHit.code();
+        // SAFETY: raw 指向本栈变量
+        assert_eq!(unsafe { pb_push_event(&raw) }, Status::Ok.code());
+        println!("✓ 超时之后目标仍然可用");
+
+        // 超时脚本**不会**被登记（不能在事件流里留一个永远不会动的订阅者）
+        assert!(
+            AgentHost::with(|state| state.scripts().iter().all(|script| script.name != "looper")),
+            "超时的脚本不该出现在登记表里"
+        );
     }
     /// 下断点时地址打错**必须是错误**，不能把目标打崩。
     ///
@@ -1151,12 +1267,19 @@ pb.subscribe("syscall_enter", on_syscall)
         let raw = PbEventRaw::from_event(&event);
         assert_eq!(unsafe { pb_push_event(&raw) }, Status::Ok.code());
 
-        let mut out = [PbEventRaw::EMPTY; 4];
+        // 事件队列是**全进程共享**的，别的用例也往里推过东西，而且先后顺序
+        // 由测试调度决定。所以这里断言的是"取到的集合里包含刚推的那条"，
+        // 而不是"恰好一条"——后者测的是测试之间的隔离，不是这条链路。
+        let mut out = [PbEventRaw::EMPTY; 64];
         let mut count: c_uint = 0;
-        let code = unsafe { pb_drain_events(out.as_mut_ptr(), 4, &mut count) };
+        let code = unsafe { pb_drain_events(out.as_mut_ptr(), 64, &mut count) };
         assert_eq!(code, Status::Ok.code());
-        assert_eq!(count, 1);
-        assert_eq!(out[0].to_event(), Some(event));
+        assert!(
+            out[..count as usize]
+                .iter()
+                .any(|raw| raw.to_event() == Some(event)),
+            "刚推的事件必须在取回的批次里（取到 {count} 条）"
+        );
 
         // 6) 空指针/零容量的防御
         assert_eq!(

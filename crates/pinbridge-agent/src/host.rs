@@ -115,6 +115,38 @@ impl AgentState {
         self.scripts.all()
     }
 
+    /// 单次脚本调用的时间预算（毫秒）。0 表示不限制。
+    #[must_use]
+    pub fn call_budget_ms(&self) -> u64 {
+        self.budget.per_call_ms()
+    }
+
+    /// 记一次脚本耗时，返回是否超预算。
+    pub fn record_script_timing(&mut self, script: u64, elapsed_ms: u64) -> bool {
+        self.budget.record(script, elapsed_ms)
+    }
+
+    /// 把脚本标记为超时（它不再接收事件）。
+    ///
+    /// # Errors
+    ///
+    /// 脚本 id 不存在时出错。
+    pub fn mark_script_timed_out(&mut self, script: u64) -> Result<()> {
+        self.scripts.mark_timed_out(script).map(|_| ())
+    }
+
+    /// 往轨迹的**审计通道**里写一行。
+    ///
+    /// 审计通道是 `.pbt` 里的文本区（与事件流分开）。用它记"策略拒绝""脚本超时"
+    /// 这类**判定**而不是观测：它们是"我们做了什么决定"，需要在事后能回答
+    /// "这条处置有没有发生过、什么时候、对谁"。
+    ///
+    /// 没有在录制时是空操作——审计不改变行为，只是留痕。
+    pub fn note_audit(&mut self, line: &str) {
+        if let Some(recorder) = self.recorder.as_mut() {
+            let _ = recorder.audit(line);
+        }
+    }
     /// 脚本宿主的可变访问（加载脚本时用）。
     ///
     /// 提供 `_mut` 而不是把 `scripts` 字段公开：脚本状态机（Registered →
@@ -360,6 +392,15 @@ impl LocalRecorder {
         }
     }
 
+    /// 写一行审计文本。
+    ///
+    /// 立刻 `flush`：审计行记录的是**判定**（拒绝、超时、终止），
+    /// 而"进程随后就可能崩/被杀"正是这些判定最需要被留下的场景——
+    /// 留在缓冲区里等于没有。
+    fn audit(&mut self, line: &str) -> Result<()> {
+        self.writer.audit_line(line)?;
+        self.writer.flush()
+    }
     /// 累计到阈值就把缓冲刷到磁盘（见 `FLUSH_EVERY_RECORDS` 的说明）。
     fn maybe_flush(&mut self) -> Result<()> {
         self.records_since_flush += 1;
