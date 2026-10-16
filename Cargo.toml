@@ -10,6 +10,7 @@ members = [
     "crates/pinbridge-agent",
     "crates/pinbridge-mcp",
     "crates/pinbridge-cli",
+    "crates/pinbridge-workbench",
 ]
 exclude = ["apps/desktop", "native"]
 

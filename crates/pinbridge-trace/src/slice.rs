@@ -47,7 +47,7 @@ pub struct ReadRecord {
 ///
 /// **为什么它必须离线可读**：轨迹会被拷走，"某个地址没有被写过"这类结论在
 /// **采集本身有缺口**时不能成立——而缺口信息只有录制方知道。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CoverageGap {
     /// 插装的内存事件点数量。
     pub sites: u64,

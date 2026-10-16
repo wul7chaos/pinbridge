@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 use pinbridge_core::capability::Capability;
 use pinbridge_sys::abi::{cstr_to_string, PbEventRaw, Status, PB_ABI_VERSION};
 
-use crate::host::{kind_name, AgentHost};
+use crate::host::AgentHost;
 use pinbridge_trace::event::EventKind;
 
 /// 探测 ABI 版本。**加载器必须先调它**，版本不符时拒绝加载。
@@ -568,28 +568,11 @@ pub extern "C" fn pb_stats(which: c_uint) -> u64 {
 /// 事件类型判别值 → 短名（永不返回 `NULL`）。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_kind_name(code: c_uint) -> *const c_char {
-    // 短名是 'static 字面量，NUL 结尾，可以直接给 C 用
-    const NAMES: &[&str] = &[
-        "reserved",
-        "breakpoint_hit",
-        "exception",
-        "syscall_enter",
-        "syscall_exit",
-        "pattern_hit",
-        "mem_write",
-        "mem_read",
-        "reg_write",
-        "trap_flag",
-        "state_change",
-        "script_output",
-        "repeat",
-    ];
-    let index = code as usize;
-    let name = if index < NAMES.len() {
-        NAMES[index]
-    } else {
-        kind_name(255)
-    };
+    // 短名表现在只有一份，在 `pinbridge_trace::event::KIND_NAMES`（跨语言单一真相）。
+    // 这里以前自己抄了一份 —— 两份定义必然漂移，本项目已经吃过两次这样的亏。
+    // 判别值→名字的映射在轨迹侧只有一份（`kind_from_code` → `EventKind::name`）。
+    // 这里以前自己抄了一张表 —— 两份定义必然漂移。
+    let name = pinbridge_trace::event::kind_name(code);
     // 手工拼一个 NUL 结尾的静态字符串
     match name {
         "reserved" => c"reserved".as_ptr(),

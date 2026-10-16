@@ -433,6 +433,17 @@ impl<R: Read> PbtReader<R> {
         &self.meta
     }
 
+    /// 是否读到过 `END` 段。
+    ///
+    /// **这是判断「收尾是否完成」的唯一可靠信号**，比「有没有 SUMMARY」可靠得多：
+    /// 写入器在刷盘时会写一条 SUMMARY 作为**提交标记**，所以一份没有收尾的轨迹
+    /// 里照样能读到 SUMMARY（Pin 路径上的文件就是这样——工具收尾晚于卸载保护，
+    /// 那次调用会被拒绝，于是没有 END）。
+    #[must_use]
+    pub fn end_seen(&self) -> bool {
+        self.end_seen
+    }
+
     /// AUDIT 段的原始文本（JSON Lines）。
     #[must_use]
     pub fn audit_log(&self) -> &str {

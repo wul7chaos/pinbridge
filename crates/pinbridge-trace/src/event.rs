@@ -144,6 +144,40 @@ pub struct Event {
     pub args: [u64; MAX_ARGS],
 }
 
+/// 判别值（ABI 里的 `u32`）→ [`EventKind`]。
+///
+/// 映射**只此一份**：名字本身在 [`EventKind::name`]，这里只负责把跨语言传过来的
+/// 数字换回枚举。以前 agent 里自己抄了一张名字表，两份定义必然漂移——本项目已经
+/// 因为 `abi_version` 拼写、寄存器顺序吃过两次亏。
+#[must_use]
+pub const fn kind_from_code(code: u32) -> Option<EventKind> {
+    Some(match code {
+        0 => EventKind::Reserved,
+        1 => EventKind::BreakpointHit,
+        2 => EventKind::Exception,
+        3 => EventKind::SyscallEnter,
+        4 => EventKind::SyscallExit,
+        5 => EventKind::PatternHit,
+        6 => EventKind::MemWrite,
+        7 => EventKind::MemRead,
+        8 => EventKind::RegWrite,
+        9 => EventKind::TrapFlag,
+        10 => EventKind::StateChange,
+        11 => EventKind::ScriptOutput,
+        12 => EventKind::Repeat,
+        _ => return None,
+    })
+}
+
+/// 判别值 → 短名。未知判别值返回 `"unknown"`（**永不 panic**：轨迹可能来自更新
+/// 版本的录制方，读到没见过的类型是正常情况，不是错误）。
+#[must_use]
+pub const fn kind_name(code: u32) -> &'static str {
+    match kind_from_code(code) {
+        Some(kind) => kind.name(),
+        None => "unknown",
+    }
+}
 impl Event {
     /// 空事件（`sequence = 0`，其余为 0）。与文章中的 `Event::EMPTY` 对应。
     pub const EMPTY: Self = Self {
