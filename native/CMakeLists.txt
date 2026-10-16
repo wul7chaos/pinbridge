@@ -58,15 +58,24 @@ add_library(pinbridge::abi_selfcheck ALIAS pinbridge_abi_selfcheck)
 # 它导出 Hub 期望的 8 个 tool 符号，内部转发给 agent DLL（运行时加载）。
 # 这是 M1 中「pinbridge-sys 加载器端到端」这条验收标准的落点：
 # 在 Pin 到位之前，加载器已经能被真实地驱动与测试。
+#
+# 只在 Windows 上构建：它依赖 `LoadLibraryA`/`GetProcAddress`/`DLLMain`，
+# 而这些正是 agent 链路在 M0/M1 的真实形态（见 docs/specs/c-abi.md）。
+# 非 Windows 平台下**跳过而不是假装能编**：ABI 自检仍然会构建并运行，
+# 于是"头文件是否可移植"这件事在 Linux/macOS 上依然被守住。
 # --------------------------------------------------------------------------
-add_library(pinbridge_bridge SHARED
-  src/agent_bridge.cpp
-  src/abi_selfcheck.cpp
-)
-target_include_directories(pinbridge_bridge PRIVATE include)
-target_compile_definitions(pinbridge_bridge PRIVATE PINBRIDGE_BRIDGE_BUILD=1)
-target_link_libraries(pinbridge_bridge PRIVATE pinbridge::abi_selfcheck)
-set_target_properties(pinbridge_bridge PROPERTIES PREFIX "")
+if(WIN32)
+  add_library(pinbridge_bridge SHARED
+    src/agent_bridge.cpp
+    src/abi_selfcheck.cpp
+  )
+  target_include_directories(pinbridge_bridge PRIVATE include)
+  target_compile_definitions(pinbridge_bridge PRIVATE PINBRIDGE_BRIDGE_BUILD=1)
+  target_link_libraries(pinbridge_bridge PRIVATE pinbridge::abi_selfcheck)
+  set_target_properties(pinbridge_bridge PROPERTIES PREFIX "")
+else()
+  message(STATUS "非 Windows：跳过桥接层（它依赖 LoadLibraryA；agent 链路目前仅 Windows）")
+endif()
 
 # --------------------------------------------------------------------------
 # 真正的工具 DLL：需要 Pin SDK（PIN_ROOT）
@@ -116,38 +125,45 @@ if(BUILD_TESTING)
   add_test(NAME abi_selfcheck COMMAND $<TARGET_FILE:abi_selfcheck_test>)
 
   # ---------------------------------------------------------------- 桥接层测试
-  add_executable(bridge_roundtrip_test tests/bridge_roundtrip_test.cpp)
-  # 只链接 ABI 自检（拿类型与常量），**不链接**桥接 DLL：
-  # 桥接层必须通过运行时加载来验证，否则测的是链接器而不是我们的加载逻辑。
-  target_link_libraries(bridge_roundtrip_test PRIVATE pinbridge::abi_selfcheck)
+  # 只在 Windows 上：非 Windows 没有桥接 DLL（见上面的 if(WIN32)）。
+  # 这里不能"注册了但跑不了"——那样 ctest 会报一个无法解释的失败，
+  # 而"平台不适用"与"实现坏了"是两件必须能区分的事。
+  if(WIN32)
+    add_executable(bridge_roundtrip_test tests/bridge_roundtrip_test.cpp)
+    # 只链接 ABI 自检（拿类型与常量），**不链接**桥接 DLL：
+    # 桥接层必须通过运行时加载来验证，否则测的是链接器而不是我们的加载逻辑。
+    target_link_libraries(bridge_roundtrip_test PRIVATE pinbridge::abi_selfcheck)
 
-  # agent DLL 由 cargo 构建（cdylib）。允许显式指定；否则在 target/{debug,release} 下找。
-  if(NOT PINBRIDGE_AGENT_DLL)
-    foreach(_profile debug release)
-      set(_candidate "${CMAKE_CURRENT_SOURCE_DIR}/../target/${_profile}/pinbridge_agent.dll")
-      if(EXISTS "${_candidate}")
-        set(PINBRIDGE_AGENT_DLL "${_candidate}")
-        break()
-      endif()
-    endforeach()
-  endif()
+    # agent DLL 由 cargo 构建（cdylib）。允许显式指定；否则在 target/{debug,release} 下找。
+    if(NOT PINBRIDGE_AGENT_DLL)
+      foreach(_profile debug release)
+        set(_candidate "${CMAKE_CURRENT_SOURCE_DIR}/../target/${_profile}/pinbridge_agent.dll")
+        if(EXISTS "${_candidate}")
+          set(PINBRIDGE_AGENT_DLL "${_candidate}")
+          break()
+        endif()
+      endforeach()
+    endif()
 
-  if(PINBRIDGE_AGENT_DLL AND EXISTS "${PINBRIDGE_AGENT_DLL}")
-    message(STATUS "agent DLL: ${PINBRIDGE_AGENT_DLL}")
+    if(PINBRIDGE_AGENT_DLL AND EXISTS "${PINBRIDGE_AGENT_DLL}")
+      message(STATUS "agent DLL: ${PINBRIDGE_AGENT_DLL}")
+    else()
+      message(WARNING
+        "未找到 pinbridge_agent.dll：桥接层的正向用例会被标记为跳过。"
+        "先执行 `cargo build -p pinbridge-agent`，或显式传 -DPINBRIDGE_AGENT_DLL=<路径>。")
+    endif()
+
+    # 正向用例：真实 agent 在场，验证"Hub 侧调用 → 桥接 → agent → 事件回来"整条链。
+    add_test(NAME bridge_roundtrip
+      COMMAND $<TARGET_FILE:bridge_roundtrip_test>
+              "$<TARGET_FILE:pinbridge_bridge>" "${PINBRIDGE_AGENT_DLL}" "positive")
+    # 反向用例：agent 缺失时必须**明确失败**，而不是静默返回成功。
+    add_test(NAME bridge_missing_agent
+      COMMAND $<TARGET_FILE:bridge_roundtrip_test>
+              "$<TARGET_FILE:pinbridge_bridge>" "${CMAKE_CURRENT_BINARY_DIR}/不存在-pinbridge_agent.dll"
+              "missing")
+    set_tests_properties(bridge_roundtrip bridge_missing_agent PROPERTIES SKIP_RETURN_CODE 77)
   else()
-    message(WARNING
-      "未找到 pinbridge_agent.dll：桥接层的正向用例会被标记为跳过。"
-      "先执行 `cargo build -p pinbridge-agent`，或显式传 -DPINBRIDGE_AGENT_DLL=<路径>。")
+    message(STATUS "非 Windows：只注册 abi_selfcheck（桥接层不可用）")
   endif()
-
-  # 正向用例：真实 agent 在场，验证"Hub 侧调用 → 桥接 → agent → 事件回来"整条链。
-  add_test(NAME bridge_roundtrip
-    COMMAND $<TARGET_FILE:bridge_roundtrip_test>
-            "$<TARGET_FILE:pinbridge_bridge>" "${PINBRIDGE_AGENT_DLL}" "positive")
-  # 反向用例：agent 缺失时必须**明确失败**，而不是静默返回成功。
-  add_test(NAME bridge_missing_agent
-    COMMAND $<TARGET_FILE:bridge_roundtrip_test>
-            "$<TARGET_FILE:pinbridge_bridge>" "${CMAKE_CURRENT_BINARY_DIR}/不存在-pinbridge_agent.dll"
-            "missing")
-  set_tests_properties(bridge_roundtrip bridge_missing_agent PROPERTIES SKIP_RETURN_CODE 77)
 endif()

@@ -130,6 +130,22 @@ jobs:
           PINBRIDGE_BRIDGE_DLL: ${{ github.workspace }}/native/build/pinbridge_bridge.dll
         run: cargo test -p pinbridge-sys --test bridge_end_to_end -- --nocapture
 
+  native-linux:
+    name: native 头文件可移植性（CMake + CTest）
+    runs-on: ubuntu-latest
+    # 只做一件事：用 g++ 构建并运行 ABI 自检。
+    # 目的是守住 `pinbridge.h` 的可移植性——它被 C++ 与 Rust 双侧包含，
+    # 一旦有人在里面塞进 Win32 专有的东西，这条 10 秒的 job 会立刻发现，
+    # 而不是等到某个 Linux 贡献者打不开项目。
+    steps:
+      - uses: actions/checkout@v4
+      - name: 配置（桥接层在非 Windows 上会被跳过）
+        run: cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+      - name: 构建
+        run: cmake --build native/build
+      - name: CTest
+        run: ctest --test-dir native/build --output-on-failure
+
   changelog:
     name: 变更日志守卫
     if: github.event_name == 'pull_request'
