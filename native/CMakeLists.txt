@@ -412,7 +412,21 @@ if(BUILD_TESTING)
       # 脚本自己跑两步，并给出三条判定（写入数精确、零丢弃、过滤计数 > 0）。
       find_program(PINBRIDGE_PWSH pwsh)
       if(PINBRIDGE_PWSH)
-        add_test(NAME pin_tool_mem_range_filter
+        # 每线程虚拟 TF 状态机：两条线程**各自**的 TF 活动必须能被分开计数。
+      # 判据是分线程的行（`线程 N：置位 X、清除 Y`）与各线程自己的迭代次数一致：
+      # 如果状态是共享的，后一条线程的置位会被判定成"没有变化"而漏报——
+      # 总数看着正常、分线程数对不上。
+      add_test(NAME pin_tool_tf_per_thread
+        COMMAND "${PIN_ROOT}/pin.exe"
+                -t "$<TARGET_FILE:pinbridge>"
+                -pb_tf virtualize
+                -pb_events 2
+                --
+                "$<TARGET_FILE:pb_sample_target>" --tf-threads 6)
+      set_tests_properties(pin_tool_tf_per_thread PROPERTIES
+        PASS_REGULAR_EXPRESSION "TF 每线程：置位 3,3 / 清除 3,3"
+        FAIL_REGULAR_EXPRESSION "Unhandled internal exception")
+      add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File
                   "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/check-mem-probe.ps1"
                   -PinRoot "third_party/pin" -BuildDir "native/build-pin")

@@ -929,7 +929,19 @@ struct ThreadStats {
   /// 就是伪造数据——所以宁可记 0（未知）并计数。
   bool syscall_pending;
   /// 目标的虚拟 TF 状态（TF 虚拟化用）。
+  ///
+  /// **每线程一份**：目标里的 TF 是**线程私有的处理器状态**，把它做成全局的
+  /// 会有两个后果：① 一条线程置位会让另一条线程的"置位"被当成"没有变化"而漏报；
+  /// ② 一条线程清除 TF 会顺手把另一条的虚拟状态抹掉。
+  /// 这两种错误在事件流里都表现为"少了几条 trap_flag"，而"少了"与"本来就没有"
+  /// 从事件流上看不出来——所以它必须有**每线程**的计数配合（见下面的 tf_* 字段）。
   bool virtual_tf;
+  /// 该线程累计的 TF 意图与处理结果（每线程一份，收尾时按线程打印）。
+  UINT64 tf_sets;
+  UINT64 tf_clears;
+  UINT64 tf_masked;
+  UINT64 tf_read_patches;
+  UINT64 tf_steps;
   /// 写入的两段式实现用的待处理槽（BEFORE 记地址，AFTER 读值）。
   /// 每线程一份，同一线程内两条回调严格相邻，不需要任何同步。
   bool pending_write_valid;
@@ -1602,10 +1614,14 @@ VOID OnFlagsLoadBefore(THREADID tid, ADDRINT ins_address, ADDRINT stack_pointer,
     return;  // 与当前虚拟状态相同：没有意图变化，不报（否则会刷屏）
   }
   stats->virtual_tf = setting;
+  // 全局总数 + **每线程**各记一份：总数回答"一共发生了几次"，
+  // 每线程那份回答"是谁做的"——后者才是"互不干扰"能被验证的地方。
   if (setting) {
     ++g_tf_sets;
+    ++stats->tf_sets;
   } else {
     ++g_tf_clears;
+    ++stats->tf_clears;
   }
   // 上报：args[0] 的语义见 docs（1=置位意图 0=清除意图 2=真实单步异常）。
   const UINT64 args[2] = {setting ? 1ULL : 0ULL, 0};
@@ -1616,6 +1632,7 @@ VOID OnFlagsLoadBefore(THREADID tid, ADDRINT ins_address, ADDRINT stack_pointer,
     const UINT64 masked = flags & ~kTrapFlagBit;
     if (PIN_SafeCopy(reinterpret_cast<VOID*>(flags_address), &masked, 8) == 8) {
       ++g_tf_masked;
+      ++stats->tf_masked;
     } else {
       ++g_tf_stack_failures;
     }
@@ -1640,6 +1657,7 @@ VOID OnFlagsStoreAfter(THREADID tid, ADDRINT stack_pointer) {
   const UINT64 patched = flags | kTrapFlagBit;
   if (PIN_SafeCopy(reinterpret_cast<VOID*>(stack_pointer), &patched, 8) == 8) {
     ++g_tf_read_patches;
+    ++stats->tf_read_patches;
   } else {
     ++g_tf_stack_failures;
   }
@@ -1662,6 +1680,7 @@ VOID OnContextChange(THREADID tid, CONTEXT_CHANGE_REASON reason, const CONTEXT* 
          static_cast<unsigned long long>(g_tf_stack_failures),
          static_cast<unsigned long long>(g_tf_sites));
   ThreadStats* stats = stats_for(tid);
+  ++stats->tf_steps;
   const UINT64 args[2] = {2, 0};
   push_probe_event(stats, 9 /* PB_EV_TRAP_FLAG */, tid,
                    PIN_GetContextReg(to, LEVEL_BASE::REG_INST_PTR), args, 2);
@@ -1877,6 +1896,53 @@ void OnFini(INT32 code, VOID* v) {
     if (g_tf_stack_failures != 0) {
       report("  栈上 flags 副本读写失败 %llu 次（这部分没能虚拟化）",
              static_cast<unsigned long long>(g_tf_stack_failures));
+    }
+    // **按线程**再报一遍：TF 是线程私有的处理器状态，"总数"看不出"是谁做的"，
+    // 而"两条线程各自的 TF 互不干扰"这条性质只能靠分线程的计数来验证——
+    // 如果状态是共享的，后一条线程的置位会被判定成"没有变化"而**漏报**，
+    // 总数看起来正常、分线程数对不上。
+    for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+      const ThreadStats& slot = g_thread_slots[i];
+      if (slot.tf_sets == 0 && slot.tf_clears == 0 && slot.tf_steps == 0) {
+        continue;
+      }
+      report("  线程 %u：置位 %llu、清除 %llu、剥离 %llu、读补 %llu、真实单步 %llu",
+             i, static_cast<unsigned long long>(slot.tf_sets),
+             static_cast<unsigned long long>(slot.tf_clears),
+             static_cast<unsigned long long>(slot.tf_masked),
+             static_cast<unsigned long long>(slot.tf_read_patches),
+             static_cast<unsigned long long>(slot.tf_steps));
+    }
+    // 再打一行**与线程号无关**的紧凑摘要，专门给自动化断言用：
+    // 线程号由运行时决定（本例里两条新线程拿到的是 2 和 3），把断言绑在
+    // 具体线程号上会让用例随环境随机失败——而失败的原因与被测性质无关。
+    // 顺序也固定（按槽位升序），所以这是可断言的。
+    {
+      std::string summary = "TF 每线程：置位 ";
+      bool first = true;
+      for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+        if (g_thread_slots[i].tf_sets == 0 && g_thread_slots[i].tf_clears == 0) {
+          continue;
+        }
+        if (!first) {
+          summary += ",";
+        }
+        first = false;
+        summary += std::to_string(g_thread_slots[i].tf_sets);
+      }
+      summary += " / 清除 ";
+      first = true;
+      for (UINT32 i = 0; i < kMaxThreadSlots; ++i) {
+        if (g_thread_slots[i].tf_sets == 0 && g_thread_slots[i].tf_clears == 0) {
+          continue;
+        }
+        if (!first) {
+          summary += ",";
+        }
+        first = false;
+        summary += std::to_string(g_thread_slots[i].tf_clears);
+      }
+      report("%s", summary.c_str());
     }
     if (g_required_tf_sets != 0) {
       if (g_tf_sets < g_required_tf_sets) {

@@ -3,7 +3,9 @@
 
 ```
 pwsh scripts/build-native.ps1 -WithPin -RequireAgent
+ctest --test-dir native/build-pin -V   # 全部 12 条，含下面的两条重点用例
 ctest --test-dir native/build-pin -R pin_tool_agent_end_to_end -V
+ctest --test-dir native/build-pin -R pin_tool_tf_per_thread -V
 ```
 
 期望看到：

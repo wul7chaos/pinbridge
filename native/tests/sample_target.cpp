@@ -13,7 +13,7 @@
 // 靶子一律自写：不拿系统二进制或外部样本。否则一次"测试失败"会同时包含
 // "我们的工具坏了"与"那个二进制有反制"，两者必须能分开归因。
 //
-//   --agent-check <agent.dll> [<script.py>]
+//   --tf-threads N   两条线程各跑 N 轮 TF 置位/清除（验证每线程状态机互不干扰）。
 //                 在**进程内**直接驱动 agent：加载 DLL → 设能力 → 加载脚本
 //                 → 推一条系统调用事件 → 取事件（脚本应当产出 script_output）
 //                 → 下断点 → 触发 → 取事件（应当产出 breakpoint_hit）
@@ -164,6 +164,102 @@ __declspec(noinline) unsigned long tf_experiment(unsigned long iterations,
   }
   *real_steps = steps;
   return reads_with_tf;
+}
+
+// ------------------------------------------------- 双线程 TF 实验（每线程隔离）
+
+/// 两条线程**各自**跑 TF 实验，用来验证"每线程虚拟 TF 状态机互不干扰"。
+///
+/// 实验形状是两轮一循环：**两条线程先各置位一次，再各清除一次**，并用票据锁把
+/// 两条线程的操作排成确定的交错（A 置位 → B 置位 → A 清除 → B 清除 → …）。
+///
+/// 为什么是这个形状（前两版都白写了，记下来）：
+///
+/// * 第一版：两条线程各自"置位→清除"成对循环。**测不出共享状态**——实测故意
+///   改成全局，用例照样通过 ✗。
+/// * 第二版：每条线程连续置位多次、中间不清除。同样**测不出**——状态机是
+///   **边沿触发**的（"与当前状态相同就不报"），连续置位本来就只有第一次算数。
+/// * 现在这版：A 置位、B 置位**紧挨着**。共享状态会在 B 处判定"已经是置位了，
+///   没有变化"而**吞掉 B 的这一次**；正确实现则各自记一次。于是一旦状态被做成
+///   全局的，分线程摘要会变成 `置位 N,0 / 清除 N,0`，用例立刻失败。
+///
+/// 判据因此落在**分线程**的计数上。
+struct TfThreadResult {
+  /// 总轮数（两条线程**相同**，否则票据锁会死锁）。
+  unsigned long rounds;
+  /// 本线程是第几个（0 或 1）——决定它在每轮里的先后。
+  unsigned long index;
+  unsigned long reads_with_tf;
+  unsigned long real_steps;
+  unsigned long sets;
+  unsigned long clears;
+};
+
+/// 票据锁：保证两条线程的操作严格交替，而不是"碰运气撞上"。
+volatile long g_tf_turn = 0;
+
+unsigned long __stdcall tf_thread_main(void* arg) {
+  auto* result = static_cast<TfThreadResult*>(arg);
+  unsigned long reads_with_tf = 0;
+  unsigned long steps = 0;
+  unsigned long sets = 0;
+  unsigned long clears = 0;
+  for (unsigned long i = 0; i < result->rounds; ++i) {
+    // 轮到本线程了才动手：顺序是 A、B、A、B……
+    const long my_turn = static_cast<long>(2 * i + result->index);
+    while (g_tf_turn < my_turn) {
+      Sleep(0);
+    }
+    const bool setting = (i % 2) == 0;  // 偶数轮置位、奇数轮清除
+    const unsigned long long flags = __readeflags();
+    // 写 flags 之后那条指令可能真的单步（没有工具虚拟化时）。所以**紧跟其后的
+    // 第一条指令必须在保护块里**——这是第一版崩掉的原因：置位后紧接着的是裸的
+    // 读回检查，异常没人接，进程直接死在 0x80000004（STATUS_SINGLE_STEP）。
+    __try {
+      __writeeflags(setting ? (flags | 0x100ULL) : (flags & ~0x100ULL));
+      g_tf_sink += 1;  // 置位后第一条指令
+      if ((__readeflags() & 0x100ULL) != 0) {
+        ++reads_with_tf;
+      }
+    } __except (GetExceptionCode() == EXCEPTION_SINGLE_STEP ? EXCEPTION_EXECUTE_HANDLER
+                                                             : EXCEPTION_CONTINUE_SEARCH) {
+      ++steps;
+    }
+    if (setting) {
+      ++sets;
+    } else {
+      ++clears;
+    }
+    InterlockedIncrement(const_cast<long*>(&g_tf_turn));
+  }
+  result->reads_with_tf = reads_with_tf;
+  result->real_steps = steps;
+  result->sets = sets;
+  result->clears = clears;
+  return 0;
+}
+
+/// `--tf-threads N`：两条线程各跑 N 轮（偶数轮置位、奇数轮清除），各自打印结果。
+int tf_threads_experiment(unsigned long rounds) {
+  TfThreadResult results[2] = {{rounds, 0, 0, 0, 0, 0}, {rounds, 1, 0, 0, 0, 0}};
+  HANDLE threads[2];
+  for (int i = 0; i < 2; ++i) {
+    threads[i] = CreateThread(nullptr, 0, &tf_thread_main, &results[i], 0, nullptr);
+    if (threads[i] == nullptr) {
+      std::printf("PB_TF_THREADS FAIL create-thread\n");
+      return 1;
+    }
+  }
+  // 一起等：两条线程的 TF 活动**在时间上交错**，共享状态会被暴露出来。
+  WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+  for (int i = 0; i < 2; ++i) {
+    CloseHandle(threads[i]);
+  }
+  std::printf("PB_TF_THREADS rounds=%lu a(sets=%lu clears=%lu read_tf=%lu) "
+              "b(sets=%lu clears=%lu read_tf=%lu)\n",
+              rounds, results[0].sets, results[0].clears, results[0].reads_with_tf,
+              results[1].sets, results[1].clears, results[1].reads_with_tf);
+  return 0;
 }
 
 // ---------------------------------------------------------------- agent 检查
@@ -426,6 +522,7 @@ int main(int argc, char** argv) {
   unsigned long touches = 0;
   unsigned long pattern_hits = 0;
   unsigned long tf_sets = 0;
+  unsigned long tf_thread_rounds = 0;
   bool print_buffer = false;
   const char* agent_dll = nullptr;
   const char* agent_script = nullptr;
@@ -440,6 +537,8 @@ int main(int argc, char** argv) {
       pattern_hits = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--tf-set") == 0 && i + 1 < argc) {
       tf_sets = std::strtoul(argv[++i], nullptr, 10);
+    } else if (std::strcmp(argv[i], "--tf-threads") == 0 && i + 1 < argc) {
+      tf_thread_rounds = std::strtoul(argv[++i], nullptr, 10);
     } else if (std::strcmp(argv[i], "--print-buffer") == 0) {
       print_buffer = true;
     } else if (std::strcmp(argv[i], "--agent-check") == 0 && i + 2 < argc) {
@@ -448,6 +547,9 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (tf_thread_rounds != 0) {
+    return tf_threads_experiment(tf_thread_rounds);
+  }
   if (agent_dll != nullptr) {
     return agent_check(agent_dll, agent_script);
   }
