@@ -24,7 +24,34 @@
 
 M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与验证方式先钉死"。
 
+### 新增（M0.5：C++ 桥接层）
+- `native/src/agent_bridge.cpp` → `pinbridge_bridge.dll`：导出 Hub 期望的 8 个
+  tool 符号并转发给真实 agent DLL。**不需要 Intel Pin**，因此"Hub ↔ agent"
+  这条链路从"只测过类型"变成了"真实跑过"。
+- `native/tests/bridge_roundtrip_test.cpp`：CTest 用例，含正向（真实 agent、
+  能力闸门、事件跨边界往返）与反向（agent 缺失必须明确失败）两类。
+- `crates/pinbridge-sys/tests/bridge_end_to_end.rs`：Hub 侧加载器端到端
+  （真实 `LoadLibraryA` → ABI 校验 → 能力下发 → 事件取回 → 错误文本）。
+  `PINBRIDGE_REQUIRE_NATIVE=1` 时**不允许跳过**（CI 的 native job 会设它）。
+- `scripts/build-native.ps1`：一条命令完成 VS/vcvars/Ninja/CMake 发现、
+  配置、构建与 CTest；本地与 CI 走同一条路径。
+- `native/README.md`：这一层的构建方式、测试矩阵与"踩过的坑"。
+- CI 新增 `native` job（windows-latest）：构建 agent + native 层 + CTest +
+  加载器端到端测试。
+- `scripts/verify.ps1` 新增 native 步骤（装了 VS 就自动跑）。
+
 ### 修复
+- `pinbridge-sys` 在能力不足时把 `needed` 固定填成 `MemRead`：AI 会读到
+  "需要 mem_read"并去申请一个它其实已经有的能力。`to_error`/`check` 现在
+  要求调用方传入真实需要的能力；`Api` 记住下发过的能力集，`held` 如实回报。
+  （`Api` 因此不再是 `Copy`——它持有状态，静默复制会让两份记录分叉。）
+- `Status::NotSupported` 之前映射成 `Error::Trace`，会把读日志的人引向轨迹文件；
+  现在映射为 `TargetUnavailable` 并带上"哪一层没实现"的说明。
+- C++ 层首次真实编译暴露的三个缺陷：头文件缺 `<stddef.h>`（`offsetof` 找不到）、
+  MSVC 未加 `/utf-8`（UTF-8 中文源码被按 GBK 解释，报出"字符串字面量中的换行符"
+  这种与根因无关的错误）、`add_test` 用裸目标名导致 ctest 找不到可执行文件。
+- MSVC 非英文界面下 `showIncludes` 前缀不匹配导致构建日志被刷屏（真正的错误被淹），
+  现已显式设置 `CMAKE_CL_SHOWINCLUDES_PREFIX`。
 - Python 侧首次通过 `ruff check` / `ruff format --check` / `mypy --strict`
   （本次 23 处 ruff 问题、5 处类型问题）：主要是行宽、`UP035` 导入来源、
   `UP037` 冗余引号，以及解码器参数类型（`bytes` → `bytes | bytearray`）。

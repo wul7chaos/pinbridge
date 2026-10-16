@@ -126,12 +126,53 @@ typedef struct pb_event_raw {
 
 ### tool 侧（C++ 导出，Hub 通过 `pinbridge-sys` 加载）
 
+Hub 期望的**全部 8 个符号**（少一个就加载失败，错误信息会点名缺哪个）：
+
 `pb_abi_version` / `pb_start` / `pb_attach` / `pb_set_capabilities` /
 `pb_continue` / `pb_pause` / `pb_drain_events` / `pb_last_error`。
 
 签名与 `crates/pinbridge-sys/src/loader.rs` 的函数指针表一一对应。
 **解析失败时的错误信息必须带上具体缺失的导出名**——
 "DLL 加载失败"在排查 Pin 版本差异时毫无价值。
+
+### 两种实现（同一套 ABI，同一套转发拓扑）
+
+| DLL | 来源 | 是否需要 Pin | 用途 |
+|-----|------|--------------|------|
+| `pinbridge_bridge.dll` | `native/src/agent_bridge.cpp` | ❌ | 把 Hub 的调用转发给 agent；**今天就能端到端跑通** |
+| `pinbridge.dll` | `native/src/pinbridge_tool.cpp`（M1） | ✅ | 同一套转发 + Pin 探针注册/JIT 上下文/TF 虚拟化 |
+
+桥接层不是"占位替身"，而是真实路径的一部分：Hub 侧加载器、ABI 版本闸门、
+能力下发、事件批量取回、错误文本传递，在它上面全部真实执行过。
+Pin 到位后新增的只是探针，转发逻辑可以原样搬过去。
+
+桥接层的行为边界（写死在代码里，也有测试）：
+
+| 调用 | 无 Pin 时 |
+|------|-----------|
+| `pb_start` | `PB_STATUS_NOT_SUPPORTED`，错误文本说明"需要 Pin 的 JIT 注入" |
+| agent DLL 缺失 | `PB_STATUS_NOT_ATTACHED`，错误文本列出**尝试过的路径**（含 `PINBRIDGE_AGENT_DLL` 提示） |
+| ABI 版本不匹配 | `PB_STATUS_ABI_MISMATCH`，错误文本给出两侧版本；**拒绝转发任何调用** |
+| `out/written` 为空、`capacity == 0` | `PB_STATUS_INVALID_ARGUMENT`（**先判空指针，再判加载状态**——顺序反了会把"传了 NULL"报成"没加载 DLL"） |
+
+agent DLL 的查找顺序，以及一条**刻意的不对称**：
+
+| 情形 | 行为 |
+|------|------|
+| 设了 `PINBRIDGE_AGENT_DLL` | 只用它。**加载失败就失败，不回退到同目录** |
+| 未设该变量 | 先找本 DLL 同目录的 `pinbridge_agent.dll`，再交给系统搜索路径 |
+
+为什么不回退：操作员指向一个新构建而路径写错时，从自己目录悄悄加载一个**旧** DLL
+会让接下来所有调试都发生在错误的二进制上——现象与"代码改了却没生效"完全一样，
+是最难发现的一类事故。显式配置不该被静默覆盖。
+
+### 桥接层的额外导出面（**不属于 Hub 的 tool ABI**）
+
+`pb_allocate_sequence` / `pb_push_event` / `pb_stats`。
+
+它们让"没有 Pin 探针"时也能做真实端到端联调：事件从这一侧进入 agent，
+再从 Hub 侧取回，全程走同一套 ABI。`loader.rs` 不要求它们，
+因此将来删掉也不会影响 Hub。**不要**把它们当成正式的上层接口。
 
 ## 指针契约
 

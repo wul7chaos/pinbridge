@@ -92,8 +92,14 @@
 ### `native/` —— C++ / Pin 层
 
 * `include/pinbridge.h`：稳定 C ABI（与 `abi.rs` 逐字段对应）。
-* `src/abi_selfcheck.cpp`：**不需要 Pin** 的布局自检（static_assert）。
-* `PINBRIDGE_WITH_PIN=ON` 时才构建真正的 tool DLL（需要 Pin SDK）。
+* `src/abi_selfcheck.cpp`：**不需要 Pin** 的布局自检（`static_assert`，编译期生效）。
+* `src/agent_bridge.cpp`：**不需要 Pin** 的桥接 DLL（`pinbridge_bridge.dll`）——
+  导出 Hub 期望的 8 个 tool 符号，转发给真实 agent DLL。
+  这是"Hub ↔ agent"链路在没有 Pin 时也能被真实驱动的原因，也是 M1 里
+  Pin tool 要复用的同一套转发拓扑。
+* `src/pinbridge_tool.cpp` + `flags_virtualize.cpp`：真正的 Pin tool（M1，需 Pin SDK）。
+* 构建与踩坑记录：[native/README.md](../../native/README.md)；
+  目录内 `CMakeLists.txt` 在 `PINBRIDGE_WITH_PIN=OFF`（默认）下只构建桥接层与自检。
 
 ### `python/` —— 离线分析
 

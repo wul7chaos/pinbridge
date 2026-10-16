@@ -6,7 +6,7 @@
  *   1. 同时改两侧；2. 提升 PB_ABI_VERSION；3. 更新规范文档与测试。
  *
  * 设计约束（不要在这里加"更优雅"的东西）：
- *   * 只允许定长整数、指针 + 长度、定长数组、repre(C) 结构体；
+ *   * 只允许定长整数、指针 + 长度、定长数组、repr(C) 结构体；
  *   * 不允许 bool / 变长结构 / 回调里跨越调用边界存活的对象；
  *   * 不允许从 C++ 抛异常穿过边界；Rust 侧不允许 panic 穿过边界；
  *   * 所有字符串是 UTF-8 + NUL 结尾，所有权归调用方。
@@ -20,6 +20,7 @@
 #ifndef PINBRIDGE_H
 #define PINBRIDGE_H
 
+#include <stddef.h> /* offsetof（下面的 static_assert 用到） */
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -28,7 +29,12 @@ extern "C" {
 
 #if defined(_WIN32)
 #  define PB_CALL __cdecl
-#  if defined(PINBRIDGE_AGENT_BUILD)
+   /* PB_EXPORT 的三态：实现方导出、使用方导入。
+    * PINBRIDGE_BRIDGE_BUILD 是给 native/src/agent_bridge.cpp 用的——
+    * 它自己也导出同名符号（把 Hub 的调用转发给 agent），
+    * 因此不能按“导入”处理。 */
+#  if defined(PINBRIDGE_AGENT_BUILD) || defined(PINBRIDGE_BRIDGE_BUILD) || \
+      defined(PINBRIDGE_TOOL_BUILD)
 #    define PB_EXPORT __declspec(dllexport)
 #  else
 #    define PB_EXPORT __declspec(dllimport)

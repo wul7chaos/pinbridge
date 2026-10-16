@@ -106,6 +106,30 @@ jobs:
         working-directory: python
         run: mypy
 
+  native:
+    name: native 层（C++ 桥接 + ABI 自检）
+    runs-on: windows-latest
+    # 这个 job 是"Hub ↔ agent"链路的**唯一强制点**：
+    # test job 里那条集成测试在没有 DLL 时会跳过（本地开发者多数没装 C++ 工具链），
+    # 而这里必须真的构建出 pinbridge_bridge.dll 并让加载器驱动它。
+    # 缺少任何一步都会失败，而不是悄悄变绿。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 构建 agent DLL（cdylib）
+        run: cargo build -p pinbridge-agent
+      - name: 构建 native 层并跑 CTest
+        shell: pwsh
+        run: ./scripts/build-native.ps1 -RequireAgent
+      - name: Hub 侧加载器端到端（真实加载 DLL）
+        shell: pwsh
+        env:
+          # 设了它，测试就**不允许**跳过：环境没准备好 = 失败
+          PINBRIDGE_REQUIRE_NATIVE: "1"
+          PINBRIDGE_BRIDGE_DLL: ${{ github.workspace }}/native/build/pinbridge_bridge.dll
+        run: cargo test -p pinbridge-sys --test bridge_end_to_end -- --nocapture
+
   changelog:
     name: 变更日志守卫
     if: github.event_name == 'pull_request'

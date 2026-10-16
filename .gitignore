@@ -27,6 +27,10 @@
 /out/
 /build/
 cmake-build-*/
+# native 层的构建目录（CMake Ninja 产物 + 编译期自检目标）。
+# 注意 `native/build/` 不是 `/native/build/`：无论谁在哪个上层目录构建，
+# 产物都不该入库。同时这里也排除了测试夹具复制过来的 agent DLL。
+native/build/
 
 # --- Python ---------------------------------------------------------------
 __pycache__/

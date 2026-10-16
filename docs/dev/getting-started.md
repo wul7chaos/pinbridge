@@ -58,6 +58,29 @@ pwsh scripts/bootstrap.ps1 -InstallHooks
 
 脚本是幂等的，反复跑不会破坏已有环境；每一步都会打印"做了什么、为什么需要"。
 
+## native 层（C++ 桥接，可选但推荐）
+
+这一层**不需要 Intel Pin**：它构建出 `pinbridge_bridge.dll`——导出 Hub 期望的
+tool ABI 并转发给真实 agent DLL 的桥接层。有了它，"Hub ↔ agent"这条链路
+在没有 Pin 的机器上也能被真实驱动（见 [dev roadmap](../roadmap.md) 的 M0.5）。
+
+```powershell
+pwsh scripts/build-native.ps1            # 配置 + 构建 + ctest
+pwsh scripts/build-native.ps1 -RequireAgent   # agent DLL 缺失即失败
+```
+
+脚本自己找 Visual Studio / Ninja / CMake（没有 CMake 时用 `uv tool install cmake` 拉一个）。
+跑完之后可以验证 Hub 侧加载器：
+
+```powershell
+$env:PINBRIDGE_REQUIRE_NATIVE = '1'
+$env:PINBRIDGE_BRIDGE_DLL = "$PWD/native/build/pinbridge_bridge.dll"
+cargo test -p pinbridge-sys --test bridge_end_to_end -- --nocapture
+```
+
+没有 C++ 工具链也能开发：`cargo test --workspace` 会跳过那条集成测试，
+其余全部离线可跑。CI 的 `native` job 负责保证它**不被永久跳过**。
+
 ## 提交前
 
 ```powershell

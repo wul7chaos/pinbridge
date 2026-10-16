@@ -50,6 +50,20 @@ try {
 
     Step 'cargo fmt --check' { cargo fmt --all -- --check } '运行 `cargo fmt --all`'
 
+    # native 层（C++ 桥接 + ABI 自检）：装了 Visual Studio 就跑。
+    # **刻意放在 cargo test 之前**：Rust 侧的加载器端到端测试需要这个 DLL，
+    # 顺序反了它就会跳过——而"跳过的测试"正是本项目最不想要的假绿。
+    # 这一步验证的是"Hub 加载真实 DLL 并驱动 agent"这条链路，
+    # 单元测试**测不到**它：它断了的表现是"目标进程崩了"而不是"测试失败"。
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        Step 'native 层（CMake + CTest）' {
+            pwsh -NoProfile -File (Join-Path $root 'scripts/build-native.ps1') -RequireAgent
+        } '先看是配置、编译还是 ctest 失败；桥接层的失败信息会指出具体缺哪个导出'
+    } else {
+        Write-Host '· 未找到 Visual Studio，跳过 native 层（CI 的 native job 会跑）' -ForegroundColor Yellow
+    }
+
     if (-not $SkipClippy) {
         Step 'cargo clippy -D warnings' {
             cargo clippy --workspace --all-targets -- -D warnings

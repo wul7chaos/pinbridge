@@ -24,6 +24,7 @@
 | 折叠压缩算法 | [design/trace-compression.md](design/trace-compression.md) |
 | 与目标进程的通信 | [specs/ipc-protocol.md](specs/ipc-protocol.md) |
 | C++ ↔ Rust 边界 | [specs/c-abi.md](specs/c-abi.md) |
+| C++ / Pin 层怎么构建、踩过哪些坑 | [../native/README.md](../native/README.md) |
 | 暴露给 AI 的工具 | [specs/mcp-tools.md](specs/mcp-tools.md) |
 | 脚本运行时 | [design/script-runtime.md](design/script-runtime.md) |
 | 四类介入时机 | [design/injection-points.md](design/injection-points.md) |

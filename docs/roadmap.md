@@ -29,20 +29,57 @@
 | 脚本执行 | `pb_load_script`（能力校验已生效，CPython 宿主未接） |
 | Pin tool 本体 | `native/src/pinbridge_tool.cpp`（不存在，M1 添加） |
 
-## M1 — 接通 Pin 与脚本运行时（规划中）
+## M0.5 — C++ 桥接层落地（✅ 已完成，2026-10-16）
+
+**目标**：在没有 Intel Pin 的情况下，让"Hub ↔ agent"这条链路**真实跑起来**，
+从而把 M1 里"第一次真正执行权限链路"的风险提前消掉。
+
+起因是一次工具链探测：本机其实装了 Visual Studio（`cl.exe` / Ninja / vcvars64），
+于是 C++ 层不再是"写出来等以后编译"的代码，而是可以当场验证的产物。
+
+| 交付 | 验收（全部可执行） |
+|------|--------------------|
+| `native/` 能被真实构建 | `pwsh scripts/build-native.ps1`（首次就抓出 3 个真缺陷：缺 `<stddef.h>`、MSVC 未加 `/utf-8` 导致中文字符串被 GBK 误解、ctest 目标路径解析错误） |
+| C ABI 布局断言进编译期 | `abi_selfcheck.cpp` 的 `static_assert` 在 MSVC 上编译通过并由 CTest 执行 |
+| `pinbridge_bridge.dll`：导出 Hub 期望的 8 个 tool 符号并转发给真实 agent | `ctest` 的 `bridge_roundtrip` 通过（含 3 条事件跨两个语言边界后逐字段完好） |
+| 反向用例：agent 缺失时必须明确失败 | `ctest` 的 `bridge_missing_agent` 通过（错误文本给出**尝试过的路径**） |
+| 能力闸门跨语言生效 | 只读基线（257）调用 `pause` → `CapabilityDenied{needed: ProcessControl, held: 257}`；给出全量能力位后 → `NotSupported`（两道闸门可区分） |
+| **Hub 侧加载器端到端** | `crates/pinbridge-sys/tests/bridge_end_to_end.rs`：真实 `LoadLibraryA` → 校验 ABI v1 → `attach` → 下发能力 → 驱动事件 → 取回错误文本 |
+| 跨平台 lint 不再靠 CI 抓 | `scripts/verify.ps1` 内置 `cargo clippy --target x86_64-unknown-linux-gnu` |
+
+**这一阶段顺带修掉的真实缺陷**（都是"跑起来才暴露"的）：
+
+1. `pinbridge-sys` 在能力不足时把 `needed` 固定填成 `MemRead`——AI 会去申请一个
+   它其实已经有的能力。现在 `to_error`/`check` 要求调用方传入真实需要的能力，
+   `Api` 也记住"下发过的能力集"以便如实回报 `held`。
+2. `Status::NotSupported` 之前映射成 `Error::Trace`——读日志的人会去翻轨迹文件，
+   而正确方向是"查哪一层没实现"。现在映射为 `TargetUnavailable` 并说明原因。
+3. C++ 侧字符串常量被 MSVC 按 GBK 解释，报出"字符串字面量中的换行符"这种
+   与真正原因无关的错误。修法是 `/utf-8`，并写进了规范。
+
+## M1 — 接通 Pin 与脚本运行时（进行中）
 
 **目标**：让 M0 的桩变成真能力，且**权限链路第一次真正执行**。
 
-| 任务 | 验收 |
+| 任务 | 状态 |
 |------|------|
-| `pinbridge.dll`：Pin tool 入口、探针注册、agent 加载与调用转发 | `pin -t pinbridge.dll -- TARGET.exe` 能跑起来并产出事件 |
-| agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | 一段脚本能被加载、被回调、产生 `script_output` 事件 |
-| 脚本沙箱白名单（禁 `os`/`ctypes`/`socket`/写文件） | 用例：尝试 `import os` 被拒且留下审计 |
-| 脚本执行时间预算（超时 → `TimedOut` + 强制卸载） | 用例：死循环脚本在 5s 内被终止，目标仍可继续 |
-| 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | 手工验证清单（见 [dev/testing.md](dev/testing.md)） |
-| `pinbridge-sys` 加载器端到端 | `Api::load` 对一个真实构建出的 DLL 成功并校验 ABI |
-| Hub ↔ agent 回环链路（真实握手、版本协商、重连） | 断开后能重新 attach，`Detached → Attached` 迁移正确 |
-| MCP 新增工具：`pb_modules` / `pb_registers` | 工具表与 `docs/specs/mcp-tools.md` 同步，含"能力不足被拒"测试 |
+| ~~`pinbridge-sys` 加载器端到端~~ | ✅ M0.5 已完成（真实 DLL，真实 ABI 校验） |
+| ~~agent 加载与调用转发的桥接拓扑~~ | ✅ M0.5 已完成（`agent_bridge.cpp`，Pin tool 复用同一拓扑） |
+| `pinbridge.dll`：Pin tool 入口、探针注册、JIT 上下文 | ⏳ 需要 Pin SDK |
+| agent 内嵌 CPython + `pb` 模块（subscribe / log / mark / read / snapshot / defer） | ⏳ |
+| 脚本沙箱白名单（禁 `os`/`ctypes`/`socket`/写文件） | ⏳ |
+| 脚本执行时间预算（超时 → `TimedOut` + 强制卸载） | ⏳ |
+| 真实内存读写 / 断点 / 单步 / 继续 / 暂停 | ⏳ 手工验证清单见 [dev/testing.md](dev/testing.md) |
+| Hub ↔ agent 回环链路（真实握手、版本协商、重连） | ⏳ M0.5 已铺好桥接层，剩下的是 NDJSON 会话层 |
+| MCP 新增工具：`pb_modules` / `pb_registers` | ⏳ |
+
+| 验收标准 | 判据 |
+|----------|------|
+| `pin -t pinbridge.dll -- TARGET.exe` 能跑起来并产出事件 | 手工验证 |
+| 一段脚本能被加载、被回调、产生 `script_output` 事件 | 用例 |
+| 尝试 `import os` 被拒且留下审计 | 用例 |
+| 死循环脚本在预算内被终止，目标仍可继续 | 用例 |
+| 真实内存读写/断点/单步/继续/暂停 | 手工验证清单 |
 
 **M1 的关键风险**：
 
