@@ -11,10 +11,7 @@ from pb import FORMAT_VERSION, MAGIC
 from pb.trace.event import Event, EventKind
 from pb.trace.fold import expand_records, fold_events
 from pb.trace.pbt import (
-    CHUNK_END,
     CHUNK_EVENT,
-    CHUNK_META,
-    CHUNK_SUMMARY,
     FLAG_DELTA_ENCODED,
     FLAG_REPEAT_FOLDED,
     PbtError,
@@ -41,7 +38,9 @@ def golden_records() -> list[Event]:
         [0x40, 0x7FF6_0000_2300, 8, 0, 0, 0, 0, 0],
     )
     return [
-        Event(1, EventKind.BREAKPOINT_HIT, 100, 0x7FF6_0000_1000, [0x1400_01000, 0, 0, 0, 0, 0, 0, 0]),
+        Event(
+            1, EventKind.BREAKPOINT_HIT, 100, 0x7FF6_0000_1000, [0x1400_01000, 0, 0, 0, 0, 0, 0, 0]
+        ),
         sample,
         Event.repeat_marker(1000, 997, sample),
     ]
@@ -74,12 +73,32 @@ def write_trace(records: list[Event], *, chunk_limit: int = 64 * 1024, flags: in
 def fixture_events() -> list[Event]:
     """带一段长重复的夹具：3 条普通事件 + 500 条完全相同的 syscall。"""
     events = [
-        Event(1, EventKind.BREAKPOINT_HIT, 100, 0x7FF6_0000_1000, [0x1400_01000, 0, 0, 0, 0, 0, 0, 0]),
-        Event(2, EventKind.SYSCALL_ENTER, 100, 0x7FF6_0000_2000, [0x40, 0x7FF6_0000_2300, 8, 0, 0, 0, 0, 0]),
-        Event(3, EventKind.MEM_WRITE, 100, 0x7FF6_0000_3000, [0x7FF6_0000_3000, 4, 0xDEAD_BEEF, 0, 0, 0, 0, 0]),
+        Event(
+            1, EventKind.BREAKPOINT_HIT, 100, 0x7FF6_0000_1000, [0x1400_01000, 0, 0, 0, 0, 0, 0, 0]
+        ),
+        Event(
+            2,
+            EventKind.SYSCALL_ENTER,
+            100,
+            0x7FF6_0000_2000,
+            [0x40, 0x7FF6_0000_2300, 8, 0, 0, 0, 0, 0],
+        ),
+        Event(
+            3,
+            EventKind.MEM_WRITE,
+            100,
+            0x7FF6_0000_3000,
+            [0x7FF6_0000_3000, 4, 0xDEAD_BEEF, 0, 0, 0, 0, 0],
+        ),
     ]
     events.extend(
-        Event(4 + offset, EventKind.SYSCALL_ENTER, 100, 0x7FF6_0000_2000, [0x40, 0x7FF6_0000_2300, 8, 0, 0, 0, 0, 0])
+        Event(
+            4 + offset,
+            EventKind.SYSCALL_ENTER,
+            100,
+            0x7FF6_0000_2000,
+            [0x40, 0x7FF6_0000_2300, 8, 0, 0, 0, 0, 0],
+        )
         for offset in range(500)
     )
     return events

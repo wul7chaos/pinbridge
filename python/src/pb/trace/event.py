@@ -35,7 +35,7 @@ class EventKind(IntEnum):
         return _KIND_NAMES[self]
 
     @classmethod
-    def from_code(cls, code: int) -> "EventKind":
+    def from_code(cls, code: int) -> EventKind:
         """由判别值还原。
 
         与 Rust 侧 `EventKind::from_code` 严格对齐：**0 也是非法值**
@@ -43,9 +43,7 @@ class EventKind(IntEnum):
         未知值一律抛 `ValueError`，绝不猜一个默认类型。
         """
         if code == int(cls.RESERVED):
-            raise ValueError(
-                "事件类型判别值 0 是保留值：文件可能被改写，或写端有 bug"
-            )
+            raise ValueError("事件类型判别值 0 是保留值：文件可能被改写，或写端有 bug")
         try:
             return cls(code)
         except ValueError as error:
@@ -54,7 +52,7 @@ class EventKind(IntEnum):
             ) from error
 
     @classmethod
-    def from_name(cls, name: str) -> "EventKind":
+    def from_name(cls, name: str) -> EventKind:
         """由短名还原。"""
         for kind in cls:
             if kind.tag == name:
@@ -103,7 +101,7 @@ class Event:
         """读参数（越界返回 0，与 Rust 的 `arg()` 一致）。"""
         return self.args[index] if 0 <= index < MAX_ARGS else 0
 
-    def same_payload(self, other: "Event") -> bool:
+    def same_payload(self, other: Event) -> bool:
         """载荷比较：**不比较序号**。
 
         这是折叠判定的核心：同一条指令重复执行百万次时，只有序号在变。
@@ -116,7 +114,7 @@ class Event:
         )
 
     @classmethod
-    def repeat_marker(cls, last_sequence: int, folded_count: int, sample: "Event") -> "Event":
+    def repeat_marker(cls, last_sequence: int, folded_count: int, sample: Event) -> Event:
         """构造折叠标记。
 
         * `sequence` = 该重复段最后一条事件的序号；

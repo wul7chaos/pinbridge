@@ -5,6 +5,13 @@
 
 from __future__ import annotations
 
+#: 解码器只做索引与切片，因此 `bytes` 与 `bytearray` 都能直接吃。
+#:
+#: 之所以显式给出这个别名，而不是把参数写成 `bytes`：流式解析器的缓冲区就是
+#: `bytearray`（要支持"读到一半、下次接着读"），如果只接受 `bytes`，
+#: 每次调用都要多一次拷贝——在几十亿条事件上是实打实的开销。
+Buffer = bytes | bytearray
+
 
 class VarintError(ValueError):
     """变长整数非法（超长或数据被截断）。"""
@@ -34,7 +41,7 @@ def write_zigzag(out: bytearray, value: int) -> None:
     write_u64(out, zz)
 
 
-def read_u64(data: bytes, offset: int = 0) -> tuple[int, int]:
+def read_u64(data: Buffer, offset: int = 0) -> tuple[int, int]:
     """读取无符号 LEB128，返回 ``(值, 新偏移)``。
 
     超过 10 字节视为损坏（与 Rust 侧一致）：这是解码器唯一必须防御的地方，
@@ -53,7 +60,7 @@ def read_u64(data: bytes, offset: int = 0) -> tuple[int, int]:
     raise VarintError(f"偏移 {offset} 处的 varint 超过 10 字节，文件可能已损坏")
 
 
-def try_read_u64(data: bytes, offset: int = 0) -> tuple[int, int] | None:
+def try_read_u64(data: Buffer, offset: int = 0) -> tuple[int, int] | None:
     """增量解码：数据不足时返回 ``None``（而不是抛异常）。
 
     流式读取 `.pbt` 时必须区分"还没读到"和"文件坏了"。
@@ -71,13 +78,13 @@ def try_read_u64(data: bytes, offset: int = 0) -> tuple[int, int] | None:
     raise VarintError(f"偏移 {offset} 处的 varint 超过 10 字节，文件可能已损坏")
 
 
-def read_zigzag(data: bytes, offset: int = 0) -> tuple[int, int]:
+def read_zigzag(data: Buffer, offset: int = 0) -> tuple[int, int]:
     """读取 zigzag 编码的 i64。"""
     raw, next_offset = read_u64(data, offset)
     return (raw >> 1) ^ -(raw & 1), next_offset
 
 
-def try_read_zigzag(data: bytes, offset: int = 0) -> tuple[int, int] | None:
+def try_read_zigzag(data: Buffer, offset: int = 0) -> tuple[int, int] | None:
     """增量版 zigzag 读取：数据不足返回 ``None``，超长 varint 仍抛异常。"""
     step = try_read_u64(data, offset)
     if step is None:

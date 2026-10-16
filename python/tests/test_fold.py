@@ -12,10 +12,18 @@ from pb.trace.event import Event, EventKind
 from pb.trace.fold import FoldError, RepeatFolder, expand_records, fold_events, iter_expanded
 
 
-def identical_run(start: int, count: int, *, thread: int = 100, address: int = 0x7FF6_0000_2000) -> list[Event]:
+def identical_run(
+    start: int, count: int, *, thread: int = 100, address: int = 0x7FF6_0000_2000
+) -> list[Event]:
     """构造一段"载荷完全相同、序号连续"的事件。"""
     return [
-        Event(start + offset, EventKind.SYSCALL_ENTER, thread, address, [0x40, 0x7FF6_0000_2300, 0, 0, 0, 0, 0, 0])
+        Event(
+            start + offset,
+            EventKind.SYSCALL_ENTER,
+            thread,
+            address,
+            [0x40, 0x7FF6_0000_2300, 0, 0, 0, 0, 0, 0],
+        )
         for offset in range(count)
     ]
 

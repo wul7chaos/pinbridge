@@ -23,8 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="PinBridge 轨迹离线读取与快速体检",
     )
     parser.add_argument("trace", help=".pbt 轨迹文件")
-    parser.add_argument("--head", type=int, default=10, help="打印前 N 条记录（默认 10，0 表示不打印）")
-    parser.add_argument("--taint", type=lambda text: int(text, 0), help="从该地址出发做前向污点传播")
+    parser.add_argument(
+        "--head", type=int, default=10, help="打印前 N 条记录（默认 10，0 表示不打印）"
+    )
+    parser.add_argument(
+        "--taint", type=lambda text: int(text, 0), help="从该地址出发做前向污点传播"
+    )
     parser.add_argument("--oep-range", help="形如 0x140000000-0x140100000，定位 OEP 候选点")
     parser.add_argument("--version", action="version", version=f"pb-replay {__version__}")
     return parser

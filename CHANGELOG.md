@@ -25,6 +25,14 @@
 M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与验证方式先钉死"。
 
 ### 修复
+- Python 侧首次通过 `ruff check` / `ruff format --check` / `mypy --strict`
+  （本次 23 处 ruff 问题、5 处类型问题）：主要是行宽、`UP035` 导入来源、
+  `UP037` 冗余引号，以及解码器参数类型（`bytes` → `bytes | bytearray`）。
+  类型层面把"读取器到底依赖了什么"显式化成两方法的 `ReadableSource` Protocol，
+  而不是假装满足 `BinaryIO`。
+- `scripts/verify.ps1` / `verify.sh` 的 Python 侧从"只跑 pytest"补成
+  pytest + ruff check + ruff format + mypy——这一步之前只在 CI 上跑，
+  导致本地全绿而 CI 变红。
 - `pinbridge-sys` 的 `PB_ABI_VERSION` 无条件导入：Windows 本地 clippy 全绿，
   Ubuntu 上因 `unused_imports` 直接失败。改为 `#[cfg(windows)]` 条件导入，
   测试模块显式导入；并把「跨平台 lint」加进 `scripts/verify.ps1` /

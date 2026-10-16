@@ -32,8 +32,8 @@ pb-replay TRACE.pbt --oep-range 0x140000000-0x140100000
 from pb.trace.replay import load
 
 trace = load("TRACE.pbt")
-print(trace.summary)          # 先看完整性：dropped / truncated
-print(trace.expanded_count()) # 展开后的事件数（流式统计，不物化）
+print(trace.summary)  # 先看完整性：dropped / truncated
+print(trace.expanded_count())  # 展开后的事件数（流式统计，不物化）
 
 # 谁动过这块内存
 for ev in trace.slice(0x7FF600003000, 0x7FF600004000, limit=50):

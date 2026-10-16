@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Iterator
+from collections.abc import Iterable, Iterator
 
 from pb.trace.event import Event, EventKind
 
@@ -44,9 +44,7 @@ class RepeatFolder:
         """
         # 序号从 1 开始（0 保留给"未初始化"），因此严格递增即可覆盖全部非法输入
         if event.sequence <= self._last_input:
-            raise FoldError(
-                f"事件序号必须严格递增：{self._last_input} 之后收到 {event.sequence}"
-            )
+            raise FoldError(f"事件序号必须严格递增：{self._last_input} 之后收到 {event.sequence}")
         self._last_input = event.sequence
         emitted: list[Event] = []
 

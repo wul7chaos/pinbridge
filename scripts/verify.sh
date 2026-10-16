@@ -46,8 +46,28 @@ step "端到端自检（pinbridge demo）" "检查 demo 断在哪一步" \
   cargo run --quiet -p pinbridge-cli -- demo --trace-dir "${TMPDIR:-/tmp}/pinbridge-verify"
 
 if [[ "${SKIP_PYTHON:-0}" != "1" ]] && command -v python3 >/dev/null 2>&1; then
-  step "Python 侧（pytest）" "跨语言一致性失败时先定位是哪一侧偏离规范" \
-    env PYTHONPATH=python/src python3 -m pytest python/tests -q
+  # 与 verify.ps1 对齐：pytest 管行为，ruff/mypy 管风格与类型。
+  # 分三步跑，是为了让"本地通过 = CI 通过"这件事真的成立。
+  py_tool() {
+    local tool="$1"; shift
+    if command -v uv >/dev/null 2>&1; then
+      (cd python && PYTHONPATH=src uv run --no-project --with "$tool" --python 3.12 "$tool" "$@")
+    elif command -v "$tool" >/dev/null 2>&1; then
+      (cd python && PYTHONPATH=src "$tool" "$@")
+    else
+      echo "· 未安装 $tool，跳过（能用 uv 时建议装：https://docs.astral.sh/uv/）" >&2
+      return 0
+    fi
+  }
+
+  step "Python: pytest" "跨语言一致性失败时先看 test_rust_parity 是否找不到 Rust 二进制" \
+    py_tool pytest -q
+  step "Python: ruff check" "运行 ruff check . --fix 处理能自动修的" \
+    py_tool ruff check . --output-format concise
+  step "Python: ruff format --check" "运行 ruff format . 统一格式" \
+    py_tool ruff format --check .
+  step "Python: mypy（严格模式）" "按提示补类型标注，不要用 type: ignore 关掉" \
+    py_tool mypy
 else
   echo "· 跳过 Python 侧（CI 会跑）"
 fi

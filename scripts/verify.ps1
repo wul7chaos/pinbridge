@@ -77,17 +77,39 @@ try {
 
     if (-not $SkipPython) {
         if (Get-Command python -ErrorAction SilentlyContinue) {
-            Step 'Python 侧（pytest）' {
+            # 这三步刻意分开：pytest 管行为，ruff/mypy 管风格与类型。
+            # 一次跑完的好处是"本地通过 = CI 通过"；不这样做的话，
+            # ruff/mypy 的问题会等到 CI 才暴露（本仓库就发生过一次）。
+            $hasUv = [bool](Get-Command uv -ErrorAction SilentlyContinue)
+
+            function Invoke-PyTool {
+                param([string]$Tool, [string[]]$ToolArgs)
                 Push-Location (Join-Path $root 'python')
                 try {
                     $env:PYTHONPATH = 'src'
-                    if (Get-Command uv -ErrorAction SilentlyContinue) {
-                        uv run --no-project --with pytest --python 3.12 python -m pytest -q
+                    if ($hasUv) {
+                        uv run --no-project --with $Tool --python 3.12 $Tool @ToolArgs
                     } else {
-                        python -m pytest -q
+                        & $Tool @ToolArgs
                     }
                 } finally { Pop-Location }
-            } '跨语言一致性失败时，先跑 test_golden_vectors 定位是哪一侧偏离了规范'
+            }
+
+            Step 'Python: pytest' {
+                Invoke-PyTool 'pytest' @('-q')
+            } '跨语言一致性失败时，先看 test_rust_parity 是不是找不到 Rust 二进制'
+
+            Step 'Python: ruff check' {
+                Invoke-PyTool 'ruff' @('check', '.', '--output-format', 'concise')
+            } '运行 `ruff check . --fix` 看哪些能自动修；剩下的按 docs/dev/coding-standards-python.md'
+
+            Step 'Python: ruff format --check' {
+                Invoke-PyTool 'ruff' @('format', '--check', '.')
+            } '运行 `ruff format .` 统一格式（与 Rust 侧同为 100 列）'
+
+            Step 'Python: mypy（严格模式）' {
+                Invoke-PyTool 'mypy' @()
+            } '类型标注问题按提示补；不要用 `# type: ignore` 关掉了事'
         } else {
             Write-Host "· 未找到 python，跳过 Python 侧（CI 会跑）" -ForegroundColor Yellow
         }

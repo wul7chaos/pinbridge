@@ -29,11 +29,28 @@ import struct
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Protocol
 
 from pb import FORMAT_VERSION, MAGIC, MAX_ARGS
 from pb.trace.event import Event, EventKind
 from pb.trace.varint import try_read_u64, try_read_zigzag, write_u64, write_zigzag
+
+
+class ReadableSource(Protocol):
+    """`PbtReader` 真正需要的最小接口。
+
+    刻意**不去满足 `BinaryIO`**：那要求实现十余个方法（`readinto`、`seekable`、
+    `writable`…），而这里只用到两个。为了通过类型检查而实现一堆用不到的方法，
+    是典型的负担转移；用一个两方法的 Protocol 反而把"我们到底依赖了什么"讲清楚了。
+
+    参数名用 `n`（与 `BinaryIO.read` 一致），这样真实的文件对象、
+    `io.BytesIO` 与本模块的 `_BytesIo` 都结构化兼容。
+    """
+
+    def read(self, n: int) -> bytes: ...  # noqa: E704
+
+    def close(self) -> None: ...  # noqa: E704
+
 
 # --- 段 tag（0x00..=0x3F 为本格式保留，0x40..=0x7E 给实验扩展，0x7F 结束）---
 CHUNK_META = 0x00
@@ -80,7 +97,7 @@ class Summary:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
 
     @classmethod
-    def from_json(cls, text: str) -> "Summary":
+    def from_json(cls, text: str) -> Summary:
         """从 JSON 解析。未知字段忽略，缺失字段取默认值。"""
         try:
             raw = json.loads(text)
@@ -88,7 +105,7 @@ class Summary:
             raise PbtError(f"summary 不是合法 JSON: {error}") from error
         if not isinstance(raw, dict):
             raise PbtError("summary 顶层必须是对象")
-        known = {field for field in cls.__dataclass_fields__}
+        known = set(cls.__dataclass_fields__)
         return cls(**{key: value for key, value in raw.items() if key in known})
 
 
@@ -226,10 +243,12 @@ class PbtReader:
 
     def __init__(self, source: bytes | bytearray | BinaryIO | str | Path) -> None:
         if isinstance(source, (bytes, bytearray)):
-            self._source: BinaryIO = _BytesIo(source)
+            self._source: ReadableSource = _BytesIo(source)
             self._owns_source = False
         elif isinstance(source, (str, Path)):
-            self._source = Path(source).open("rb")
+            # 这里刻意不使用 `with`：句柄的生命周期必须由 PbtReader 自己持有，
+            # 因为它要在多次 `records()` 调用之间保持打开。__exit__/close 负责关闭。
+            self._source = Path(source).open("rb")  # noqa: SIM115
             self._owns_source = True
         else:
             self._source = source
@@ -257,7 +276,7 @@ class PbtReader:
         self.version = version
         self.flags = flags
 
-    def __enter__(self) -> "PbtReader":
+    def __enter__(self) -> PbtReader:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -424,8 +443,8 @@ class _BytesIo:
         self._data = bytes(data)
         self._offset = 0
 
-    def read(self, count: int) -> bytes:
-        piece = self._data[self._offset : self._offset + count]
+    def read(self, n: int) -> bytes:
+        piece = self._data[self._offset : self._offset + n]
         self._offset += len(piece)
         return piece
 
