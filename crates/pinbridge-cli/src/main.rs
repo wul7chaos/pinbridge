@@ -19,9 +19,13 @@ use pinbridge_core::session::TargetSpec;
 use pinbridge_hub::HubService;
 use pinbridge_proto::frames::ControlCommand;
 use pinbridge_proto::mcp::TOOLS;
+use pinbridge_trace::diff::{attach_warnings, diff_traces, diff_warnings, DiffOptions};
 use pinbridge_trace::event::EventKind;
 use pinbridge_trace::fold::expand_records;
-use pinbridge_trace::pbt::PbtReader;
+use pinbridge_trace::pbt::{PbtReader, Summary};
+
+/// 报告里最多列出几处分岔（总数仍然准确）。
+const MAX_DIFFERENCES: usize = 8;
 
 const USAGE: &str = "\
 pinbridge 0.1.0 —— 插装式动态分析框架（AI 主导 · 人机平级）
@@ -30,6 +34,8 @@ pinbridge 0.1.0 —— 插装式动态分析框架（AI 主导 · 人机平级�
   pinbridge tools                     打印 MCP 工具表
   pinbridge replay <FILE.pbt> [--head N]
                                       离线读取轨迹并打印汇总/前 N 条记录
+  pinbridge diff <A.pbt> <B.pbt> [--ignore-address]
+                                      同一个目标的两次运行：行为在哪里分岔
   pinbridge demo [--trace-dir <DIR>]  端到端自检
   pinbridge mcp                       以 stdio 方式启动 MCP 服务
   pinbridge version                   打印版本
@@ -64,6 +70,27 @@ fn main() -> ExitCode {
             }
             None => {
                 eprintln!("用法: pinbridge replay <FILE.pbt> [--head N]");
+                ExitCode::FAILURE
+            }
+        },
+        "diff" => match (args.get(1), args.get(2)) {
+            (Some(left), Some(right)) => {
+                let options = DiffOptions {
+                    ignore_address: args.iter().any(|a| a == "--ignore-address"),
+                    ignore_thread: args.iter().any(|a| a == "--ignore-thread"),
+                };
+                match diff(left, right, options) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("差分失败: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
+                eprintln!(
+                    "用法: pinbridge diff <A.pbt> <B.pbt> [--ignore-address] [--ignore-thread]"
+                );
                 ExitCode::FAILURE
             }
         },
@@ -135,6 +162,50 @@ fn parse_trace_dir(args: &[String]) -> std::path::PathBuf {
         || std::env::temp_dir().join("pinbridge-traces"),
         std::path::PathBuf::from,
     )
+}
+
+/// 读一份轨迹并展开折叠，返回（展开后的事件、汇总）。
+///
+/// 两个刻意的选择：
+///
+/// 1. **用流式模式读**（容忍被截断的尾部）。严格模式在"录制被强杀/目标崩溃"时
+///    直接报损坏、读不出任何东西——而那种轨迹恰恰是最想拿来比对的
+///    （"这次为什么崩了"）。容忍截断 + 把"汇总缺失/不完整"变成**告警**，
+///    比"读不出来"有用得多；
+/// 2. **展开折叠后比对**。折叠对时序敏感，两次运行的折叠位置不同会制造大量
+///    伪分岔（见 `pinbridge_trace::diff` 的告警）。
+fn load_trace(path: &str) -> Result<(Vec<pinbridge_trace::Event>, Option<Summary>), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut reader = PbtReader::open_streaming(file).map_err(|e| format!("{path}: {e}"))?;
+    let records = reader.read_all().map_err(|e| format!("{path}: {e}"))?;
+    let summary = reader.summary().map_err(|e| format!("{path}: {e}"))?;
+    Ok((expand_records(&records), summary))
+}
+
+/// `pinbridge diff A.pbt B.pbt`：两次运行的行为分岔在哪里。
+fn diff(left_path: &str, right_path: &str, options: DiffOptions) -> Result<(), String> {
+    let (left, left_summary) = load_trace(left_path)?;
+    let (right, right_summary) = load_trace(right_path)?;
+    let mut result = diff_traces(&left, &right, options, MAX_DIFFERENCES);
+    attach_warnings(
+        &mut result,
+        diff_warnings(left_summary.as_ref(), right_summary.as_ref()),
+    );
+    println!("左（基准）: {left_path}");
+    println!("右（对照）: {right_path}");
+    // 说清本命令**已经**做了什么：上面那条折叠告警会让读者以为"还得先展开"，
+    // 而 CLI 在读取时就已经展开了（否则会让人去做一件已经做过的事）。
+    println!("（读取时已自动展开折叠，按展开后的事件逐条比对）");
+    print!("{}", result.render());
+    // 有告警时**额外**在最后再提一次：报告很长的时候，第一行的告警会被滚出屏幕，
+    // 而"这份数据能不能用来下结论"是唯一不能漏的信息。
+    if result.has_warnings() {
+        println!(
+            "⚠ 上面有 {} 条告警：结论的可信度受限，先处理告警再看分岔。",
+            result.warnings.len()
+        );
+    }
+    Ok(())
 }
 
 fn replay(path: &str, head: usize) -> Result<(), String> {
