@@ -135,6 +135,97 @@ mod imp {
     }
 }
 
+/// 一次内存快照的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snapshot {
+    /// 落盘的字节数。
+    pub bytes: u64,
+    /// FNV-1a 64 位校验和。
+    pub checksum: u64,
+}
+
+/// 快照允许的最大长度。
+///
+/// 有上限是必须的：`snapshot(addr, 1<<40, path)` 会试图分配/写一个天文数字，
+/// 把目标进程和目标磁盘一起拖垮。超限**明确拒绝**，不截断——
+/// "我要 1 GiB，你给我 64 MiB 且没告诉我"会让上层把半截数据当完整数据用。
+pub const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 分块大小：8 MiB 一块，既不至于一次性占用大块内存，也不至于系统调用过密。
+const SNAPSHOT_CHUNK: usize = 8 * 1024 * 1024;
+
+/// 计算 FNV-1a 64 位校验和。
+///
+/// **这不是密码学哈希**：它挡的是"传输/落盘过程中出了明显差错"和
+/// "两次快照是不是同一段内存"，不挡可构造的碰撞。对抗场景要的是能区分
+/// "数据被改过"，那种需求得用真正的哈希，届时单独引入依赖并说明。
+#[must_use]
+pub fn checksum(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 把目标进程的一段内存写到文件里（分块读、分块写、边写边算校验和）。
+///
+/// # Errors
+///
+/// 长度超上限、地址读不到（会指出是哪个偏移起读不到）、文件写不进去时返回原因。
+pub fn snapshot_to_file(address: u64, length: u64, path: &std::path::Path) -> Result<Snapshot> {
+    use std::io::Write;
+
+    if length > MAX_SNAPSHOT_BYTES {
+        return Err(Error::TargetUnavailable(format!(
+            "快照长度 {length} 超过上限 {MAX_SNAPSHOT_BYTES} 字节；请分段快照"
+        )));
+    }
+    if length == 0 {
+        return Err(Error::TargetUnavailable("快照长度为 0".into()));
+    }
+    let file = std::fs::File::create(path).map_err(|error| {
+        Error::TargetUnavailable(format!("创建 {} 失败：{error}", path.display()))
+    })?;
+    let mut writer = std::io::BufWriter::new(file);
+    let mut done: u64 = 0;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut buffer = vec![0u8; SNAPSHOT_CHUNK.min(length as usize)];
+    while done < length {
+        let want = (length - done).min(buffer.len() as u64) as usize;
+        let slice = &mut buffer[..want];
+        let read = read_process(address + done, slice).map_err(|error| {
+            // 指出**从哪个偏移起读不到**：快照失败时 AI 需要知道"边界在哪"，
+            // 否则它只能猜是整段不可读还是只是尾巴。
+            Error::TargetUnavailable(format!(
+                "快照在偏移 {done}（地址 0x{:x}）处读失败：{error}",
+                address + done
+            ))
+        })?;
+        if read == 0 {
+            return Err(Error::TargetUnavailable(format!(
+                "快照在偏移 {done} 处读回 0 字节"
+            )));
+        }
+        for byte in &slice[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        writer.write_all(&slice[..read]).map_err(|error| {
+            Error::TargetUnavailable(format!("写入 {} 失败：{error}", path.display()))
+        })?;
+        done += read as u64;
+    }
+    writer.flush().map_err(|error| {
+        Error::TargetUnavailable(format!("刷新 {} 失败：{error}", path.display()))
+    })?;
+    Ok(Snapshot {
+        bytes: done,
+        checksum: hash,
+    })
+}
+
 #[cfg(not(windows))]
 mod imp {
     use super::{Error, Result};

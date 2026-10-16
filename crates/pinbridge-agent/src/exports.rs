@@ -107,15 +107,36 @@ pub unsafe extern "C" fn pb_push_event(raw: *const PbEventRaw) -> c_int {
         });
     }
     // SAFETY: 上面已判空；调用方保证指针在本次调用期间有效
-    let event = unsafe { *raw };
-    flush_breakpoint_hits();
-    // ── 先分发，再入队 ──
+    let mut event = unsafe { *raw };
+    // **序号 0 = "没填"，由 agent 分配一个。**
     //
-    // 顺序是刻意的：脚本可能在回调里 `pb.mark`/`pb.log`，那些输出会产生
-    // **新的** ScriptOutput 事件。先分发再入队，能让这些输出紧跟在
-    // "触发它的事件"之后出现在事件流里；反过来会让因果顺序看起来是反的。
-    dispatch_to_scripts(&event);
-    AgentHost::call(|state| state.push(&event).map(|_| ()))
+    // 序号 0 不是合法的事件序号（分配器从 1 开始）。把 0 当成"未设置"而不是
+    // 原样入队，是因为轨迹侧折叠器有"序号严格递增"的不变量：调用方顺手传 0
+    // 会在记录里造成序号回退。实测过一次——几条用例并发时，
+    // 整个测试进程在那个 debug_assert 上 panic（现场离原因很远）。
+    if event.sequence == 0 {
+        event.sequence = pb_allocate_sequence();
+    }
+    // ── 先入队**触发事件**，再产生派生事件 ──
+    //
+    // 顺序有两条约束，必须同时满足：
+    //
+    // 1. **因果顺序**：脚本在回调里 `pb.mark`/`pb.log` 产生的输出，应当紧跟在
+    //    "触发它的那条事件"之后出现在事件流里；
+    // 2. **序号单调**：派生事件用的是新分配的序号，必然比调用方这条大。
+    //    如果先把派生事件入队，记录侧的折叠器就会看到"序号回退"——
+    //    它有"严格递增"的不变量（实测过一次：某些用例顺序下整个测试进程
+    //    在那里 panic）。
+    //
+    // 两条约束同时满足的排法只有一个：**先入队触发事件，再入队派生事件**。
+    // （早先写成了"先分发再入队"，那会让输出出现在触发事件**之前**，
+    //   序号也回退——因果看起来是反的。）
+    let status = AgentHost::call(|state| state.push(&event).map(|_| ()));
+    if status == Status::Ok.code() {
+        dispatch_to_scripts(&event);
+    }
+    flush_breakpoint_hits();
+    status
 }
 
 /// 把一条入站事件交给脚本的订阅者，并把脚本产生的输出转成事件。
@@ -150,6 +171,10 @@ fn dispatch_to_scripts(event: &PbEventRaw) {
     match outcome {
         Ok(crate::python_host::HostDispatchOutcome::Called(called)) => {
             if called != 0 {
+                // deferred 的活在这里执行：**回调已经返回**，目标此刻不在我们的
+                // 插装点里。这正是 `pb.defer` 要的能力——回调必须极快返回，
+                // 耗时的整理解析排到回调之后做。
+                run_deferred_work();
                 let (outputs, _) = collect_script_outputs();
                 emit_script_outputs(&outputs);
             }
@@ -264,6 +289,10 @@ fn event_kind_by_name(name: &str) -> Option<u8> {
 fn emit_script_outputs(outputs: &[(u64, u64, String)]) {
     for (kind, value, _text) in outputs {
         let mut raw = PbEventRaw::EMPTY;
+        // **框架自己产生的事件也要走序号分配器。** 漏掉这一步会推出序号 0 的事件，
+        // 而轨迹写入侧的折叠器有"序号必须严格递增"的不变量（debug_assert）——
+        // 实测过一次：某些用例顺序下整个测试进程在这里 panic。
+        raw.sequence = pb_allocate_sequence();
         raw.kind = EventKind::ScriptOutput.code();
         raw.thread_id = 0;
         // 事件的 args 是**数字**（`.pbt` 的模型就是这样）：类别与数值在这里，
@@ -302,17 +331,42 @@ pub unsafe extern "C" fn pb_drain_events(
             state.fail(Status::InvalidArgument, "pb_drain_events: capacity 为 0")
         });
     }
-    // 先把异常上下文攒下的断点命中落成事件，再连同队列一起取走——
-    // 否则"命中了但事件要等下一次推送才出现"会让调用方以为断点没生效。
-    flush_breakpoint_hits();
     // SAFETY: 由调用方保证缓冲区大小与 capacity 一致
     let buffer = unsafe { std::slice::from_raw_parts_mut(out, capacity as usize) };
     let count = AgentHost::with(|state| state.drain_into(buffer));
     // SAFETY: written 已判空
     unsafe { *written = count as c_uint };
+    // **取完之后**才把异常上下文攒下的断点命中落成事件：它们的序号必然比刚取走的
+    // 那批更大。反过来（先落再取）会让这批里出现"序号比前面的还小"的事件，
+    // 破坏记录侧"严格递增"的不变量。代价是命中最快在**下一次**取事件时出现——
+    // 而调用方本来就会反复取，这个延迟可以接受；序号单调不可以妥协。
+    flush_breakpoint_hits();
     Status::Ok.code()
 }
 
+/// 执行脚本排队的 deferred 活，并把其中的异常写进审计通道。
+///
+/// 为什么异常要进审计而不是只打日志：deferred 的活是脚本自己排的，它里面出错
+/// **不会**让任何调用失败（那时回调早就返回了）。如果只打日志，
+/// 在"目标跑完就退出"的常规场景里这些错误根本没人看见——
+/// 脚本会安静地少做一半事。
+fn run_deferred_work() {
+    let Ok(count) = crate::python_host::run_deferred() else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    let errors = crate::python_host::deferred_errors().unwrap_or_default();
+    if errors.trim() == "[]" || errors.is_empty() {
+        return;
+    }
+    AgentHost::with(|state| {
+        state.note_audit(&format!(
+            "script_defer_errors: {count} 个 deferred 执行，异常：{errors}"
+        ));
+    });
+}
 /// 把异常上下文记下的断点命中转成事件。
 ///
 /// **只在正常上下文调用**（`pb_drain_events` / `pb_push_event` 进来时）：
@@ -710,6 +764,8 @@ pub unsafe extern "C" fn pb_load_script(name: *const c_char, source: *const c_ch
     }
     // 加载期的 log / mark 也要变成事件（订阅那几条已经用掉了）。
     emit_script_outputs(&outputs);
+    // 加载期排的 deferred 活也在这里执行。
+    run_deferred_work();
     AgentHost::with(|state| {
         state.fail(
             Status::Ok,

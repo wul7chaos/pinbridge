@@ -141,6 +141,8 @@ mod imp {
         PyExc_ValueError: *mut *mut c_void,
         /// `PyObject* PyModule_GetDict(PyObject*)`（借用）
         PyModule_GetDict: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        /// `PyObject* PyLong_FromLongLong(long long)`（**新引用**）
+        PyLong_FromLongLong: unsafe extern "C" fn(i64) -> *mut c_void,
         /// `int PyThreadState_SetAsyncExc(unsigned long id, PyObject* exc)`（**新引用**由调用方负责）
         PyThreadState_SetAsyncExc:
             unsafe extern "C" fn(std::os::raw::c_ulong, *mut c_void) -> c_int,
@@ -414,6 +416,89 @@ mod imp {
     /// 一个天文数字的缓冲区，把目标进程的内存直接吃光。
     const MAX_SCRIPT_READ_BYTES: u64 = 4 * 1024 * 1024;
 
+    /// `_pb_snapshot_native(address, length, path) -> bytes`：把一段内存落到文件。
+    ///
+    /// 能力校验在**这里**（和 `pb.read` 同一条纪律）：脚本改不了 Rust 侧的状态。
+    /// 顺带写一行审计——"在什么地址上取了多大的快照、校验和是多少"是事后
+    /// 判断"这份 dump 是哪一次拿的"的唯一依据。
+    unsafe extern "C" fn pb_snapshot_native(_self: *mut c_void, args: *mut c_void) -> *mut c_void {
+        let Some(api) = CALLBACK_API.get() else {
+            return std::ptr::null_mut();
+        };
+        let fail = |message: &str| -> *mut c_void {
+            let text = c_string(message).unwrap_or_default();
+            // SAFETY: 异常类型是 DLL 里的数据符号；解除引用得到 PyObject*。
+            let kind = unsafe { *api.PyExc_RuntimeError };
+            // SAFETY: kind 是异常类型；text 在本调用期间存活。
+            unsafe { (api.PyErr_SetString)(kind, text.as_ptr()) };
+            std::ptr::null_mut()
+        };
+        if args.is_null() {
+            return fail("pb.snapshot 需要三个参数：地址、长度、路径");
+        }
+        // SAFETY: args 是参数元组（METH_VARARGS 约定）。
+        let count = unsafe { (api.PyTuple_Size)(args) };
+        if count != 3 {
+            return fail(&format!(
+                "pb.snapshot 需要三个参数（地址、长度、路径），收到 {count} 个"
+            ));
+        }
+        // SAFETY: 索引 0..2 在范围内，返回借用引用。
+        let (address_object, length_object, path_object) = unsafe {
+            (
+                (api.PyTuple_GetItem)(args, 0),
+                (api.PyTuple_GetItem)(args, 1),
+                (api.PyTuple_GetItem)(args, 2),
+            )
+        };
+        if address_object.is_null() || length_object.is_null() || path_object.is_null() {
+            return fail("pb.snapshot 的参数取不到");
+        }
+        // SAFETY: 三个对象都非空；非整数会设异常并返回 -1。
+        let (address, length) = unsafe {
+            (
+                (api.PyLong_AsUnsignedLongLong)(address_object),
+                (api.PyLong_AsUnsignedLongLong)(length_object),
+            )
+        };
+        if address == u64::MAX || length == u64::MAX {
+            return fail("pb.snapshot 的地址/长度必须是整数");
+        }
+        let Some(path) = (unsafe { py_string_to_rust(api, path_object) }) else {
+            return fail("pb.snapshot 的路径必须是字符串");
+        };
+        if path.is_empty() {
+            return fail("pb.snapshot 的路径为空");
+        }
+        // 能力闸门：与 Hub 侧读内存走的是同一道门。
+        if let Err(error) = crate::host::AgentHost::with(|state| {
+            state.require(pinbridge_core::capability::Capability::MemRead)
+        }) {
+            return fail(&error.to_string());
+        }
+        match crate::memory::snapshot_to_file(address, length, std::path::Path::new(&path)) {
+            Ok(snapshot) => {
+                crate::host::AgentHost::with(|state| {
+                    state.note_audit(&format!(
+                        "snapshot: 0x{address:x} +{length} → {path}（{} 字节，校验和 0x{:016x}）",
+                        snapshot.bytes, snapshot.checksum
+                    ));
+                });
+                // 返回字节数：脚本可以据此判断"拿到的是不是我要的那一段"。
+                // SAFETY: 返回新引用（整数对象）。
+                unsafe { (api.PyLong_FromLongLong)(snapshot.bytes as i64) }
+            }
+            Err(error) => fail(&error.to_string()),
+        }
+    }
+
+    /// `_pb_snapshot_native` 的方法表（静态原因同 `READ_NATIVE_DEF`）。
+    static SNAPSHOT_NATIVE_DEF: SyncMethodDef = SyncMethodDef(PyMethodDef {
+        name: c"_pb_snapshot_native".as_ptr(),
+        method: pb_snapshot_native,
+        flags: METH_VARARGS,
+        doc: c"snapshot target memory: snapshot(address, length, path) -> written bytes".as_ptr(),
+    });
     /// `_pb_read_native` 的方法表（必须是静态：CPython 只存指针）。
     static READ_NATIVE_DEF: SyncMethodDef = SyncMethodDef(PyMethodDef {
         name: c"_pb_read_native".as_ptr(),
@@ -472,6 +557,37 @@ mod imp {
         }
     }
 
+    /// 把一个 Python 字符串对象读成 Rust `String`。
+    ///
+    /// # Safety
+    ///
+    /// 调用时**必须持有 GIL**；`object` 必须是有效的 Python 对象
+    /// （不是字符串时返回 `None`）。
+    unsafe fn py_string_to_rust(api: &PyApi, object: *mut c_void) -> Option<String> {
+        // SAFETY: 由调用方保证 GIL 与对象有效性；下面每一步都检查了空。
+        let as_text = Owned::new(api, unsafe { (api.PyObject_Str)(object) });
+        if as_text.is_null() {
+            unsafe { (api.PyErr_Print)() };
+            return None;
+        }
+        // SAFETY: as_text 是 str 对象。
+        let as_bytes = Owned::new(api, unsafe {
+            (api.PyUnicode_AsUTF8String)(as_text.object())
+        });
+        if as_bytes.is_null() {
+            unsafe { (api.PyErr_Print)() };
+            return None;
+        }
+        // SAFETY: as_bytes 是 bytes 对象。
+        let pointer = unsafe { (api.PyBytes_AsString)(as_bytes.object()) };
+        let length = unsafe { (api.PyBytes_Size)(as_bytes.object()) };
+        if pointer.is_null() || length < 0 {
+            return None;
+        }
+        // SAFETY: pointer/length 来自同一个 bytes 对象，在本作用域内有效。
+        let slice = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), length as usize) };
+        Some(String::from_utf8_lossy(slice).into_owned())
+    }
     /// 把 `&str` 变成 C 串（不带上下文名，调用点自己给更好的错误文本）。
     fn c_string(text: &str) -> Result<CString> {
         CString::new(text)
@@ -532,15 +648,58 @@ def _pb_handler_count():
     """当前登记的处理器总数（测试与诊断用）。"""
     return sum(len(items) for items in _PB_SUBSCRIBERS.values())
 
+_PB_DEFERRED = []
+_PB_DEFER_ERRORS = []
+
+def _pb_defer(fn, *args):
+    """把活排到**当前回调返回之后**再做。
+
+    回调跑在目标线程上，必须极快返回：在里面做重活会拖慢目标，
+    被分析的程序里那些对时序敏感的代码会因此表现异常——而"目标变慢了"
+    与"目标本来就这样"几乎无法区分。所以规则是：回调里只做判断与排队，
+    耗时的整理解析交给这里。
+
+    注意边界：deferred 的活**仍然在这条线程上、仍然算在这段预算里**。
+    "移出回调"移的是"目标此刻不在我们的插装点里"，不是"移到别的线程"。
+    """
+    _PB_DEFERRED.append((fn, args))
+    return len(_PB_DEFERRED)
+
+def _pb_run_deferred():
+    """执行排队的活，返回执行了几个（取走即清空）。"""
+    queued = list(_PB_DEFERRED)
+    del _PB_DEFERRED[:]
+    ran = 0
+    for fn, args in queued:
+        try:
+            fn(*args)
+        except Exception as exc:
+            # 一个坏掉的 deferred 不该带走整批：记下来，继续跑剩下的。
+            _PB_DEFER_ERRORS.append("%s: %s" % (type(exc).__name__, exc))
+        ran += 1
+    return ran
+
+def _pb_take_defer_errors():
+    errors = list(_PB_DEFER_ERRORS)
+    del _PB_DEFER_ERRORS[:]
+    return _json.dumps(errors, ensure_ascii=False)
+
+def _pb_pending_deferred():
+    return len(_PB_DEFERRED)
 _pb = _types.ModuleType("pb")
 _pb.log = _pb_log
 _pb.mark = _pb_mark
 _pb.subscribe = _pb_subscribe
-# read 由 Rust 提供（`_pb_read_native`），因为读内存必须过能力闸门——
-# 闸门在 Rust 侧才够不着（脚本能改 Python 里的任何东西）。
+# read / snapshot 由 Rust 提供（`_pb_read_native` / `_pb_snapshot_native`），
+# 因为它们必须过能力闸门——闸门在 Rust 侧才够不着（脚本能改 Python 里的任何东西）。
 _pb.read = _pb_read_native
+_pb.snapshot = _pb_snapshot_native
+_pb.defer = _pb_defer
+# 诊断用：还有几个 deferred 活没执行（脚本与测试都可以问）。
+_pb.pending_deferred = _pb_pending_deferred
 _pb.__doc__ = "PinBridge 目标侧接口（由 agent 注入，不是安装到环境里的包）"
 _sys.modules["pb"] = _pb
+
 
 class _PBTimeout(Exception):
     """脚本超出时间预算时抛出（由宿主的看门狗线程异步注入）。
@@ -680,6 +839,7 @@ def _pb_dispatch(combined_json):
             let err_set_string = must!("PyErr_SetString");
             let module_get_dict = must!("PyModule_GetDict");
             let dict_set_item_string = must!("PyDict_SetItemString");
+            let long_from_long = must!("PyLong_FromLongLong");
             let thread_state_set_async_exc = must!("PyThreadState_SetAsyncExc");
             let thread_get_thread_ident = must!("PyThread_get_thread_ident");
             let err_print = must!("PyErr_Print");
@@ -801,6 +961,10 @@ def _pb_dispatch(combined_json):
                     *mut c_void,
                     unsafe extern "C" fn(*mut c_void) -> *mut c_void,
                 >(module_get_dict),
+                PyLong_FromLongLong: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(i64) -> *mut c_void,
+                >(long_from_long),
                 PyThreadState_SetAsyncExc: std::mem::transmute::<
                     *mut c_void,
                     unsafe extern "C" fn(std::os::raw::c_ulong, *mut c_void) -> c_int,
@@ -1074,6 +1238,32 @@ def _pb_dispatch(combined_json):
                     unsafe { (api.PyErr_Print)() };
                     return Err(Error::Script("把原生可调用对象放进 __main__ 失败".into()));
                 }
+                // 第二个原生函数：内存快照（同样要过能力闸门、同样要能写文件，
+                // 所以同样不能只用 Python 实现）。
+                // SAFETY: 方法表是静态的；self/module 传空。
+                let snapshot = Owned::new(api, unsafe {
+                    (api.PyCFunction_NewEx)(
+                        std::ptr::addr_of!(SNAPSHOT_NATIVE_DEF.0).cast_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                });
+                if snapshot.is_null() {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script("构造快照可调用对象失败".into()));
+                }
+                // SAFETY: 同上。
+                let code = unsafe {
+                    (api.PyDict_SetItemString)(
+                        dict,
+                        c"_pb_snapshot_native".as_ptr(),
+                        snapshot.object(),
+                    )
+                };
+                if code != 0 {
+                    unsafe { (api.PyErr_Print)() };
+                    return Err(Error::Script("把快照可调用对象放进 __main__ 失败".into()));
+                }
                 Ok(())
             })();
             // SAFETY: gil 来自上面的 Ensure。
@@ -1236,6 +1426,23 @@ def _pb_dispatch(combined_json):
             dispatched.map(DispatchOutcome::Called)
         }
 
+        /// 执行脚本排队的 deferred 活，返回执行了几个。
+        pub(crate) fn run_deferred(&self) -> Result<u32> {
+            let counted = self.call_json("_pb_run_deferred", None)?;
+            Ok(counted.trim().parse().unwrap_or(0))
+        }
+
+        /// 取走 deferred 执行期间的异常（JSON 数组）。
+        pub(crate) fn deferred_errors(&self) -> Result<String> {
+            self.call_json("_pb_take_defer_errors", None)
+        }
+
+        /// 当前排队但还没执行的 deferred 数量。
+        #[allow(dead_code)]
+        pub(crate) fn pending_deferred(&self) -> Result<u32> {
+            let counted = self.call_json("_pb_pending_deferred", None)?;
+            Ok(counted.trim().parse().unwrap_or(0))
+        }
         /// 给接下来执行的脚本打标记，并清掉**同一个标记**留下的旧处理器。
         ///
         /// 顺序是刻意的：先清旧的、再执行新的，于是"同名脚本换版本"的效果是
@@ -1530,6 +1737,32 @@ def _pb_dispatch(combined_json):
             .map(Into::into)
     }
 
+    /// 执行脚本排队的 deferred 活（平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用时出错。
+    pub fn run_deferred() -> Result<u32> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.run_deferred()
+    }
+
+    /// 取走 deferred 执行期间的异常（JSON 数组，平台统一入口）。
+    ///
+    /// # Errors
+    ///
+    /// 解释器不可用时出错。
+    pub fn deferred_errors() -> Result<String> {
+        let host = shared()?;
+        let guard = host
+            .lock()
+            .map_err(|_| Error::Script("解释器宿主锁中毒".into()))?;
+        guard.deferred_errors()
+    }
+
     /// 给脚本打标记并清掉同名脚本留下的旧处理器（平台统一入口）。
     ///
     /// # Errors
@@ -1684,6 +1917,20 @@ mod imp {
     /// # Errors
     ///
     /// 总是返回"不支持"。
+    pub fn run_deferred() -> Result<u32> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
+    pub fn deferred_errors() -> Result<String> {
+        Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
+    }
+
+    /// # Errors
+    ///
+    /// 总是返回"不支持"。
     pub fn set_script_tag(_tag: &str) -> Result<()> {
         Err(Error::TargetUnavailable(NOT_SUPPORTED.into()))
     }
@@ -1767,8 +2014,9 @@ mod outcome_bridge {
 }
 
 pub use imp::{
-    bootstrap, dispatch, dispatch_with_budget, drain_outputs, drop_handlers, handler_count,
-    library_description, probe, run_source, run_source_with_budget, set_script_tag,
+    bootstrap, deferred_errors, dispatch, dispatch_with_budget, drain_outputs, drop_handlers,
+    handler_count, library_description, probe, run_deferred, run_source, run_source_with_budget,
+    set_script_tag,
 };
 
 /// 当前平台是否实现了 CPython 宿主。
@@ -1970,6 +2218,120 @@ pb.log("script loaded")
         println!("✓ 预算 0 = 不限制");
     }
 
+    /// `pb.defer`：回调里排的活**在回调返回之后**才执行。
+    ///
+    /// 证据链条：回调内看到队列长度为 0（说明活没在回调里做），
+    /// 宿主执行之后队列被清空且结果出现在输出里。
+    #[test]
+    fn deferred_work_runs_after_the_callback_returns() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+        host.set_script_tag("defer").expect("打标记应当成功");
+        host.run(
+            r#"
+import pb
+
+def on_syscall(ev):
+    pb.defer(pb.mark, "deferred_done", ev.args[0])
+    pb.mark("in_callback", pb.pending_deferred())
+
+pb.subscribe("syscall_enter", on_syscall)
+"#,
+        )
+        .expect("注册脚本应当成功");
+
+        let payload =
+            serde_json::json!({ "address": 4096, "args": [7, 0, 0, 0, 0, 0, 0, 0] }).to_string();
+        let called = host
+            .dispatch_with_budget("syscall_enter", &payload, 2_000)
+            .expect("分发应当成功");
+        assert!(matches!(called, DispatchOutcome::Called(count) if count >= 1));
+
+        // 回调里看到的是"排了 1 个还没执行"
+        let during = host.drain_outputs().expect("drain 应当成功");
+        assert!(
+            during.contains("[2, 1, \"in_callback\"]"),
+            "回调内应当看到队列里有 1 个待执行的活：{during}"
+        );
+        // 而 deferred 的活已经由宿主执行完了
+        let ran = host.run_deferred().expect("执行 deferred 应当成功");
+        let after = host.drain_outputs().expect("drain 应当成功");
+        let _ = ran;
+        println!("✓ 回调内输出：{during}");
+        println!("✓ deferred 执行后输出：{after}");
+        // `pb.defer(pb.mark, "deferred_done", ev.args[0])` → 值就是当时事件里的 7。
+        // 关键不是这个值，而是**它出现在宿主执行 deferred 之后**：
+        // 回调内只排了队（`in_callback` 那条看到 1），活是回调返回后才做的。
+        assert!(
+            after.contains("[2, 7, \"deferred_done\"]"),
+            "deferred 的 mark 应当出现：{after}"
+        );
+    }
+
+    /// `pb.snapshot`：把一段真实内存落到文件，并把字节数交回脚本。
+    #[test]
+    fn snapshot_writes_a_real_file_and_reports_the_size() {
+        let _guard = serialize();
+        if matches!(probe(), Availability::Unavailable { .. }) {
+            println!("跳过：本机没有可用的 CPython");
+            return;
+        }
+        static mut SNAPSHOT_BUFFER: [u8; 32] = [0u8; 32];
+        let address = std::ptr::addr_of_mut!(SNAPSHOT_BUFFER).cast::<u8>() as u64;
+        crate::memory::write_process(address, b"PBSNAPSHOT-DATA-0123456789abc")
+            .expect("写测试缓冲区应当成功");
+
+        let dir = std::env::temp_dir().join(format!("pb-snap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("shot.bin");
+        let path_text = path.to_string_lossy().replace('\\', "\\\\");
+
+        let _ = crate::exports::pb_set_capabilities(
+            pinbridge_core::capability::Capability::read_only_baseline().bits(),
+        );
+        let host = pinbridge_agent_test_host();
+        host.bootstrap().expect("注入 pb 模块应当成功");
+        host.set_script_tag("snap").expect("打标记应当成功");
+        host.run(&format!("PB_SNAPSHOT_ADDRESS = {address}"))
+            .expect("注入地址应当成功");
+        host.set_script_tag("snap").expect("打标记应当成功");
+        // 注意：路径要在 Python 源码里当字符串字面量，所以先转义反斜杠
+        let outcome = host.run(&format!(
+            "import pb\n\nwritten = pb.snapshot(PB_SNAPSHOT_ADDRESS, 32, \"{path_text}\")\npb.mark(\"snapshot\", written)\n"
+        ));
+        // 没能力的环境（非 Windows）：快照必须报错而不是静默成功
+        if let Err(error) = outcome {
+            println!("✓ 无内存读能力时快照报错：{error}");
+            let _ = crate::exports::pb_set_capabilities(
+                pinbridge_core::capability::Capability::operator_default().bits(),
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let drained = host.drain_outputs().expect("drain 应当成功");
+        println!("✓ 快照输出：{drained}");
+        assert!(
+            drained.contains("[2, 32, \"snapshot\"]"),
+            "应当报回 32 字节：{drained}"
+        );
+
+        let written = std::fs::read(&path).expect("快照文件应当存在");
+        assert_eq!(written.len(), 32);
+        // 写入的是 29 字节的字面量（"PBSNAPSHOT-DATA-0123456789abc"），
+        // 剩下的 3 字节是缓冲区里原来的 0。
+        assert_eq!(&written[..29], b"PBSNAPSHOT-DATA-0123456789abc");
+        assert_eq!(&written[29..], &[0u8, 0, 0]);
+        println!(
+            "✓ 快照文件内容正确：{:?}",
+            String::from_utf8_lossy(&written[..29])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// 分发路径的预算：回调里的死循环也要被中断。
     #[test]
     fn a_looping_callback_is_interrupted_too() {
