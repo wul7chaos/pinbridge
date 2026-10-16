@@ -539,11 +539,19 @@ if(BUILD_TESTING)
                 -pb_syscalls 1
                 -pb_syscall_max 200000
                 -pb_events 2
+                -pb_require_exceptions 32
                 --
                 "$<TARGET_FILE:pb_sample_target>" --exception-flow 32)
+      # 这条用例现在要求**工具真的观察到异常**，而不只是"靶子跑完了"：
+      # 靶子抛的是私有码 0xE0000001，工具那一行同时带着条数与异常码，
+      # 所以断言这一行就同时钉住了「挂点抓到了」与「抓到的是对的那个异常」。
+      #
+      # 背景（实测）：只挂 `KiUserExceptionDispatcher` 时**一次都没进**（Pin 的异常
+      # 投递不经过那个桩），主挂点是 `RtlRaiseException`。所以这条用例同时是那个
+      # 结论的回归保护：挂点被换回"看起来更正确"的那个，它会立刻变红。
       set_tests_properties(pin_tool_exception_flow_continues PROPERTIES
-        PASS_REGULAR_EXPRESSION "observed=32"
-        FAIL_REGULAR_EXPRESSION "PB_EXCEPTION_FLOW FAIL|Unhandled internal exception|not-raised")
+        PASS_REGULAR_EXPRESSION "异常事件：观察到 32 次.*code=0xE0000001"
+        FAIL_REGULAR_EXPRESSION "PB_EXCEPTION_FLOW FAIL|Unhandled internal exception|not-raised|异常事件：一次都没观察到")
 
       add_test(NAME pin_tool_mem_range_filter
           COMMAND "${PINBRIDGE_PWSH}" -NoProfile -File

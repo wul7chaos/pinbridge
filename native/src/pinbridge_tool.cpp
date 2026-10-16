@@ -475,6 +475,22 @@ volatile UINT64 g_transfer_rets = 0;
 volatile bool g_exceptions_enabled = false;
 /// 观察到的异常条数（不含单步异常，那是 TF 那一套的账）。
 volatile UINT64 g_exceptions_observed = 0;
+/// 首个被捕获的应用异常（收尾报告用，也是"探针真的挂对了地方"的证据）。
+volatile UINT64 g_first_exception_code = 0;
+volatile UINT64 g_first_exception_address = 0;
+/// 命中的栈布局：`0` 未知、`1` 表示 `[rsp]` 是异常记录、`2` 表示 `[rsp+8]` 是。
+///
+/// 为什么把这件事也记下来：`KiUserExceptionDispatcher` 入口处的栈布局在不同来源的
+/// 文档里说法不一致（"记录在前"与"上下文在前"都有人写）。与其猜，不如**两个候选
+/// 都读一遍、把命中的那个报出来** —— 让数据纠正猜测，而不是反过来。判决性判据在
+/// 测试里（靶子抛的是私有码 0xE0000001），所以读错会立刻暴露。
+volatile UINT32 g_exception_layout = 0;
+/// 是否已经给 `KiUserExceptionDispatcher` 布过探针（只布一次）。
+bool g_exception_probe_installed = false;
+/// 诊断打印的次数（有界：只打前几次）。
+UINT32 g_exception_diag_prints = 0;
+/// 实际命中过哪个挂点：0 无、1 `RtlRaiseException`、2 `KiUserExceptionDispatcher`。
+volatile UINT32 g_exception_source = 0;
 /// 要求观察到的异常条数（0 = 不检查）。
 UINT64 g_required_exceptions = 0;
 
@@ -913,6 +929,13 @@ bool parse_patterns(const char* text) {
   return true;
 }
 
+/// 前向声明：定义在下面（`OnImageLoad` 要用它们）。参数类型此时已完整，
+/// 所以不需要把定义一起搬上来。
+bool install_exception_probe(IMG img);
+VOID OnUserExceptionDispatcher(THREADID tid, ADDRINT rsp, ADDRINT rcx, ADDRINT rdx);
+VOID OnRaiseException(THREADID tid, ADDRINT record_pointer);
+void record_exception_from(THREADID tid, const UINT64* pointers, UINT32 count, UINT32 source);
+
 void OnImageLoad(IMG img, VOID* v) {
   (void)v;
 
@@ -941,6 +964,19 @@ void OnImageLoad(IMG img, VOID* v) {
 
   // 安全上下文：把回调里攒下的"摘插装"请求真正执行掉
   apply_pending_hard_stop();
+
+  // ── 应用异常：挂在 ntdll 的分发器上 ──
+  // `KiUserExceptionDispatcher` 是内核把控制权交回用户态处理异常的入口，
+  // **任何**异常都会经过它（包括应用自己 `RaiseException` 的软件异常 —— 那些
+  // 到不了 `PIN_AddContextChangeFunction`）。
+  //
+  // 放在"排除自身模块"之后、主模块判断之前：它既不是自己的模块，也不限于主模块。
+  if (g_exceptions_enabled && !g_exception_probe_installed) {
+    const std::string name = module_name_of(IMG_Name(img));
+    if (name == "ntdll.dll" || name == "ntdll") {
+      install_exception_probe(img);
+    }
+  }
 
   if (!IMG_IsMainExecutable(img)) {
     return;
@@ -2019,6 +2055,216 @@ VOID OnFlagsStoreAfter(THREADID tid, ADDRINT stack_pointer) {
 /// **不依赖调试框架**是刻意的：这个回调由 Pin 在**异常发生的那一刻**通知工具，
 /// 不需要设置调试端口、不需要 AttachDebugger、也不挂钩内核调试对象。
 /// 因此它不会与其他调试器冲突，也不会在"目标正在被调试"时失效。
+/// 给 ntdll 的分发器布探针。返回是否布上。
+///
+/// `RTN_FindByName` + `RTN_Open` 在 JIT 模式下可用：这里不需要
+/// `PIN_StartProgramProbed()`（那是 `RTN_InsertCall(IPOINT_AFTER)` 这类需求才需要）。
+bool install_exception_probe(IMG img) {
+  // 两个挂点都试，**以先命中的为准**：
+  //
+  // * `RtlRaiseException(PEXCEPTION_RECORD)` —— 应用调用 `RaiseException` 走的
+  //   就是它，那个记录指针就是**第一个参数**（RCX）。稳定、语义明确、不用猜栈布局。
+  // * `KiUserExceptionDispatcher` —— 内核把控制权交回用户态处理异常的入口，
+  //   硬件故障（访问违例等）会经过它。
+  //
+  // 实测过：只挂分发器时**一次都没进**（Pin 的异常投递路径不经过那个桩，
+  // 诊断打印一条都没有）——所以"文档说任何异常都经过它"这句话在插桩环境下不成立。
+  // 这里保留它作为补充，同时明确报出实际命中的是哪一个。
+  bool any = false;
+  RTN raise = RTN_FindByName(img, "RtlRaiseException");
+  if (RTN_Valid(raise)) {
+    RTN_Open(raise);
+    RTN_InsertCall(raise, IPOINT_BEFORE, reinterpret_cast<AFUNPTR>(OnRaiseException),
+                   IARG_THREAD_ID, IARG_REG_VALUE, LEVEL_BASE::REG_RCX, IARG_END);
+    RTN_Close(raise);
+    report("异常探针：已挂在 ntdll!RtlRaiseException（应用 RaiseException 走这里）");
+    any = true;
+  } else {
+    report("异常探针：ntdll 里找不到 RtlRaiseException");
+  }
+
+  RTN dispatcher = RTN_FindByName(img, "KiUserExceptionDispatcher");
+  if (RTN_Valid(dispatcher)) {
+    RTN_Open(dispatcher);
+    RTN_InsertCall(dispatcher, IPOINT_BEFORE,
+                   reinterpret_cast<AFUNPTR>(OnUserExceptionDispatcher), IARG_THREAD_ID,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_RSP, IARG_REG_VALUE, LEVEL_BASE::REG_RCX,
+                   IARG_REG_VALUE, LEVEL_BASE::REG_RDX, IARG_END);
+    RTN_Close(dispatcher);
+    report("异常探针：已挂在 ntdll!KiUserExceptionDispatcher（硬件故障走这里）");
+    any = true;
+  }
+  g_exception_probe_installed = any;
+  return any;
+}
+
+/// `RtlRaiseException` 的入口探针：`RCX` 就是 `PEXCEPTION_RECORD`。
+///
+/// 为什么用它作为**主**挂点（实测）：`KiUserExceptionDispatcher` 在插桩环境下
+/// **一次都没进**（Pin 的异常投递不走那个桩）。而 `RaiseException` →
+/// `RtlRaiseException` 是应用异常**必经**的路径，且第一个参数就是异常记录 ——
+/// 既不用猜栈布局，也不依赖"内核会跳哪个桩"这类版本相关的细节。
+VOID OnRaiseException(THREADID tid, ADDRINT record_pointer) {
+  if (!g_exceptions_enabled || g_shutdown || record_pointer < 0x10000) {
+    return;
+  }
+  const UINT64 candidates[1] = {static_cast<UINT64>(record_pointer)};
+  // 1 = `RtlRaiseException`（见 `g_exception_source` 的说明）。
+  record_exception_from(tid, candidates, 1, 1);
+}
+
+/// `KiUserExceptionDispatcher` 的入口探针：**应用自己抛的异常也会走到这里**。
+///
+/// 为什么换到这个挂点：`PIN_AddContextChangeFunction` 收不到应用 `RaiseException`
+/// 的软件异常（实测过：32 轮异常控制流，回调一次都没进），而 `NtRaiseException`
+/// （0x175）在系统调用边界上也一次没出现。`KiUserExceptionDispatcher` 是内核把
+/// 控制权交回用户态处理异常的入口，**任何**异常都会经过它。
+///
+/// 入口处栈上是两个指针；哪个是异常记录有歧义（见 `g_exception_layout` 的说明），
+/// 所以两个候选都读一遍、取"像记录"的那个（异常码非 0 且异常地址非 0）。
+/// 读栈一律用 `PIN_SafeCopy`：判断错了绝不能变成一次访问违例。
+/// 从若干候选指针里认出异常记录并发出事件。
+///
+/// 两个挂点共用它：`RtlRaiseException` 手上是**确定的**记录指针（RCX），
+/// 分发器那条路是**栈上的两个指针、哪个是记录有歧义**。把"认记录"这件事写在一处，
+/// 两条路径的行为就不会漂移（判据在测试里：靶子抛的私有码 0xE0000001）。
+void record_exception_from(THREADID tid, const UINT64* pointers, UINT32 count, UINT32 source) {
+  UINT64 code = 0;
+  UINT64 flags = 0;
+  UINT64 fault_address = 0;
+  UINT64 parameters = 0;
+  UINT32 layout = 0;
+  for (UINT32 slot = 0; slot < count; ++slot) {
+    const ADDRINT base = static_cast<ADDRINT>(pointers[slot]);
+    if (base < 0x10000) {
+      continue; // 明显不是用户态指针：跳过（不做"看起来像"的猜测）
+    }
+    UINT32 candidate_code = 0;
+    UINT32 candidate_flags = 0;
+    UINT64 candidate_address = 0;
+    UINT32 candidate_parameters = 0;
+    if (PIN_SafeCopy(&candidate_code, reinterpret_cast<VOID*>(base), sizeof(UINT32)) !=
+        sizeof(UINT32)) {
+      continue;
+    }
+    if (PIN_SafeCopy(&candidate_flags, reinterpret_cast<VOID*>(base + 4), sizeof(UINT32)) !=
+        sizeof(UINT32)) {
+      continue;
+    }
+    if (PIN_SafeCopy(&candidate_address, reinterpret_cast<VOID*>(base + 16),
+                     sizeof(UINT64)) != sizeof(UINT64)) {
+      continue;
+    }
+    if (PIN_SafeCopy(&candidate_parameters, reinterpret_cast<VOID*>(base + 24),
+                     sizeof(UINT32)) != sizeof(UINT32)) {
+      continue;
+    }
+    if (candidate_code != 0 && candidate_address != 0) {
+      code = candidate_code;
+      flags = candidate_flags;
+      fault_address = candidate_address;
+      parameters = candidate_parameters;
+      layout = slot + 1;
+      break;
+    }
+  }
+  if (code == 0) {
+    return; // 候选都不像异常记录：**不猜**，也不报一条假事件
+  }
+  g_exception_source = source;
+  if (g_exceptions_observed == 0) {
+    g_first_exception_code = code;
+    g_first_exception_address = fault_address;
+    g_exception_layout = layout;
+    report("首要异常：code=0x%llX 地址=0x%llX 标志=0x%llX 参数个数=%llu"
+           "（挂点 %s，第 %u 个候选指针是记录）",
+           static_cast<unsigned long long>(code),
+           static_cast<unsigned long long>(fault_address),
+           static_cast<unsigned long long>(flags),
+           static_cast<unsigned long long>(parameters),
+           source == 1 ? "RtlRaiseException" : "KiUserExceptionDispatcher",
+           static_cast<unsigned>(layout));
+  }
+  ++g_exceptions_observed;
+
+  const UINT64 args[4] = {code, fault_address, flags, parameters};
+  // 事件的 `address` 用**异常地址**（出事的指令），而不是分发器/抛出点的地址：
+  // 与其它探针一致 —— 事件地址回答"发生在哪"。
+  push_probe_event(stats_for(tid), 2 /* PB_EV_EXCEPTION */, tid,
+                   static_cast<ADDRINT>(fault_address), args, 4);
+}
+
+VOID OnUserExceptionDispatcher(THREADID tid, ADDRINT rsp, ADDRINT rcx, ADDRINT rdx) {
+  if (!g_exceptions_enabled || g_shutdown) {
+    return;
+  }
+  UINT64 pointers[2] = {0, 0};
+  if (PIN_SafeCopy(&pointers[0], reinterpret_cast<VOID*>(rsp), sizeof(UINT64)) !=
+      sizeof(UINT64)) {
+    return;
+  }
+  if (PIN_SafeCopy(&pointers[1], reinterpret_cast<VOID*>(rsp + sizeof(UINT64)),
+                   sizeof(UINT64)) != sizeof(UINT64)) {
+    return;
+  }
+  // 有界诊断：前几次把"手上到底有什么"打出来。文档对入口处布局的说法不一致，
+  // 与其继续猜，不如让第一次运行直接把事实摆出来（本项目在探针位置上用过同一招：
+  // 打印前若干个被跳过的点，比报告一个总数有用得多）。
+  if (g_exception_diag_prints < 3) {
+    ++g_exception_diag_prints;
+    UINT64 third = 0;
+    PIN_SafeCopy(&third, reinterpret_cast<VOID*>(rsp + 2 * sizeof(UINT64)), sizeof(UINT64));
+    report("异常探针诊断 #%u：rsp=0x%llX [rsp]=0x%llX [rsp+8]=0x%llX [rsp+16]=0x%llX "
+           "rcx=0x%llX rdx=0x%llX",
+           static_cast<unsigned>(g_exception_diag_prints),
+           static_cast<unsigned long long>(rsp),
+           static_cast<unsigned long long>(pointers[0]),
+           static_cast<unsigned long long>(pointers[1]),
+           static_cast<unsigned long long>(third),
+           static_cast<unsigned long long>(rcx),
+           static_cast<unsigned long long>(rdx));
+    const UINT64 cand[2] = {pointers[0], pointers[1], };
+    for (UINT32 slot = 0; slot < 2; ++slot) {
+      if (cand[slot] < 0x10000) {
+        continue;
+      }
+      UINT64 head = 0;
+      UINT64 at16 = 0;
+      if (PIN_SafeCopy(&head, reinterpret_cast<VOID*>(static_cast<ADDRINT>(cand[slot])),
+                       sizeof(UINT64)) != sizeof(UINT64)) {
+        report("  候选 %u（0x%llX）：读不到", static_cast<unsigned>(slot),
+               static_cast<unsigned long long>(cand[slot]));
+        continue;
+      }
+      PIN_SafeCopy(&at16, reinterpret_cast<VOID*>(static_cast<ADDRINT>(cand[slot]) + 16),
+                   sizeof(UINT64));
+      report("  候选 %u（0x%llX）：+0=0x%llX +16=0x%llX", static_cast<unsigned>(slot),
+             static_cast<unsigned long long>(cand[slot]),
+             static_cast<unsigned long long>(head),
+             static_cast<unsigned long long>(at16));
+    }
+  }
+
+  // 认记录 + 发射走**公共实现**（两个挂点共用）：栈上哪个指针是记录有歧义，
+  // 所以两个都当候选交进去，由它按"像不像记录"挑。
+  record_exception_from(tid, pointers, 2, 2 /* KiUserExceptionDispatcher */);
+}
+
+/// 异常回调（Pin 的上下文变化通知）。
+///
+/// 1. **真实单步异常**（TF 虚拟化漏网时）——TF 那套逻辑（见下）；
+/// 2. **目标自己抛出的异常**（`RaiseException` / 访问违例）——当目标用异常做
+///    控制流时（混淆与保护壳的常见手法），事件流必须**连续**，也就是说我们
+///    只观察、不参与决策。
+///
+/// **不依赖调试框架**是刻意的：这个回调由 Pin 在**异常发生的那一刻**通知工具，
+/// 不需要设置调试端口、不需要 AttachDebugger、也不挂钩内核调试对象。
+/// 因此它不会与其他调试器冲突，也不会在"目标正在被调试"时失效。
+///
+/// **注意（实测）**：应用自己 `RaiseException` 的软件异常**不会**走到这里
+/// （诊断打印每一次回调，跑了 32 轮异常控制流，回调一次都没进）。应用异常的
+/// 观察改挂在 `KiUserExceptionDispatcher` 上（见 `OnUserExceptionDispatcher`），
+/// 那个挂点任何异常都会经过。别把"这个回调没报"当成"目标没抛异常"。
 VOID OnContextChange(THREADID tid, CONTEXT_CHANGE_REASON reason, const CONTEXT* from,
                      CONTEXT* to, INT32 info, VOID* v) {
   (void)from;
@@ -2306,6 +2552,20 @@ void OnFini(INT32 code, VOID* v) {
         report("✓ 异常观察数满足要求（%llu >= %llu）",
                static_cast<unsigned long long>(g_exceptions_observed),
                static_cast<unsigned long long>(g_required_exceptions));
+      }
+    }
+    // 应用异常的账：条数 + 首个异常的码/地址 + **命中的栈布局**。
+    // 布局这一项是给"我判断错了"留的出口：文档对它的说法不一致，
+    // 所以读出来的东西必须能被数据检验（判据在测试里：靶子抛 0xE0000001）。
+    if (g_exceptions_enabled) {
+      if (g_exceptions_observed == 0) {
+        report("异常事件：一次都没观察到（探针已挂上时这应当被当成失败看）");
+      } else {
+        report("异常事件：观察到 %llu 次，首个 code=0x%llX 地址=0x%llX（栈上第 %u 个指针是记录）",
+               static_cast<unsigned long long>(g_exceptions_observed),
+               static_cast<unsigned long long>(g_first_exception_code),
+               static_cast<unsigned long long>(g_first_exception_address),
+               static_cast<unsigned>(g_exception_layout));
       }
     }
   }
