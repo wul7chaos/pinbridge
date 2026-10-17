@@ -1085,16 +1085,31 @@ mod tests {
         let text = response["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_default();
-        assert_ne!(
-            response["result"]["isError"],
-            json!(true),
-            "pb_modules 应当成功：{response}"
-        );
-        println!("✓ ④ pb_modules：{text}");
-        assert!(
-            text.to_lowercase().contains("ntdll") || text.contains(".exe"),
-            "模块列表看着不像真实数据（既没有 ntdll 也没有 .exe）：{text}"
-        );
+        // 模块枚举读的是目标自己的 PEB —— **只在 Windows 上实现**（agent 侧 `modules::supported()`）。
+        // 所以非 Windows 上正确的期望不是"成功"，而是**如实报不支持**（不是假装返回空列表）。
+        if cfg!(windows) {
+            assert_ne!(
+                response["result"]["isError"],
+                json!(true),
+                "pb_modules 应当成功：{response}"
+            );
+            println!("✓ ④ pb_modules：{text}");
+            assert!(
+                text.to_lowercase().contains("ntdll") || text.contains(".exe"),
+                "模块列表看着不像真实数据（既没有 ntdll 也没有 .exe）：{text}"
+            );
+        } else {
+            assert_eq!(
+                response["result"]["isError"],
+                json!(true),
+                "非 Windows 上 pb_modules 必须报不支持，而不是假装成功：{response}"
+            );
+            assert!(
+                text.contains("PEB") || text.contains("Windows"),
+                "非 Windows 的拒绝理由应当说清是平台原因：{text}"
+            );
+            println!("✓ ④ 非 Windows：如实报不支持：{text}");
+        }
     }
 
     #[test]
