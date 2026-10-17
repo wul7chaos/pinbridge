@@ -157,6 +157,7 @@
 | ~~调用图重建~~ | ✅ 已完成（ADR 0012）：工具侧**转移探针**（`INS_IsCall`/`INS_IsRet` → `reg_write` 形状，`args[2]` 为转移码）产出数据，`pinbridge calls` 建图。实测 `call_edges=1192 paired=1177`（98.7% 的调用边有配对返回：返回地址 = 调用指令 + 指令长度）。未在本轨迹出现的**目标保留但标注未验证**（`--strict-code-targets` 才丢） |
 | ~~多轨迹差分~~ | ✅ 已完成：`pinbridge diff A.pbt B.pbt` —— 给出**分类**结论（类型不同／控制流分岔／数据分岔／前缀／一致）+「第几条之后开始分岔」+ `PB_DIFF` 机器行；残缺数据（丢事件、截断、缺汇总、有折叠）**必须先告警**；`--ignore-address` 应付 ASLR 噪声。用例：库侧 8 条 + CLI 二进制层 4 条 |
 | Tauri 工作台接真实数据 | 事件流、溯源、脚本版本、接管按钮全部可用 |
+| Tauri 工作台：验证状态 | ✅ 数据层（`pinbridge-workbench`，5 条用例）+ 客户端（7 条）+ 视图模型（7 条）+ Tauri 壳（4 条）全部有用例；前端 **`tsc --noEmit` 与 `vite build` 通过**（门禁第 11/12 步；CI 另有 `desktop-frontend` job）。<br>⏳ 只剩**肉眼联调**（`pnpm tauri dev`，需要显示器）；`tauri build` 的完整打包不进 CI（需要系统 WebView） |
 | 轨迹可视化（时间线 + 地址热力） | 5 分钟量级轨迹能在 < 2s 内渲染出概览 |
 
 ## 不做的事（长期）

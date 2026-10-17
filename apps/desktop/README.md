@@ -21,15 +21,29 @@
 >   真实轨迹 → 界面可用 JSON（含告警与折叠）、读不到文件时报错而不是返回空载荷、
 >   能力矩阵来自单一真相、覆盖缺口单独可查。
 >
-> **怎么验证**（本仓库的 registry 只通 crates.io，npm 不通）：
+> **怎么验证**（npm registry 恢复可达后，这一步已经补上）：
 >
 > ```powershell
-> pwsh scripts/build-desktop.ps1     # 构建壳 + 跑壳里的用例（不进 verify.ps1）
-> node --test                        # 前端侧纯逻辑（无需依赖），在 apps/desktop 下
-> pnpm install && pnpm tauri dev      # 需要 npm registry，装不了就跳过
+> pwsh scripts/build-desktop.ps1        # 构建壳 + 跑壳里的 4 条用例
+> node --test                           # 前端侧纯逻辑（无需依赖），在 apps/desktop 下
+> .\node_modules\.bin\tsc.cmd --noEmit  # 类型检查（第一次真实验证：通过）
+> .\node_modules\.bin\vite.cmd build    # 前端真构建一次：41 模块 → dist/
+> pnpm install && pnpm tauri dev         # 肉眼联调：需要显示器，得你自己看一眼
 > ```
->   Tauri/React 的**构建**刻意不进 CI（需要 Node 依赖 + 系统 WebView，
->   会让门禁从几十秒变成十分钟）；只验证不依赖 registry 的那部分逻辑。
+>
+> 前四条现在都在门禁里（`tsc` 与 `vite build` 是门禁的第 11/12 步，没有
+> `node_modules` 时会明确说明跳过），CI 另有独立的 `desktop-frontend` job。
+>
+> ⚠ **pnpm 11 会挡住 `pnpm lint`**：它先跑一次依赖检查，而那次检查因为
+> `ERR_PNPM_IGNORED_BUILDS`（`esbuild` 的 postinstall 被默认拦下）以 `exit=1` 结束，
+> **tsc 根本没机会跑**。把 `onlyBuiltDependencies` 放进 `pnpm-workspace.yaml`
+> （pnpm 11 的新位置）实测**仍报同一错误**；交互式 `pnpm approve-builds` 只解决本机。
+> 所以：本机直接调 `node_modules/.bin/*.cmd`，CI 用 `npm install` ——
+> 验证的是同一件事（tsc/vite 的真实行为），只是不绕 pnpm 的包装。
+>
+> Tauri/React 的**完整打包**（`tauri build`）仍不进 CI：需要系统 WebView，
+> 会让门禁从几十秒变成十分钟。**类型检查 + 前端构建 + 壳的用例**已经把
+> "能不能跑"验掉了，剩下的只有肉眼那一关。
 
 ## 这里是谁用的
 
