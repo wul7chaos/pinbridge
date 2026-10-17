@@ -185,15 +185,26 @@ if(PINBRIDGE_WITH_PIN)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dist"
   )
 
-  # 把 agent DLL 一并放到 dist/：这样 `dist/` 是一个**自包含**的可运行目录，
-  # `cd dist && pin.exe -t pinbridge.dll -- TARGET.exe` 直接就能跑通，
-  # 不需要任何环境变量。少一个环境变量 = 少一类"在我机器上能跑"。
+  # 把 agent DLL **与桥接层**一并放到 dist/：这样 `dist/` 才真的是自包含的可运行目录。
+  #
+  # 这里曾经只拷 agent —— 注释写着"`cd dist && pin.exe …` 直接就能跑通"，
+  # 而只要目标不在构建目录里（CWD 是 dist 时工具按名去找 `pinbridge_bridge.dll`），
+  # 就必然报"无法加载转发层"。`ctest` 之所以一直绿，只因为靶子
+  # `pb_sample_target.exe` 正好就在 `native/build-pin/`，那儿恰好有桥接层 ——
+  # 也就是说：**用例一直在测一个用户不会遇到的位置**。
   if(WIN32 AND PINBRIDGE_AGENT_DLL AND EXISTS "${PINBRIDGE_AGENT_DLL}")
     add_custom_command(TARGET pinbridge POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               "${PINBRIDGE_AGENT_DLL}"
               "${CMAKE_BINARY_DIR}/dist/pinbridge_agent.dll"
       COMMENT "把 pinbridge_agent.dll 复制到 dist/（让 dist 自包含）")
+  endif()
+  if(WIN32 AND TARGET pinbridge_bridge)
+    add_custom_command(TARGET pinbridge POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE:pinbridge_bridge>"
+              "${CMAKE_BINARY_DIR}/dist/pinbridge_bridge.dll"
+      COMMENT "把 pinbridge_bridge.dll 复制到 dist/（让 dist 自包含）")
   endif()
 
   message(STATUS "Pin tool 目标已启用：PIN_ROOT=${PIN_ROOT}")

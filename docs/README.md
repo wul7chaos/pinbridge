@@ -55,6 +55,7 @@
 | 问题 | 读 |
 |------|-----|
 | 目标检测到我了，可能在哪一层 | [architecture/security-model.md](architecture/security-model.md) |
+| **目标已经在跑，能不能附加进去** | [dev/attach-capability-gaps.md](dev/attach-capability-gaps.md) |
 | 轨迹怎么压缩 | [design/trace-compression.md](design/trace-compression.md) |
 | 怎么找 OEP / Dump 时机 | [design/offline-replay.md](design/offline-replay.md) |
 | 目标用 TF 陷阱恶心我 | [design/flags-virtualization.md](design/flags-virtualization.md) |
