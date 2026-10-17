@@ -15,7 +15,10 @@ export interface SessionBarProps {
 
 export function SessionBar({ session, summary, onTakeover }: SessionBarProps) {
   const lossy = summary.dropped > 0 || summary.truncated;
-  // 驾驶者用 ai:/human: 前缀区分；这里直接展示审计名，避免出现两套叫法
+  // 驾驶者用 ai:/human: 前缀区分；这里直接展示审计名，避免出现两套叫法。
+  // **没有租约时不要瞎猜驾驶者** —— 以前这里会因为空字符串而显示"人类 驾驶"，
+  // 那会让人以为"现在是人握着控制权"，而事实是没人持有。
+  const hasLease = session.lease_holder !== "";
   const pilot = session.lease_holder.startsWith("ai:") ? "AI" : "人类";
 
   return (
@@ -27,13 +30,19 @@ export function SessionBar({ session, summary, onTakeover }: SessionBarProps) {
         <span className="tag">pid {session.pid}</span>
         <span className="tag">{session.state}</span>
         <span className="tag">{session.scripts} 个脚本</span>
-        <span className={`tag ${pilot === "AI" ? "tag--ai" : "tag--human"}`}>
-          {pilot} 驾驶（{session.lease_holder}）
-        </span>
+        {hasLease ? (
+          <span className={`tag ${pilot === "AI" ? "tag--ai" : "tag--human"}`}>
+            {pilot} 驾驶（{session.lease_holder}）
+          </span>
+        ) : (
+          <span className="tag">无租约（没有人持有控制权）</span>
+        )}
         {/* epoch 与持有者**一起**常驻：只看持有者会显示一个已经过期的驾驶者。 */}
-        <span className="tag" title="租约代次：控制权换过一次就加一">
-          epoch {session.lease_epoch}
-        </span>
+        {hasLease && (
+          <span className="tag" title="租约代次：控制权换过一次就加一">
+            epoch {session.lease_epoch}
+          </span>
+        )}
         <button type="button" onClick={() => onTakeover(session.session)}>
           接管
         </button>

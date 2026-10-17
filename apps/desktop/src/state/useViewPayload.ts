@@ -1,26 +1,34 @@
 /**
- * 载荷的来源：**真实数据优先，演示数据必须自己说出来**。
+ * 载荷的来源：**真实优先，没有就空着，演示数据必须被显式要求**。
  *
- * 这一条是工作台里最容易被忽略、后果最严重的问题：**演示数据与真实数据长得一样**。
- * 一个人盯着屏幕做判断时，不会去确认"这行数字到底是不是真的"。所以：
+ * 这个文件的存在意义不是"取数据"，而是**不让界面伪造内容**。
+ * 以前的规则是"拿不到真实数据就退到演示数据"——那条规则错在：
+ * 演示数据与真实数据长得一模一样（假事件、假审计链、假 pid），
+ * 而人盯着屏幕做判断时不会去确认这行数字是不是真的。
  *
- *   * 能用 Tauri 命令拿到真实轨迹就用真实的 (`source: "tauri"`)；
- *   * 拿不到就退到演示数据，但**必须**带上 `source: "demo"`，
- *     界面会把这件事当成一条告警显示（与其他告警同一个位置：最上面）。
+ * 现在的规则写在 `payload-source.mjs`（纯函数，带用例）里：
  *
- * 换句话说：这个文件存在的意义不是"取数据"，而是**不让演示数据冒充真实数据**。
+ *   * 没被要求 → **空状态**，并说清"为什么没有"（没有桌面壳 / 还没选轨迹 / 读取失败）；
+ *   * 被显式要求（`?demo=1` 或界面上的按钮）→ 演示数据，且**照旧把自己写成告警**；
+ *   * 读取失败 → 空状态 + 失败原因，**绝不**退到演示数据。
  */
 import { useCallback, useEffect, useState } from "react";
 
 import { buildWorkbenchState, type WorkbenchState } from "./view-model";
+// 注意：这里**不带** `.mjs` 扩展名 —— 带扩展名时 TS 会去找 `payload-source.d.mts`，
+// 而不带时才认 `payload-source.d.ts`（与项目里 `./view-model` 的写法一致）。
+import { emptyPayload, resolvePayloadPlan } from "./payload-source";
 
-/** 载荷来源。 */
-export type PayloadSource = "tauri" | "demo" | "loading";
+/** 载荷来源。`empty` = 明确没有数据（不是"还在加载"）。 */
+export type PayloadSource = "tauri" | "demo" | "empty" | "loading";
 
 export interface ViewPayloadResult {
   state: WorkbenchState;
   source: PayloadSource;
+  /** 重新取（可指定轨迹路径）。 */
   reload: (path?: string) => void;
+  /** 显式切到演示数据 —— 只有这个入口会让人看到演示内容。 */
+  showDemo: () => void;
 }
 
 /**
@@ -50,63 +58,100 @@ export function demoPayload(): object {
   };
 }
 
-/** Tauri 是否在场（浏览器里跑 `npm run dev` 时不在）。 */
+/** 演示数据的会话信息（只在演示模式下使用，绝不冒充真实会话）。 */
+export const DEMO_LEASE = { holder: "ai:demo-agent", epoch: 1 };
+
+/** Tauri 是否在场（浏览器里跑 `pnpm dev` 时不在）。 */
 function tauriAvailable(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/** URL 上显式要求演示数据？(`?demo=1`) —— 这是"知情"的入口之一。 */
+function demoRequestedFromUrl(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return new URLSearchParams(window.location.search).get("demo") === "1";
+}
+
 /**
- * 取载荷。真实优先，演示必须自报家门。
+ * 取载荷。
  *
- * @param initialPath 启动时要打开的轨迹路径（为空则用演示数据）
+ * @param initialPath 启动时要打开的轨迹路径（为空则是空状态，不是演示数据）
  */
 export function useViewPayload(initialPath = ""): ViewPayloadResult {
+  const [demoRequested, setDemoRequested] = useState<boolean>(() => demoRequestedFromUrl());
   const [state, setState] = useState<WorkbenchState>(() =>
-    buildWorkbenchState(demoPayload(), { lease: { holder: "ai:demo-agent", epoch: 1 } }),
+    // 初值就是空状态：**不要**在还没判断之前先拿演示数据垫一下。
+    buildWorkbenchState(emptyPayload("还没有加载轨迹"), { lease: { holder: "", epoch: 0 } }),
   );
   const [source, setSource] = useState<PayloadSource>("loading");
 
-  const reload = useCallback((path?: string) => {
-    const target = path ?? initialPath;
-    if (!tauriAvailable() || target === "") {
-      // 演示数据：**在模型里留下一条告警**，界面会把它渲染在最上面。
-      const demo = buildWorkbenchState(
-        { ...demoPayload(), warnings: ["当前显示的是**演示数据**（没有连接真实轨迹）"] },
-        { lease: { holder: "ai:demo-agent", epoch: 1 } },
-      );
-      setState(demo);
-      setSource("demo");
-      return;
-    }
-    void (async () => {
-      try {
-        // 动态导入：不在 Tauri 里跑时不该因为缺少这个包而整个界面挂掉。
-        const { invoke } = await import("@tauri-apps/api/core");
-        const payload = (await invoke("view_trace", { path: target, head: 200 })) as
-          | object
-          | string;
-        const parsed = typeof payload === "string" ? JSON.parse(payload) : payload;
-        setState(buildWorkbenchState(parsed));
-        setSource("tauri");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        // 失败也要说清两件事：**为什么失败**，以及**现在看的是演示数据**。
+  const load = useCallback(
+    (path: string, demo: boolean) => {
+      const plan = resolvePayloadPlan({
+        tauriAvailable: tauriAvailable(),
+        path,
+        demoRequested: demo,
+      });
+
+      if (plan.kind === "demo") {
+        // 演示数据：**在模型里留下一条告警**，界面会把它渲染在最上面（与真实告警同位置）。
         setState(
           buildWorkbenchState(
-            { ...demoPayload(), warnings: [`读取真实轨迹失败：${message}`] },
-            { lease: { holder: "", epoch: 0 } },
+            {
+              ...demoPayload(),
+              warnings: [`当前显示的是**演示数据**（${plan.reason}）`],
+            },
+            { lease: DEMO_LEASE },
           ),
         );
-        setState((previous) => ({
-          ...previous,
-          warnings: [...previous.warnings, "当前显示的是**演示数据**"],
-        }));
         setSource("demo");
+        return;
       }
-    })();
-  }, [initialPath]);
 
-  useEffect(() => reload(), [reload]);
+      if (plan.kind === "empty") {
+        setState(
+          buildWorkbenchState(emptyPayload(plan.reason), { lease: { holder: "", epoch: 0 } }),
+        );
+        setSource("empty");
+        return;
+      }
 
-  return { state, source, reload };
+      void (async () => {
+        try {
+          // 动态导入：不在 Tauri 里跑时不该因为缺少这个包而整个界面挂掉。
+          const { invoke } = await import("@tauri-apps/api/core");
+          const payload = (await invoke("view_trace", { path: plan.path, head: 200 })) as
+            | object
+            | string;
+          const parsed = typeof payload === "string" ? JSON.parse(payload) : payload;
+          setState(buildWorkbenchState(parsed));
+          setSource("tauri");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          // 失败就说失败：**绝不**退回演示数据（那会让"读不到文件"看起来像"有数据"）。
+          setState(
+            buildWorkbenchState(emptyPayload(`读取轨迹失败：${message}`), {
+              lease: { holder: "", epoch: 0 },
+            }),
+          );
+          setSource("empty");
+        }
+      })();
+    },
+    [],
+  );
+
+  const reload = useCallback((path?: string) => load(path ?? initialPath, false), [load, initialPath]);
+  const showDemo = useCallback(() => {
+    setDemoRequested(true);
+    load("", true);
+  }, [load]);
+
+  useEffect(() => {
+    load(initialPath, demoRequested);
+  }, [load, initialPath, demoRequested]);
+
+  return { state, source, reload, showDemo };
 }

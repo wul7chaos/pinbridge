@@ -21,7 +21,7 @@ import { EventStream } from "./components/EventStream";
 import { SessionBar } from "./components/SessionBar";
 import { useViewPayload } from "./state/useViewPayload";
 
-/** 会话信息（将来由 Hub 提供；现在只有演示值）。 */
+/** 演示模式下的会话信息。**只在演示模式用** —— 绝不冒充真实会话（假的 pid 最容易被当真）。 */
 const DEMO_SESSION: SessionSummary = {
   session: 1,
   pid: 4242,
@@ -70,10 +70,27 @@ const DEMO_CAPABILITIES = [
   "trace_record",
 ];
 
+/**
+ * 没有会话信息时的会话栏取值。
+ *
+ * 以前这里是演示值（`TARGET.exe` / `pid 4242`）**无条件**顶上去的 —— 那正是
+ * "界面显示测试文本"的来源：一份看起来完全正常的假会话。现在没有就是没有。
+ */
+const NO_SESSION: SessionSummary = {
+  session: 0,
+  pid: 0,
+  state: "未连接",
+  image_path: "（没有加载轨迹）",
+  lease_holder: "",
+  lease_epoch: 0,
+  scripts: 0,
+};
+
 export default function App() {
   const [following, setFollowing] = useState(true);
   const [auditFilter, setAuditFilter] = useState<"all" | "ai" | "human">("all");
-  const { state, source } = useViewPayload("");
+  const { state, source, showDemo } = useViewPayload("");
+  const demo = source === "demo";
 
   // 事件流沿用组件既有的 `EventView` 形状：视图模型里的行已经做过格式化，
   // 这里只把地址/参数还原成组件要的数字（展示格式由组件自己决定）。
@@ -102,20 +119,29 @@ export default function App() {
     [state.status],
   );
 
-  const session: SessionSummary = {
-    ...DEMO_SESSION,
-    lease_holder: state.lease.holder || "（无租约）",
-    // 真实载荷时用视图模型算出的 epoch；**不能**沿用 DEMO_SESSION 里那个假值 ——
-    // 界面上看不出差别，但那正好是"看起来对、其实是死的"那一类错误。
-    lease_epoch: state.lease.epoch,
-  };
+  // 会话信息：**只有演示模式才用演示值**。其余情况按"没有会话"呈现 ——
+  // 宁可显示"未连接"，也不要显示一个看起来正常的假会话。
+  const session: SessionSummary = demo
+    ? {
+        ...DEMO_SESSION,
+        lease_holder: state.lease.holder || "ai:demo-agent",
+        lease_epoch: state.lease.epoch,
+      }
+    : {
+        ...NO_SESSION,
+        lease_holder: state.lease.holder,
+        lease_epoch: state.lease.epoch,
+      };
 
+  // 审计链是**信任面**：非演示模式下没有真实条目就是空列表，绝不拿演示条目顶上。
   const visibleAudit = useMemo(
     () =>
-      auditFilter === "all"
-        ? DEMO_AUDIT
-        : DEMO_AUDIT.filter((entry) => entry.actor.kind === auditFilter),
-    [auditFilter],
+      demo
+        ? auditFilter === "all"
+          ? DEMO_AUDIT
+          : DEMO_AUDIT.filter((entry) => entry.actor.kind === auditFilter)
+        : [],
+    [auditFilter, demo],
   );
 
   return (
@@ -129,7 +155,7 @@ export default function App() {
             <header className="panel__header">
               <h2>先读这些</h2>
               <span className="panel__source">
-                数据来源：{source === "tauri" ? "真实轨迹" : "演示数据"}
+                数据来源：{source === "tauri" ? "真实轨迹" : source === "demo" ? "演示数据" : "空"}
               </span>
             </header>
             <ul className="warnings">
@@ -137,6 +163,26 @@ export default function App() {
                 <li key={warning}>{warning}</li>
               ))}
             </ul>
+          </section>
+        )}
+
+        {/* 空状态：明说"没有数据"以及该做什么 —— 界面**不伪造**任何内容。
+            演示数据只能从这里那个按钮（或 `?demo=1`）进来看。 */}
+        {state.events.length === 0 && (
+          <section className="panel panel--empty">
+            <header className="panel__header">
+              <h2>没有可显示的数据</h2>
+            </header>
+            <p>
+              打开一条轨迹：<code>pinbridge view &lt;轨迹.pbt&gt;</code>，或在桌面壳里选择文件。
+            </p>
+            <p className="panel__hint">
+              想看界面长什么样，可以看演示数据 —— 它会把自己标成"演示数据"，
+              <strong>不会</strong>冒充实测结果。
+            </p>
+            <button type="button" onClick={showDemo}>
+              看演示数据
+            </button>
           </section>
         )}
 
@@ -174,7 +220,13 @@ export default function App() {
       </main>
 
       <footer className="app__footer">
-        <CapabilityPanel names={DEMO_CAPABILITIES} bits={0x0fff} />
+        {/* 能力位：只有演示模式才展示一份"已授予"的假象；其余情况**说清没有接上**，
+            而不是把演示值摆上去。授予状态的真来源是会话（`pb_capability_grant`）。 */}
+        {demo ? (
+          <CapabilityPanel names={DEMO_CAPABILITIES} bits={0x0fff} />
+        ) : (
+          <CapabilityPanel names={[]} bits={0} />
+        )}
       </footer>
     </div>
   );

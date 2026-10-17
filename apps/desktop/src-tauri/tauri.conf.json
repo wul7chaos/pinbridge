@@ -22,6 +22,17 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "shortDescription": "PinBridge 工作台 —— AI 与人类平等参与的动态分析",
+    "longDescription": "PinBridge 的桌面工作台：先看告警再看结论，控制权与 epoch 常驻可见。它读的是 pinbridge 产出的真实轨迹（.pbt），没有轨迹时显示空状态，不伪造内容。",
+    "publisher": "PinBridge",
+    "copyright": "PinBridge contributors",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

@@ -27,10 +27,33 @@ cargo gate    # fmt-check + lint + test + doc（本地门禁）
 | `pinbridge_agent.dll` | `crates/pinbridge-agent`（cdylib） | 注入目标进程的 agent |
 | `pinbridge.dll` | `native/`（`PINBRIDGE_WITH_PIN=ON`） | Pin tool（C++），**需要 Pin SDK** |
 | `pb`（Python 包） | `python/` | 离线分析 + `pb-replay` |
+| `PinBridge_0.1.0_x64-setup.exe` | `apps/desktop`（Tauri + NSIS） | **桌面工作台安装器**（给人装的那个） |
 
 **注意**：`pinbridge.dll` 与 `pinbridge_agent.dll` 的关系是
 "Pin tool 加载 agent"。两者的 ABI 由 [../specs/c-abi.md](../specs/c-abi.md) 约束，
 版本必须匹配（不匹配时加载器拒绝加载）。
+
+### 桌面安装器怎么打
+
+```powershell
+cd apps/desktop
+pnpm install --frozen-lockfile   # 需要 pnpm-workspace.yaml 里的 allowBuilds（见 apps/desktop/README.md）
+pnpm tauri build                 # 先跑 tsc + vite（beforeBuildCommand），再 release 编译壳并打 NSIS
+# 产物：<仓库根>/target/release/bundle/nsis/PinBridge_<版本>_x64-setup.exe
+```
+
+要点与坑：
+
+* **图标是脚本生成的**（`pwsh scripts/make-icon.ps1`）：多尺寸 `.ico`（256/64/48/32/16）。
+  仓库里不放来路不明的二进制 —— 图标只是"一个桥 + 缩写"，脚本重放一遍就能得到同样的东西。
+  只给 32×32 的占位图标时 `tauri dev` 能跑，但**打包会失败**（安装器要 256）。
+* **首次打包会联网**下载 NSIS 与 `nsis_tauri_utils`（Tauri 自带哈希校验，日志里会打印
+  `validating hash`）。离线机器打不了包。
+* 安装器**不进日常 CI**：它会 release 编译整个壳 + 下载 NSIS，把门禁从几十秒变成好几分钟。
+  它走 `release.yml` 的 `desktop-bundle` job（打 tag 或手动触发）。
+* **打包不替代验证**：`tsc` + `vite build` + 前端用例 + 壳的命令用例仍要在门禁里跑
+  （见 [testing.md](testing.md)）。"能打出安装器"与"界面是对的"是两件事。
+* 装出来的东西**不要**在开发机上顺手点着装 —— 装不装是使用者的决定。
 
 ## 发布流程
 

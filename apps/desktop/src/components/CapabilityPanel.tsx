@@ -16,6 +16,19 @@ export interface CapabilityPanelProps {
 }
 
 export function CapabilityPanel({ names, bits }: CapabilityPanelProps) {
+  // 没有名字就没有会话：**说清"没接上"**，不要显示一个"能力集 0x0000"让人以为
+  // "这个会话什么都没被授予" —— 那是另一回事（而且同样会误导）。
+  if (names.length === 0) {
+    return (
+      <div className="capabilities">
+        <span className="capabilities__title">能力集：尚未接上会话</span>
+        <span className="capabilities__hint">
+          这里展示"当前主体持有什么"，来源是会话的授权记录（`pb_capability_grant`）。
+          没有加载轨迹时它没有可显示的内容。
+        </span>
+      </div>
+    );
+  }
   return (
     <div className="capabilities">
       <span className="capabilities__title">能力集 {formatCapabilityBits(bits)}</span>
