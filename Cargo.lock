@@ -135,6 +135,7 @@ dependencies = [
 name = "pinbridge-mcp"
 version = "0.1.0"
 dependencies = [
+ "pinbridge-agent",
  "pinbridge-client",
  "pinbridge-core",
  "pinbridge-hub",

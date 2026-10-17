@@ -27,5 +27,10 @@ pinbridge-trace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# 只有测试需要 agent：端到端用例要在同一个进程里把"目标侧链路"真起起来
+# （`pb_link_start`），再把 MCP 侧连过去。生产路径不依赖 agent crate。
+[dev-dependencies]
+pinbridge-agent.workspace = true
+
 [lints]
 workspace = true

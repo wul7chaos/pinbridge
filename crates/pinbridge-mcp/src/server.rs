@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 /// `PINBRIDGE_AGENT_PORT_FILE` 指向 `pb_link_start`（agent 侧导出）写出来的端口文件。
 fn connect_agent_link(
     port_file: Option<&std::path::Path>,
+    capabilities: pinbridge_core::capability::CapabilitySet,
 ) -> std::result::Result<(Box<dyn pinbridge_hub::TargetLink>, String), String> {
     let Some(path) = port_file else {
         return Err(
@@ -39,7 +40,12 @@ fn connect_agent_link(
         .map_err(|_| format!("端口文件内容不是 127.0.0.1:PORT（{:?}）", text.trim()))?;
     let transport = pinbridge_client::transport::TcpTransport::connect(addr)
         .map_err(|error| format!("连不上 {addr}（{error}）"))?;
-    let link = crate::link::ClientLink::new(pinbridge_client::client::AgentClient::new(transport));
+    // **必须声明能力集**：agent 按客户端声明的这一份来拦截（不声明 = 0 = 什么都做不了，
+    // 实测会得到「能力不足: 需要 MemRead，当前持有 CapabilitySet(0)」）。
+    // 声明的是**这个 actor 在 Hub 侧的真实能力**，不是"给什么都不吃亏"的 ALL。
+    let link = crate::link::ClientLink::new(
+        pinbridge_client::client::AgentClient::new(transport).with_capabilities(capabilities),
+    );
     Ok((
         Box::new(link),
         format!("链路已连上 {addr}（agent 在自己进程里应答）"),
@@ -287,7 +293,7 @@ impl McpServer {
                 // 但回话里必须写清"仅登记"，否则"已附加"就是谎话（G2）。
                 let port_file =
                     std::env::var_os("PINBRIDGE_AGENT_PORT_FILE").map(std::path::PathBuf::from);
-                let link_note = match connect_agent_link(port_file.as_deref()) {
+                let link_note = match connect_agent_link(port_file.as_deref(), self.capabilities) {
                     Ok((link, note)) => {
                         match self.hub.attach_link(&self.actor.clone(), session, link) {
                             Ok(described) => format!("；{note}（{described}）"),
@@ -996,6 +1002,99 @@ mod tests {
             "连不上时也必须说清「仅登记」：{text}"
         );
         println!("✓ ③ 连不上：{text}");
+    }
+
+    /// **一次性端到端**：人建会话并授权 → AI 走 MCP `pb_session_attach` → 真的连上目标里的
+    /// agent → `pb_modules` 的模块来自目标自己的加载器链。
+    ///
+    /// # 为什么必须在进程内做
+    ///
+    /// MCP 的 actor 是 **AI**（只读基线），而 `session_create` / `attach` 都要
+    /// `process_control` —— **AI 不能给自己扩权**（Hub 直接拒绝，这正是设计）。
+    /// 所以"人"和"AI"必须共用一个 Hub 实例：这也正是工作台的真实形态
+    /// （人在这头点授权，AI 在那头调工具）。
+    ///
+    /// # 为什么"目标侧"能在一个测试进程里成立
+    ///
+    /// `pb_link_start` 起的是**进程内回环服务**，测试进程就扮演目标进程 —— 同一个导出、
+    /// 同一条服务线程、同一套帧协议，不是另写一套假实现。
+    #[test]
+    fn end_to_end_human_grants_then_ai_attaches_and_reads_modules_over_the_real_link() {
+        // ① 目标侧：起真链路
+        let dir = std::env::temp_dir().join(format!("pb-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let port_file = dir.join("agent-port.txt");
+        // 用安全入口（`start_link_server`）而不是 C 导出：本 crate 是 `forbid(unsafe_code)`，
+        // 而这条路径与 C 导出走的是**同一个**静态服务与线程，只是少了解 C 指针那一步。
+        let addr = pinbridge_agent::exports::start_link_server(&port_file.to_string_lossy())
+            .expect("agent 侧链路应当启动成功");
+        println!("✓ ① agent 链路：{addr}");
+        // agent **自己**也有一份能力集（Hub 的能力集是另一份，两边都要有）：
+        // 不下发的话链路工具会以「能力不足: 需要 MemRead，当前持有 CapabilitySet(0)」被拒。
+        let bits = Capability::read_only_baseline().bits();
+        let set_code = pinbridge_agent::exports::pb_set_capabilities(bits);
+        let readback = pinbridge_agent::exports::pb_get_capabilities();
+        println!("✓ ① agent 能力：下发 {bits:#x} 返回 {set_code}，读回 {readback:#x}");
+        assert_eq!(set_code, 0, "下发 agent 能力应当成功");
+        std::env::set_var("PINBRIDGE_AGENT_PORT_FILE", &port_file);
+
+        // ② 人建会话 + 授权（同一个 Hub）
+        let mut server = server();
+        call(
+            &mut server,
+            "initialize",
+            json!({"clientInfo": {"name": "e2e"}}),
+        );
+        let human = Principal::human("operator");
+        let id = server
+            .hub
+            .create_session(&human, TargetSpec::launch("TARGET.exe", "x86_64"))
+            .expect("人类建会话");
+        server
+            .hub
+            .attach(&human, id, 4242, "TARGET.exe")
+            .expect("人类附加");
+        let epoch = server.hub.epoch_of(id).expect("epoch");
+        server
+            .hub
+            .grant_capabilities(&human, id, epoch, &server.actor.clone(), &Capability::ALL)
+            .expect("人类授权");
+        server.capabilities = server.hub.capabilities_of(&server.actor.clone());
+        server.epochs.insert(id.get(), epoch);
+
+        // ③ AI 走 MCP 工具 attach：回话必须说"链路已连上"
+        let (response, text) = attach_text(&mut server, id.get());
+        std::env::remove_var("PINBRIDGE_AGENT_PORT_FILE");
+        assert_ne!(
+            response["result"]["isError"],
+            json!(true),
+            "attach 不该失败：{response}"
+        );
+        assert!(
+            text.contains("链路已连上"),
+            "应当真的连上 agent 链路（而不是仅登记）：{text}"
+        );
+        println!("✓ ③ attach：{text}");
+
+        // ④ 链路工具：模块列表必须来自目标侧（本进程 = 目标进程），不是假数据
+        let response = call(
+            &mut server,
+            "tools/call",
+            json!({"name": "pb_modules", "arguments": {"session": id.get()}}),
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert_ne!(
+            response["result"]["isError"],
+            json!(true),
+            "pb_modules 应当成功：{response}"
+        );
+        println!("✓ ④ pb_modules：{text}");
+        assert!(
+            text.to_lowercase().contains("ntdll") || text.contains(".exe"),
+            "模块列表看着不像真实数据（既没有 ntdll 也没有 .exe）：{text}"
+        );
     }
 
     #[test]

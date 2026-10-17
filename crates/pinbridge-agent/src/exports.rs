@@ -126,9 +126,11 @@ pub unsafe extern "C" fn pb_link_start(port_file: *const c_char) -> c_int {
 
 /// 绑定并启动服务线程（幂等），再把地址写进文件。
 ///
-/// 单独抽出来是为了**能被测试直接调用**：导出的签名是 C ABI，测试里调它要造 C 字符串；
-/// 而这条路径真正要验的是"文件里出现了可连的端口、连接能通"。
-fn start_link_server(path: &str) -> Result<std::net::SocketAddr, String> {
+/// **给 Rust 调用方的安全入口**：上面的 C ABI 导出（`pb_link_start`）只是它的薄包装
+/// （把 `*const c_char` 解成 `&str`）。之所以要暴露这一层：`pinbridge-mcp` 这类 crate
+/// 里是 `#![forbid(unsafe_code)]`，测试没法自己解 C 指针 —— 但它们**可以**调这个函数，
+/// 于是"端到端用例"依然验的是同一条路径（同一个静态服务、同一条线程、同一套帧）。
+pub fn start_link_server(path: &str) -> Result<std::net::SocketAddr, String> {
     let addr = match LINK_SERVER.get_or_init(|| {
         // 记住"起不来"：第二次调用会拿到同一个 None，而不是重新 bind 一次
         // （那样会让"偶尔成功"看起来像 bug 修好了）。

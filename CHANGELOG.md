@@ -41,6 +41,25 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（一次性端到端跑通）+ 修复（链路客户端从不声明能力 —— 安全相关）
+- **一次性端到端**（`crates/pinbridge-mcp/src/server.rs` 的
+  `end_to_end_human_grants_then_ai_attaches_and_reads_modules_over_the_real_link`）：
+  **人**建会话并授权 → **AI** 走 MCP `pb_session_attach` → **真的**连上目标里的 agent →
+  `pb_modules` 的模块来自目标自己的加载器链。实测输出：
+  ```
+  ✓ ① agent 链路：127.0.0.1:55954 （agent 能力下发 0x101 返回 0，读回 0x101）
+  ✓ ③ attach：…；链路已连上 127.0.0.1:55954（agent 在自己进程里应答）（agent 链路（tcp://…））
+  ✓ ④ pb_modules：模块（加载顺序，基址 + 大小）：…
+  ```
+  为什么必须在进程内做：MCP 的 actor 是 AI（只读基线），`session_create`/`attach` 都要
+  `process_control` —— **AI 不能给自己扩权**；所以"人"与"AI"必须共用一个 Hub（这正是工作台形态）。
+- **修复（安全相关，端到端用例抓到的）**：链路客户端 `AgentClient::new(transport)` **从不声明
+  能力集** ⇒ agent 侧看到的是 `CapabilitySet(0)` ⇒ 所有链路工具以「能力不足: 需要 MemRead，
+  当前持有 CapabilitySet(0)」被拒。现在 MCP 在建链路时**声明该 actor 在 Hub 侧的真实能力集**
+  （不是"给什么都不吃亏"的 ALL）—— 声明谁的能力，agent 就按谁的拦。
+- **新增安全入口** `pinbridge-agent::exports::start_link_server(&str)`：C 导出 `pb_link_start`
+  只是它的薄包装。原因是 `pinbridge-mcp` 是 `#![forbid(unsafe_code)]`，测试没法自己解 C 指针；
+  而这条安全入口走的是**同一个**静态服务、同一条线程、同一套帧，所以端到端验的仍是真实路径。
 ### 新增（附加之后**真的能分析**：agent 链路入口 + MCP 接线 + 诚实的回话）
 - **agent 新增导出 `pb_link_start(port_file)`**：绑定回环端口、起一个服务到进程退出的线程、
   把 `127.0.0.1:PORT` 写进文件。**幂等**（重复调用同一端口）。以前 `LinkServer` 只有测试在启动，
