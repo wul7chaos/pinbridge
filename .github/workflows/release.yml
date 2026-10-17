@@ -43,17 +43,21 @@ jobs:
           "$bin" version
           "$bin" tools | head -n 5
 
+      # 用 pwsh + Compress-Archive，而不是 `zip`：
+      # Windows runner 上没有 `zip`，之前这一步以 exit 127（命令不存在）失败 ——
+      # 而这条流程在第一次真跑之前没人发现（见 docs/dev/build-and-release.md 的说明）。
       - name: 打包
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          name="pinbridge-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp -f "target/${{ matrix.target }}/release/pinbridge${{ matrix.ext }}" "dist/$name/" 2>/dev/null || true
-          cp -f "target/${{ matrix.target }}/release/pinbridge-mcp${{ matrix.ext }}" "dist/$name/" 2>/dev/null || true
-          cp -f README.md LICENSE CHANGELOG.md "dist/$name/"
-          (cd dist && zip -qr "$name.zip" "$name")
-          echo "ARTIFACT=dist/$name.zip" >> "$GITHUB_ENV"
+          $name = "pinbridge-$($env:GITHUB_REF_NAME ?? 'dev')-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          foreach ($bin in @('pinbridge', 'pinbridge-mcp')) {
+            $src = "target/${{ matrix.target }}/release/$bin${{ matrix.ext }}"
+            if (Test-Path $src) { Copy-Item $src "dist/$name/" -Force }
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md "dist/$name/" -Force
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
+          "ARTIFACT=dist/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,11 +97,14 @@ jobs:
         working-directory: apps/desktop
         run: pnpm tauri build
 
+      # 注意：**不要**设 working-directory。产物从仓库根算起是
+      # target/release/bundle/nsis（第一次写成了 ../target，从 apps/desktop 出发
+      # 少了一层，于是这一步找不到文件而失败）。
       - name: 校验和
         shell: pwsh
-        working-directory: apps/desktop
         run: |
-          $dir = '../target/release/bundle/nsis'
+          $dir = 'target/release/bundle/nsis'
+          if (-not (Test-Path $dir)) { throw "没有找到安装器输出目录：$dir" }
           $files = Get-ChildItem $dir -Filter '*.exe'
           if ($files.Count -eq 0) { throw "$dir 里没有 .exe" }
           foreach ($f in $files) {
