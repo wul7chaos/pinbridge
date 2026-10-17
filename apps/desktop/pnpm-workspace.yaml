@@ -1,0 +1,8 @@
+# pnpm 11 起，这类设置读这里（package.json 的 "pnpm" 字段会被忽略并告警）。
+#
+# 为什么要显式放行 esbuild：pnpm 默认拦下依赖的构建脚本（**这是个好的默认** —— 供应链风险），
+# 但被拦下会让 `pnpm <任何脚本>` 前置的依赖检查以 exit=1 结束，于是
+# `pnpm tauri dev` / `pnpm lint` 全都跑不起来（报 ERR_PNPM_IGNORED_BUILDS）。
+# 设置名在 pnpm 11 是 allowBuilds（onlyBuiltDependencies 是旧名，会被"迁移"掉）。
+allowBuilds:
+  esbuild: true

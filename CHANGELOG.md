@@ -41,6 +41,29 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 修复（`pnpm tauri dev` 在这台机器上跑不起来 —— 根因是 pnpm 11 的构建设置名写错了）
+- **症状**（用户实测）：`cd apps/desktop && pnpm tauri dev` 直接失败，
+  `ERR_PNPM_IGNORED_BUILDS: Ignored build scripts: esbuild@0.21.3`；
+  `pnpm lint` / `pnpm run build` 同样起不来。
+- **根因**：pnpm 默认拦下依赖的构建脚本（**这是个好的默认** —— 供应链风险），
+  而一旦有包被拦下，`pnpm <任何脚本>` **之前**那次依赖检查就以 `exit=1` 结束 ——
+  于是脚本根本没机会跑。要放行就得写对设置名。
+- **我上一轮写错了** `onlyBuiltDependencies`（那是**旧名**，pnpm 11 会把它"迁移"掉并告警 ⇒
+  等于没写），于是当时得出的结论是"只能绕开 pnpm"（本机直接调 `node_modules/.bin/*.cmd`、
+  CI 改用 npm）。**正确的名字是 `allowBuilds`**，而且它不是我猜出来的：**pnpm 自己的报错
+  提示里就写着** `Add the package to "allowBuilds" in your project's pnpm-workspace.yaml`。
+  ⇒ 教训：**不要靠回忆配置项的名字，去读工具的报错原文**。
+- **修法**：新增 `apps/desktop/pnpm-workspace.yaml`：
+  `allowBuilds:\n  esbuild: true`。
+- **验证**（本地实测，逐条）：`pnpm install --frozen-lockfile` → `exit=0`、
+  `pnpm exec tsc --noEmit` → `exit=0`、`pnpm run build` → `exit=0`（41 模块）、
+  **`pnpm tauri --version` → `exit=0`** —— 最后这条走的正是用户失败的那条路径
+  （`runDepsStatusCheck`）。
+- **CI 随之改回 pnpm**：`desktop-frontend` job 用 `pnpm/action-setup@v4` +
+  `pnpm install --frozen-lockfile`（此前为绕开该问题临时用 `npm install`）——
+  冻结锁文件比 npm 那版更能锁死版本。
+- 门禁里仍直接调 `node_modules/.bin/*.cmd`：**刻意如此** —— 门禁不该因为 pnpm 的版本
+  或它的策略变化而失败，验证的是 tsc/vite 的真实行为。
 ### 修复（会话栏补上 epoch：只看持有者会显示一个已经过期的驾驶者）
 - **肉眼联调完成**：界面在真实浏览器里渲出来了，设计里的几条都成立 ——
   告警永远第一块（`先读这些` 里就是"当前显示的是**演示数据**"）、数据来源徽标、
