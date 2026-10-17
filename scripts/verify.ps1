@@ -133,6 +133,32 @@ try {
     # 只跑**不需要依赖**的那部分：NDJSON 客户端的逻辑是纯 ESM，用 Node 自带的
     # 测试运行器即可验证（`node --test`）。装配依赖（React/Tauri）需要 registry，
     # 那个由 CI 装 —— 这里跑不了的就不假装跑过。
+    # 前端：装过依赖才跑（类型检查与打包都需要 node_modules）。
+    # 注意：这里**不**跑 `pnpm lint` —— pnpm 11 会先跑一次依赖检查，而它因为
+    # "ignored build scripts"（esbuild 的 postinstall 被默认拦下）以 exit=1 结束，
+    # 于是 type check 根本没机会跑。直接调 node_modules 里的二进制绕开这层，
+    # 验证的是同一件事（tsc/vite 的真实行为），只是不绕 pnpm 的包装。
+    $desktop = Join-Path $root 'apps/desktop'
+    if (Test-Path (Join-Path $desktop 'node_modules')) {
+        Step '桌面端: tsc --noEmit（类型检查）' {
+            Push-Location $desktop
+            try {
+                & (Join-Path $desktop 'node_modules/.bin/tsc.cmd') --noEmit
+                if ($LASTEXITCODE -ne 0) { throw "tsc 失败（退出码 $LASTEXITCODE）" }
+            } finally { Pop-Location }
+        } '类型错误按提示补；不要用 `// @ts-ignore` 关掉了事'
+
+        Step '桌面端: vite build（前端真构建一次）' {
+            Push-Location $desktop
+            try {
+                & (Join-Path $desktop 'node_modules/.bin/vite.cmd') build
+                if ($LASTEXITCODE -ne 0) { throw "vite build 失败（退出码 $LASTEXITCODE）" }
+            } finally { Pop-Location }
+        } '看报错的第一行（模块解析/语法），不要先怀疑 vite 配置'
+    } else {
+        Write-Host "· apps/desktop 没有 node_modules，跳过前端类型检查与构建（CI 会跑）" -ForegroundColor Yellow
+    }
+
     if (Get-Command node -ErrorAction SilentlyContinue) {
         Step '桌面端: node --test（NDJSON 客户端）' {
             Push-Location (Join-Path $root 'apps/desktop')

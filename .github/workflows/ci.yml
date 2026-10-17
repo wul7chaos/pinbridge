@@ -123,6 +123,27 @@ jobs:
         # 传目录在旧版本上会被当成模块名 ⇒ "在我机器上是好的"）。
         run: node --test
 
+  desktop-frontend:
+    name: 桌面端（类型检查 + 前端构建）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # 用 npm 而不是 pnpm：pnpm 11 会在 `install`/`lint` 前先跑依赖检查，而它因为
+      # "ignored build scripts"（esbuild 的 postinstall 被默认拦下）以 exit=1 结束，
+      # type check 根本没机会跑。npm 不做这层拦阻，验证的是同一件事。
+      - name: 安装前端依赖
+        working-directory: apps/desktop
+        run: npm install --no-audit --no-fund
+      - name: tsc --noEmit（类型检查）
+        working-directory: apps/desktop
+        run: npx tsc --noEmit
+      - name: vite build（前端真构建一次）
+        working-directory: apps/desktop
+        run: npx vite build
+
   native:
     name: native 层（C++ 桥接 + ABI 自检）
     runs-on: windows-latest

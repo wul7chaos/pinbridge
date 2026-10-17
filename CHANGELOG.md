@@ -41,6 +41,21 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（桌面端前端**第一次真实验证**：类型检查 + 构建进 CI）
+npm registry 恢复可达后，把一直缺的那一步补上了：
+- `apps/desktop` 装上依赖并跑通 **`tsc --noEmit`（exit 0）** —— 这是第 41/42 轮写的那些 TS
+  （NDJSON 客户端类型、视图模型声明、`useViewPayload.ts`、新的 `App.tsx`）的**第一次真实
+  类型检查**；
+- **`vite build` 通过**：41 个模块 → `dist/`（152 kB JS + 3.6 kB CSS，392 ms）；
+- **门禁从 11 步变 13 步**（新增前端类型检查与构建；没有 `node_modules` 时会明确说明跳过）；
+- **CI 新增 `desktop-frontend` job**：装依赖 + `tsc --noEmit` + `vite build`。
+  CI 里用 **npm** 而不是 pnpm —— pnpm 11 会在 `install`/`lint` 之前先跑一次依赖检查，
+  而它因为 `ERR_PNPM_IGNORED_BUILDS`（esbuild 的 postinstall 被默认拦下）以 `exit=1` 结束，
+  **type check 根本没机会跑**。试过把 `onlyBuiltDependencies` 放进
+  `pnpm-workspace.yaml`（pnpm 11 的新位置），仍报同一错误；交互式 `approve-builds` 只解决
+  本机。所以：CI 用 npm，本机验证时直接调 `node_modules/.bin/tsc.cmd` / `vite.cmd`
+  —— 验证的是同一件事（tsc/vite 的真实行为），只是不绕 pnpm 的包装。
+- 顺带确认 Tauri 壳仍可构建、4 条命令用例仍全绿（防回归）。
 ### 结论（TF 异常位置的等值判据：**在插桩下取不到数据**，已定论）
 - 上一条记录说"下一步用 VEH 让靶子活过真实单步"。**做了，没用**（实测）：
   靶子改用 `AddVectoredExceptionHandler` 之后，在 `-pb_tf watch` 下**仍然接不住**
