@@ -35,9 +35,19 @@
 .PARAMETER Unload
   调用完导出后 `FreeLibrary` 卸载注入的模块（"分离"）。默认不卸载。
 
+.PARAMETER LinkPortFile
+  启动 agent 的回环链路，并把端口写进这个文件（**绝对路径**）。
+  做法：把路径写进目标进程 → 调 `pb_link_start(远端路径地址)` → 目标自己写文件。
+  之后 MCP/Hub 侧设 `PINBRIDGE_AGENT_PORT_FILE` 指向同一文件，`pb_session_attach`
+  就能真的连上（否则它只会说"仅登记"，见 docs/dev/attach-capability-gaps.md 的 G2/G3）。
+
 .EXAMPLE
   # 对一次性靶子做附加自检（推荐先拿它验证环境）
   pwsh -NoProfile -File scripts/inject-agent.ps1 -TargetPid 1234
+
+.EXAMPLE
+  # 注入并把 agent 链路接起来（之后 MCP 就能连）
+  pwsh -NoProfile -File scripts/inject-agent.ps1 -TargetPid 1234 -LinkPortFile "$env:TEMP\pb-agent-port.txt"
 
 .EXAMPLE
   # 只验 ABI、不标记附加
@@ -50,6 +60,7 @@ param(
     [string[]]$Call = @('pb_abi_version', 'pb_attach'),
     [int]$CallArg = -1,
     [int]$TimeoutSec = 20,
+    [string]$LinkPortFile = '',
     [switch]$Unload
 )
 
@@ -195,6 +206,62 @@ try {
         # 约定：0 = PB_STATUS_OK（见 docs/specs/c-abi.md）
         Ok ("$name(0x{0:X}) → 0x{1:X}  [rva 0x{2:X}]" -f $param.ToInt64(), $c2.ToInt64(), $rva)
         if (-not (Alive $TargetPid)) { Bad "$name 调用后目标已死亡"; exit 1 }
+    }
+
+    # ── 3.5) 可选：让 agent 自己把链路服务起起来，并把端口写进文件（G3 的入口）
+    #
+    # 为什么要绕一圈"把路径写进目标再传地址"：`pb_link_start` 的入参是一个 C 字符串指针，
+    # 而 CreateRemoteThread 只能传一个**整数**。所以先在目标里分配一块内存放路径，
+    # 再把它的地址当参数传进去。
+    if ($LinkPortFile -ne '') {
+        $abs = [IO.Path]::GetFullPath($LinkPortFile)
+        $remotePathBytes = [Text.Encoding]::UTF8.GetBytes($abs + [char]0)
+        $remotePath = [PBN]::VirtualAllocEx($h, [IntPtr]::Zero, [IntPtr]$remotePathBytes.Length, 0x3000, 0x04)
+        if ($remotePath -eq [IntPtr]::Zero) { Bad 'VirtualAllocEx（端口文件路径）失败'; exit 1 }
+        $w = [IntPtr]::Zero
+        if (-not [PBN]::WriteProcessMemory($h, $remotePath, $remotePathBytes, [IntPtr]$remotePathBytes.Length, [ref]$w)) {
+            Bad ("写端口文件路径失败（Win32 " + [Runtime.InteropServices.Marshal]::GetLastWin32Error() + "）"); exit 1
+        }
+
+        $locLink = $null
+        # 注意：`pb_link_start` 是 **agent** 的导出，不是桥接层的 —— 桥接层只负责把 agent
+        # 带进目标进程。所以本地要 Load 一份 agent 算 RVA，远端要在目标里找 agent 的基址。
+        $agentLeaf = 'pinbridge_agent.dll'
+        $agentPath = Join-Path (Split-Path $Dll -Parent) $agentLeaf
+        if (-not (Test-Path $agentPath)) { Bad "找不到 $agentLeaf（应与桥接层同目录）：$agentPath"; exit 1 }
+        $agentLocal = [System.Runtime.InteropServices.NativeLibrary]::Load($agentPath)
+        $agentLocalBase = [PBN]::GetModuleHandleA($agentLeaf)
+        if ($agentLocalBase -eq [IntPtr]::Zero) { Bad "本地拿不到 $agentLeaf 的基址"; exit 1 }
+        $agentRemoteBase = [PBN]::FindModuleBase($TargetPid, $agentLeaf)
+        if ($agentRemoteBase -eq 0) {
+            Bad "$agentLeaf 不在目标进程里（桥接层没把它带进去？先确认 -Dll 与 agent 同目录）"
+            exit 1
+        }
+        Info ("远端 $agentLeaf 基址 = 0x{0:X}" -f $agentRemoteBase)
+        $locLink = [System.Runtime.InteropServices.NativeLibrary]::GetExport($agentLocal, 'pb_link_start')
+        if ($locLink -eq [IntPtr]::Zero) { Bad '本地 agent DLL 没有 pb_link_start（版本太旧？先重建）'; exit 1 }
+        $linkRva = $locLink.ToInt64() - $agentLocalBase.ToInt64()
+        $remLink = [IntPtr]($agentRemoteBase + $linkRva)
+        # 与上面同样的规矩：**先核对序言，再调用**。
+        $l8b = New-Object byte[] 8; [Runtime.InteropServices.Marshal]::Copy($locLink, $l8b, 0, 8)
+        $r8b = New-Object byte[] 8; $gotb = [IntPtr]::Zero
+        if (-not [PBN]::ReadProcessMemory($h, $remLink, $r8b, [IntPtr]8, [ref]$gotb)) { Bad 'pb_link_start: 远端读不到序言，不调用'; exit 1 }
+        for ($i = 0; $i -lt 8; $i++) { if ($l8b[$i] -ne $r8b[$i]) { Bad ("pb_link_start: 远端序言不一致（{0} vs {1}），不调用" -f (Hex8 $l8b), (Hex8 $r8b)); exit 1 } }
+
+        $t4 = [PBN]::CreateRemoteThread($h, [IntPtr]::Zero, [IntPtr]::Zero, $remLink, $remotePath, 0, [ref]$tid)
+        if ($t4 -eq [IntPtr]::Zero) { Bad ("pb_link_start: CreateRemoteThread 失败（Win32 " + [Runtime.InteropServices.Marshal]::GetLastWin32Error() + "）"); exit 1 }
+        $wait4 = [PBN]::WaitForSingleObject($t4, $TimeoutSec * 1000)
+        $c4 = [IntPtr]::Zero
+        [void][PBN]::GetExitCodeThread($t4, [ref]$c4)
+        [void][PBN]::CloseHandle($t4)
+        [void][PBN]::VirtualFreeEx($h, $remotePath, [IntPtr]::Zero, 0x8000)
+        if ($wait4 -ne 0) { Bad ("pb_link_start: 调用超时（等待 $wait4）"); exit 1 }
+        if ($c4.ToInt64() -ne 0) { Bad ("pb_link_start 返回 0x{0:X}（非 0 = 失败，错误文案在 pb_last_error）" -f $c4.ToInt64()); exit 1 }
+
+        if (-not (Test-Path $abs)) { Bad "pb_link_start 返回成功但端口文件没出现：$abs"; exit 1 }
+        $portLine = ((Get-Content $abs) -join '').Trim()
+        Ok "agent 链路已启动：$portLine（写入 $abs）"
+        Info "  下一步：把 PINBRIDGE_AGENT_PORT_FILE 设成这个文件，再 pb_session_attach 就会真的连上"
     }
 
     # ── 4) 可选：分离（FreeLibrary）。默认不做——卸载正在被别人用着的 DLL 本身就是风险

@@ -63,6 +63,106 @@ pub extern "C" fn pb_detach() -> c_int {
     })
 }
 
+/// 进程内已启动的链路服务地址（**进程内唯一**）。
+///
+/// 用 `OnceLock<Option<..>>` 而不是 `AtomicBool`：重复调用要把**同一个**端口再报一次，
+/// 而"启动失败"也要被记住 —— 否则第二次调用会重试 bind，把失败变成"偶发"。
+static LINK_SERVER: OnceLock<Option<std::net::SocketAddr>> = OnceLock::new();
+
+/// 启动 agent 的回环链路服务，并把 `127.0.0.1:PORT` 写进 `port_file`。
+///
+/// # 为什么需要它
+///
+/// `LinkServer` 与 `ClientLink` 早就写好了，但**没有任何生产入口启动它**：以前只有测试
+/// 在进程内 `LinkServer::bind()`。于是"附加"这条路走不通 —— agent 进了目标进程，Hub 却
+/// 够不到它（见 `docs/dev/attach-capability-gaps.md` 的 G3）。
+///
+/// 这个导出就是那个入口：注入器（`scripts/inject-agent.ps1`）调它之后，**端口会落到文件里**，
+/// Hub/MCP 侧读同一个文件就能 `TcpTransport::connect`。
+///
+/// # 语义
+///
+/// * 幂等：重复调用返回**同一个**端口，并把端口文件重写一遍；
+/// * 非阻塞：bind 与线程创建都在调用内完成，但服务在独立线程上跑；
+/// * 失败返回 `PB_STATUS_INTERNAL` 并写入错误文案（`pb_last_error` 可读）；
+/// * 只绑回环（`LinkServer::bind` 本身不接受地址参数，见 `link.rs` 的说明）。
+///
+/// # Safety
+///
+/// `port_file` 必须指向一个以 NUL 结尾的合法 C 字符串（调用期间有效）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pb_link_start(port_file: *const c_char) -> c_int {
+    if port_file.is_null() {
+        return AgentHost::with(|state| {
+            state.fail(Status::InvalidArgument, "pb_link_start: port_file 为空指针")
+        });
+    }
+    // SAFETY: 非空已检查；调用方按契约保证指针在本次调用期间有效、以 NUL 结尾。
+    // 注意：`cstr_to_string` 返回的是 `Option<String>`（不是 `Result`）。
+    let Some(path) = (unsafe { cstr_to_string(port_file) }) else {
+        return AgentHost::with(|state| {
+            state.fail(
+                Status::InvalidArgument,
+                "pb_link_start: 端口文件路径不是合法 UTF-8",
+            )
+        });
+    };
+    if path.trim().is_empty() {
+        return AgentHost::with(|state| {
+            state.fail(Status::InvalidArgument, "pb_link_start: 端口文件路径为空")
+        });
+    }
+
+    match start_link_server(&path) {
+        Ok(addr) => AgentHost::with(|state| {
+            state.note_audit(&format!(
+                "pb_link_start: 链路服务在 {addr} 监听，端口已写入 {path}"
+            ));
+            Status::Ok.code()
+        }),
+        Err(message) => AgentHost::with(|state| state.fail(Status::Internal, &message)),
+    }
+}
+
+/// 绑定并启动服务线程（幂等），再把地址写进文件。
+///
+/// 单独抽出来是为了**能被测试直接调用**：导出的签名是 C ABI，测试里调它要造 C 字符串；
+/// 而这条路径真正要验的是"文件里出现了可连的端口、连接能通"。
+fn start_link_server(path: &str) -> Result<std::net::SocketAddr, String> {
+    let addr = match LINK_SERVER.get_or_init(|| {
+        // 记住"起不来"：第二次调用会拿到同一个 None，而不是重新 bind 一次
+        // （那样会让"偶尔成功"看起来像 bug 修好了）。
+        let Ok(server) = crate::link::LinkServer::bind() else {
+            return None;
+        };
+        let addr = server.addr();
+        // 服务线程**一直跑到进程退出**：附加场景里没有"优雅停止"的时机，
+        // 而 agent 本身就是随目标进程一起结束的。
+        if std::thread::Builder::new()
+            .name("pinbridge-link".to_owned())
+            .spawn(move || loop {
+                // 单个连接出错（对端断开、半包）不该把服务带走。
+                if server.serve_once().is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+            .is_err()
+        {
+            return None;
+        }
+        Some(addr)
+    }) {
+        Some(addr) => *addr,
+        None => {
+            return Err("pb_link_start: 链路服务启动失败（绑定回环端口或创建线程失败）".to_owned())
+        }
+    };
+
+    std::fs::write(path, format!("{addr}\n"))
+        .map_err(|error| format!("pb_link_start: 写端口文件 {path} 失败（{error}）"))?;
+    Ok(addr)
+}
+
 /// 是否已附加（1 = 是，0 = 否）。
 #[unsafe(no_mangle)]
 pub extern "C" fn pb_is_attached() -> c_int {

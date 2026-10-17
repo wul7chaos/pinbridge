@@ -13,6 +13,39 @@ use pinbridge_proto::frames::ControlCommand;
 use pinbridge_proto::mcp::{find, schema_of, TOOLS};
 use serde_json::{json, Value};
 
+/// 从端口文件连上 agent，返回"链路 + 一句给人看的话"。
+///
+/// # 为什么返回值里带一句话，而不是干脆 `Result<()>`
+///
+/// `pb_session_attach` 以前一律回"已附加" —— 而 `HubService::attach` **只登记**
+/// （见 `docs/dev/attach-capability-gaps.md` 的 G2）。链路连不上时**不该**让 attach
+/// 整体失败（登记本身有用），但**必须**把"其实没连上"说出来，否则那句"已附加"就是谎话。
+///
+/// `PINBRIDGE_AGENT_PORT_FILE` 指向 `pb_link_start`（agent 侧导出）写出来的端口文件。
+fn connect_agent_link(
+    port_file: Option<&std::path::Path>,
+) -> std::result::Result<(Box<dyn pinbridge_hub::TargetLink>, String), String> {
+    let Some(path) = port_file else {
+        return Err(
+            "没有配置 agent 端口文件（设 PINBRIDGE_AGENT_PORT_FILE 指向 pb_link_start 写出的文件后才能真正连上）"
+                .to_owned(),
+        );
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("读不到端口文件 {}（{error}）", path.display()))?;
+    let addr: std::net::SocketAddr = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("端口文件内容不是 127.0.0.1:PORT（{:?}）", text.trim()))?;
+    let transport = pinbridge_client::transport::TcpTransport::connect(addr)
+        .map_err(|error| format!("连不上 {addr}（{error}）"))?;
+    let link = crate::link::ClientLink::new(pinbridge_client::client::AgentClient::new(transport));
+    Ok((
+        Box::new(link),
+        format!("链路已连上 {addr}（agent 在自己进程里应答）"),
+    ))
+}
+
 /// JSON-RPC / MCP 协议级错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolError {
@@ -249,8 +282,25 @@ impl McpServer {
                     .map_err(describe)?;
                 let epoch = self.hub.epoch_of(session).map_err(describe)?;
                 self.epochs.insert(session.get(), epoch);
+
+                // 登记之后再试一次"真的连上"（G3）。连不上不算失败 ——
+                // 但回话里必须写清"仅登记"，否则"已附加"就是谎话（G2）。
+                let port_file =
+                    std::env::var_os("PINBRIDGE_AGENT_PORT_FILE").map(std::path::PathBuf::from);
+                let link_note = match connect_agent_link(port_file.as_deref()) {
+                    Ok((link, note)) => {
+                        match self.hub.attach_link(&self.actor.clone(), session, link) {
+                            Ok(described) => format!("；{note}（{described}）"),
+                            Err(error) => format!(
+                                "；**仅登记**：链路连上了但挂到会话失败（{}）",
+                                describe(error)
+                            ),
+                        }
+                    }
+                    Err(reason) => format!("；**仅登记**：{reason}"),
+                };
                 Ok(format!(
-                    "已附加到 pid={pid}（会话 {session}，epoch={epoch}）"
+                    "已附加到 pid={pid}（会话 {session}，epoch={epoch}）{link_note}"
                 ))
             }
             "pb_control" => {
@@ -823,6 +873,131 @@ mod tests {
         assert!(text.contains("TARGET.exe"), "应当带出模块路径：{text}");
         println!("✓ 模块列表：{}", text.replace('\n', " | "));
     }
+    /// 建会话、附加、并把 `Capability::ALL` 授给 MCP 的 actor（AI）。
+    ///
+    /// 为什么要授权：`pb_session_attach` 需要 `process_control`，而 AI 默认只有只读基线
+    /// `[mem_read, trace_record]` —— 这是**设计**（人建会话、人授权、AI 才动手），
+    /// 所以用例必须自己把这一步演出来，否则测到的是闸门而不是接线。
+    fn attached_session(server: &mut McpServer) -> u64 {
+        call(
+            server,
+            "initialize",
+            json!({"clientInfo": {"name": "alice"}}),
+        );
+        let human = Principal::human("operator");
+        let id = server
+            .hub
+            .create_session(&human, TargetSpec::launch("TARGET.exe", "x86_64"))
+            .expect("人类建会话应当成功");
+        server
+            .hub
+            .attach(&human, id, 4242, "TARGET.exe")
+            .expect("人类附加应当成功");
+        let epoch = server.hub.epoch_of(id).expect("取 epoch");
+        server
+            .hub
+            .grant_capabilities(&human, id, epoch, &server.actor.clone(), &Capability::ALL)
+            .expect("人类授权应当成功");
+        server.capabilities = server.hub.capabilities_of(&server.actor.clone());
+        server.epochs.insert(id.get(), epoch);
+        id.get()
+    }
+
+    fn attach_text(server: &mut McpServer, session: u64) -> (Value, String) {
+        let response = call(
+            server,
+            "tools/call",
+            json!({"name": "pb_session_attach", "arguments": {"session": session, "pid": 4242}}),
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        (response, text)
+    }
+
+    /// G2 + G3：`pb_session_attach` 的回话必须**诚实**。
+    ///
+    /// 三种情况合并在一条用例里，因为端口文件是靠进程级环境变量传的 ——
+    /// 拆成三条并行跑会互相踩（本仓库的用例不保证串行）。
+    ///
+    /// * 没有端口文件 ⇒ "**仅登记**"（以前一律回"已附加"，而目标里什么都没有）；
+    /// * 端口文件指向活着的监听 ⇒ "链路已连上"（G3 的接线真的接上了）；
+    /// * 端口文件指向没人听的端口 ⇒ 仍说"**仅登记**"并带上原因（不假装成功）。
+    #[test]
+    fn attach_reports_honestly_whether_the_agent_link_is_live() {
+        const KEY: &str = "PINBRIDGE_AGENT_PORT_FILE";
+        let mut server = server();
+        let session = attached_session(&mut server);
+
+        // ① 没有端口文件
+        std::env::remove_var(KEY);
+        let (response, text) = attach_text(&mut server, session);
+        assert_ne!(
+            response["result"]["isError"],
+            json!(true),
+            "attach 本身应当成功（登记是有用的）：{response}"
+        );
+        assert!(
+            text.contains("已附加到 pid=4242"),
+            "回话里应有登记结果：{text}"
+        );
+        assert!(
+            text.contains("仅登记"),
+            "没有端口文件时必须写清「仅登记」，否则「已附加」就是谎话：{text}"
+        );
+        assert!(
+            text.contains(KEY),
+            "回话应当告诉使用者怎么才能真正连上：{text}"
+        );
+        println!("✓ ① 没有端口文件：{text}");
+
+        // ② 端口文件指向活着的监听（裸 TcpListener 冒充 agent 侧：握手由内核完成）
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("占一个回环端口");
+        let live = listener.local_addr().expect("取地址");
+        let dir = std::env::temp_dir().join(format!("pb-link-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let live_file = dir.join("agent-port.live.txt");
+        std::fs::write(&live_file, format!("{live}\n")).expect("写端口文件");
+        std::env::set_var(KEY, &live_file);
+        let (response, text) = attach_text(&mut server, session);
+        assert_ne!(
+            response["result"]["isError"],
+            json!(true),
+            "attach 应当成功：{response}"
+        );
+        assert!(
+            text.contains("链路已连上"),
+            "端口文件有效时必须报「链路已连上」：{text}"
+        );
+        assert!(
+            !text.contains("仅登记"),
+            "连上了就不该再说「仅登记」：{text}"
+        );
+        println!("✓ ② 端口文件有效：{text}");
+
+        // ③ 端口文件指向没人听的端口（占一个立刻关掉）
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("占端口");
+            listener.local_addr().expect("取地址")
+        };
+        let dead_file = dir.join("agent-port.dead.txt");
+        std::fs::write(&dead_file, format!("{dead}\n")).expect("写端口文件");
+        std::env::set_var(KEY, &dead_file);
+        let (response, text) = attach_text(&mut server, session);
+        std::env::remove_var(KEY);
+        assert_ne!(
+            response["result"]["isError"],
+            json!(true),
+            "attach 应当成功：{response}"
+        );
+        assert!(
+            text.contains("仅登记"),
+            "连不上时也必须说清「仅登记」：{text}"
+        );
+        println!("✓ ③ 连不上：{text}");
+    }
+
     #[test]
     fn memory_read_returns_hex_once_a_link_is_attached() {
         let mut server = server();

@@ -41,6 +41,22 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 新增（附加之后**真的能分析**：agent 链路入口 + MCP 接线 + 诚实的回话）
+- **agent 新增导出 `pb_link_start(port_file)`**：绑定回环端口、起一个服务到进程退出的线程、
+  把 `127.0.0.1:PORT` 写进文件。**幂等**（重复调用同一端口）。以前 `LinkServer` 只有测试在启动，
+  生产侧没有任何入口 —— 这就是"注入进去了但 Hub 够不到"的根因（G3）。
+- **MCP `pb_session_attach` 会说真话（G2）并真的连（G3）**：先登记，再按
+  `PINBRIDGE_AGENT_PORT_FILE` 去连 agent，连上就 `attach_link`。回话分三种且都被用例断言：
+  没有端口文件 ⇒「**仅登记**」；端口文件有效 ⇒「链路已连上 …」；连不上 ⇒「**仅登记**：连不上 …」。
+  以前**一律**回"已附加"，而目标里其实什么都没有。
+- **注入器新增 `-LinkPortFile`**：一条命令完成"注入 → 起链路 → 写端口文件"。
+- **用例**：`crates/pinbridge-client/tests/agent_link_start_export.rs`（真连上并握手，不是只断言
+  返回 0）+ MCP 侧 `attach_reports_honestly_whether_the_agent_link_is_live`（三种回话）。
+- **踩过的两个真坑**（写进脚本注释）：`pb_link_start` 是 **agent** 的导出、不是桥接层的；
+  `dist/pinbridge_agent.dll` 是 Rust cdylib，必须 `cargo build -p pinbridge-agent --release`
+  后替换，`build-native.ps1` 不会替你重编 Rust 侧。
+- **没验的一步（如实记）**：没有做"注入 → 设环境变量 → 起 MCP → attach → 调链路工具"的
+  一次性端到端；三段各自验过（见 docs/dev/attach-capability-gaps.md 第 8 节）。
 ### 新增（附加已运行目标：免 Pin 的注入通路 + 缺口清单）
 - **新增原型** `scripts/inject-agent.ps1`：把转发层注入**已在运行**的进程（`CreateRemoteThread(LoadLibraryW)`
   → 桥接层按同目录规则带起 agent → 再远程调 `int32_t` 导出，返回值即线程退出码）。全程不冻结、

@@ -237,3 +237,72 @@ pin.exe -t pinbridge.dll -pb_syscalls 0 -pb_tf off -- $env:TEMP\pbt_outside.exe 
 | G6 pin.exe 失败仍返回 0 | 未修（只能靠解析文本判成败，已在本文档记录） |
 | G7 全量 INS 插装代价 | 未测（长跑目标上的代价未知） |
 | G8 断点依赖停线程 | 维持"不做调试器语义"的定位 |
+
+## 8. G2 + G3 已修：附加之后**真的能分析**（2026-10-17）
+
+第 7 节的结论是"注入能通，但 Hub 够不到 agent"。这一节把它接上了。
+
+### 8.1 agent 侧新增导出 `pb_link_start(port_file)`
+
+以前 `LinkServer` **只有测试在启动**（生产侧没有入口）。现在是 agent 的第 40 个导出：
+
+* 绑定回环端口 → 起一个**一直服务到进程退出**的线程 → 把 `127.0.0.1:PORT` 写进你给的文件；
+* **幂等**：重复调用返回同一个端口（否则每次附加都换端口，调用方没法稳定连上）；
+* 失败返回 `PB_STATUS_INTERNAL`，文案进 `pb_last_error`（不静默）。
+
+用例：`crates/pinbridge-client/tests/agent_link_start_export.rs` ——
+**真的连上去握手**（`pinbridge-agent 0.1.0 / x86_64`），而不只是断言"返回 0"
+（那是"桩函数假装成功"的经典假通过）。
+
+### 8.2 MCP 侧：`pb_session_attach` 会说真话（G2）并真的连（G3）
+
+`pb_session_attach` 现在做两件事：先登记（原样），再按 `PINBRIDGE_AGENT_PORT_FILE`
+指向的文件去连 agent；连上就 `attach_link`。回话分三种，**都能被用例断言**：
+
+```
+① 没有端口文件：已附加到 pid=4242（会话 1，epoch=1）；**仅登记**：没有配置 agent 端口文件（设 PINBRIDGE_AGENT_PORT_FILE …）
+② 端口文件有效：已附加到 pid=4242（…）；链路已连上 127.0.0.1:60087（agent 在自己进程里应答）（agent 链路（tcp://…））
+③ 连不上：      已附加到 pid=4242（…）；**仅登记**：连不上 127.0.0.1:60089（os error 10061）
+```
+
+以前**一律**回"已附加" —— 而目标里其实什么都没有。现在"仅登记"三个字是硬要求：
+**只要没连上就必须出现**（用例 `attach_reports_honestly_whether_the_agent_link_is_live`）。
+
+顺带一条：这些用例先要靠人类把 `process_control` 授给 AI 才能调 attach ——
+这本身就是设计的体现（AI 默认只有只读基线 `[mem_read, trace_record]`，闸门先拦下来）。
+
+### 8.3 注入器：一条命令把链路接起来
+
+```powershell
+pwsh -NoProfile -File scripts/inject-agent.ps1 -TargetPid <PID> `
+     -Dll <repo>\native\build-pin\dist\pinbridge_bridge.dll `
+     -LinkPortFile "$env:TEMP\pb-agent-port.txt"
+# 然后让 MCP 指向同一个文件：
+$env:PINBRIDGE_AGENT_PORT_FILE = "$env:TEMP\pb-agent-port.txt"
+```
+
+实测（自写心跳靶子，第三次尝试才通 —— 前两次的失败都是**真问题**）：
+
+```
+✓ 已注入 pinbridge_bridge.dll：LoadLibrary 态耗时 9 ms，目标 存活
+✓ pb_abi_version(0x2570) → 0x1
+✓ pb_attach(0x2570)      → 0x0
+远端 pinbridge_agent.dll 基址 = 0x7FFC83B20000
+✓ agent 链路已启动：127.0.0.1:64528（写入 …\pb-agent-port3.txt）
+✓ 从外部真连上（TCP 已建立）   靶子存活=True
+```
+
+**前两次失败留下的教训（都写进脚本注释了）**：
+
+1. `pb_link_start` 是 **agent** 的导出，**不是桥接层**的 —— 拿桥接层去 `GetExport` 会得到
+   "Unable to find an entry point"，而桥接层只是"把 agent 带进目标"的那一段；
+2. `dist/pinbridge_agent.dll` 是**旧的**（05:02 构建，那时还没有这个导出）——
+   agent 是 Rust cdylib，必须 `cargo build -p pinbridge-agent --release` 后用新产物替换
+   `dist/` 里那份；`build-native.ps1` 不会替你重编 Rust 侧。
+
+### 8.4 还没验的那一步（说清楚）
+
+**没有**做过"注入 → 设环境变量 → 起 `pinbridge-mcp` → `pb_session_attach` → 调一个真正
+用到链路的工具"这条**一次性**的端到端。分开验过的是：agent 导出能连能握手（8.1）、
+MCP 的接线与三种回话（8.2）、注入器能把端口文件写出来且端口真的可连（8.3）。
+把这三段拼起来的那一次运行，是下一步最该做的事。
