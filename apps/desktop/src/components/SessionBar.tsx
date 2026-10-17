@@ -30,6 +30,10 @@ export function SessionBar({ session, summary, onTakeover }: SessionBarProps) {
         <span className={`tag ${pilot === "AI" ? "tag--ai" : "tag--human"}`}>
           {pilot} 驾驶（{session.lease_holder}）
         </span>
+        {/* epoch 与持有者**一起**常驻：只看持有者会显示一个已经过期的驾驶者。 */}
+        <span className="tag" title="租约代次：控制权换过一次就加一">
+          epoch {session.lease_epoch}
+        </span>
         <button type="button" onClick={() => onTakeover(session.session)}>
           接管
         </button>

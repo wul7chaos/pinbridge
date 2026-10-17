@@ -21,6 +21,14 @@ export interface SessionSummary {
   image_path: string;
   /** 控制权持有者，形如 `human:operator` / `ai:agent-7` */
   lease_holder: string;
+  /**
+   * 租约代次（epoch）。
+   *
+   * 为什么要**和持有者一起**常驻显示：光看"现在是 AI 在驾驶"不够 ——
+   * 老界面会显示一个**已经过期**的持有者。epoch 变了就说明控制权换过人，
+   * 而使用者必须一眼看出自己看到的这份数据属于哪一代。
+   */
+  lease_epoch: number;
   scripts: number;
 }
 

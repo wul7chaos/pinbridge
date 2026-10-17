@@ -28,6 +28,7 @@ const DEMO_SESSION: SessionSummary = {
   state: "paused",
   image_path: "TARGET.exe",
   lease_holder: "ai:demo-agent",
+  lease_epoch: 1,
   scripts: 1,
 };
 
@@ -104,6 +105,9 @@ export default function App() {
   const session: SessionSummary = {
     ...DEMO_SESSION,
     lease_holder: state.lease.holder || "（无租约）",
+    // 真实载荷时用视图模型算出的 epoch；**不能**沿用 DEMO_SESSION 里那个假值 ——
+    // 界面上看不出差别，但那正好是"看起来对、其实是死的"那一类错误。
+    lease_epoch: state.lease.epoch,
   };
 
   const visibleAudit = useMemo(
