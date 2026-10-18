@@ -133,6 +133,18 @@ impl McpServer {
         &self.actor
     }
 
+    /// 直通 Hub（**只给「人类座位 + MCP 服务」合体的进程用**）。
+    ///
+    /// 为什么需要它：授权必须在 `initialize` 被处理**之前**落进 Hub
+    /// （`initialize` 会用 `capabilities_of` 重新取一次，取晚了就是空集），
+    /// 而 `McpServer` 持有 `HubService` 的所有权、外面拿不到。
+    /// 边界很清楚：**能拿到 `&mut HubService` 的进程本来就是"人"**
+    /// （它得先自己建会话、附加、连链路），不是 AI 客户端能碰到的东西。
+    #[must_use]
+    pub fn hub_mut(&mut self) -> &mut HubService {
+        &mut self.hub
+    }
+
     /// 是否已完成 `initialize`。
     #[must_use]
     pub const fn is_initialized(&self) -> bool {
