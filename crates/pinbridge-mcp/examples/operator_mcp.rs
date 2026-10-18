@@ -22,7 +22,7 @@ use std::io::{BufRead, Write};
 
 use pinbridge_client::transport::TcpTransport;
 use pinbridge_client::AgentClient;
-use pinbridge_core::capability::Capability;
+use pinbridge_core::capability::{Capability, CapabilitySet};
 use pinbridge_core::principal::Principal;
 use pinbridge_core::session::TargetSpec;
 use pinbridge_hub::HubService;
@@ -100,10 +100,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 而"服务活着 + 工具诚实地报错"比"进程直接死掉"好排查得多。
             match TcpTransport::connect(endpoint.as_str()) {
                 Ok(transport) => {
-                    let link = ClientLink::new(
-                        AgentClient::new(transport)
-                            .with_capabilities(Capability::read_only_baseline()),
-                    );
+                    // 链路侧能力必须是 ALL：只读基线的话 agent 不会往这边推
+                    // 插桩事件，`pb_trace_record` 就会录到 events=0（实测过）。
+                    let all = Capability::ALL
+                        .iter()
+                        .fold(CapabilitySet::empty(), |set, cap| set.with(*cap));
+                    let link = ClientLink::new(AgentClient::new(transport).with_capabilities(all));
                     match hub.attach_link(&human, session, Box::new(link)) {
                         Ok(described) => eprintln!("✓ 链路已连上 {endpoint}（{described}）"),
                         Err(e) => eprintln!("⚠ 链路已连上但 attach_link 失败：{e}"),
@@ -123,6 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    （名字由客户端 `clientInfo.name` 决定，所以必须在看到 initialize 之后再授；
     //     而 `initialize` 自己会重取一次能力集，所以授名要赶在 server.handle 之前）。
     let mut server = McpServer::new(hub);
+    // 会话是人在外面建的，MCP 侧不知道它的 epoch；不补这一步，
+    // pb_trace_record / pb_control 会报「会话未在本 MCP 连接中建立」。
+    server.adopt_session(session, epoch);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     eprintln!("✓ MCP 服务就绪（stdio）；等待客户端 initialize");

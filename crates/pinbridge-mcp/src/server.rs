@@ -145,6 +145,16 @@ impl McpServer {
         &mut self.hub
     }
 
+    /// 登记一个**由人在同一个 Hub 里建好**的会话的 epoch。
+    ///
+    /// `McpServer` 平时只在它自己处理 `create_session` / `attach` 时才知道 epoch
+    /// （`epochs` 缓存），而 `operator_mcp` 的会话是人在外面建的。不补这一步，
+    /// 后续 `pb_trace_record` / `pb_control` 会报
+    /// 「会话 N 尚未在本 MCP 连接中建立，请先 attach 或 create」。
+    pub fn adopt_session(&mut self, session: SessionId, epoch: u64) {
+        self.epochs.insert(session.get(), epoch);
+    }
+
     /// 是否已完成 `initialize`。
     #[must_use]
     pub const fn is_initialized(&self) -> bool {
