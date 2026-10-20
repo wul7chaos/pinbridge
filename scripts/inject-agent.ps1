@@ -58,7 +58,7 @@ param(
     [Parameter(Mandatory = $true)][int]$TargetPid,
     [string]$Dll = (Join-Path (Split-Path -Parent $PSScriptRoot) 'native\build\pinbridge_bridge.dll'),
     [string[]]$Call = @('pb_abi_version', 'pb_attach'),
-    [int]$CallArg = -1,
+    [long]$CallArg = -1,
     [int]$TimeoutSec = 20,
     [string]$LinkPortFile = '',
     [switch]$Unload
@@ -192,7 +192,7 @@ try {
             Bad ("$name : 远端序言与本地不一致（{0} vs {1}），**不调用**" -f (Hex8 $l8), (Hex8 $r8)); continue
         }
 
-        $param = if ($CallArg -ge 0) { [IntPtr]$CallArg } else { [IntPtr]$TargetPid }
+        $param = if ($CallArg -ge 0) { [IntPtr][int64]$CallArg } else { [IntPtr]$TargetPid }
         $t2 = [PBN]::CreateRemoteThread($h, [IntPtr]::Zero, [IntPtr]::Zero, $rem, $param, 0, [ref]$tid)
         if ($t2 -eq [IntPtr]::Zero) {
             Bad ("${name}: CreateRemoteThread 失败（Win32 " + [Runtime.InteropServices.Marshal]::GetLastWin32Error() + "）"); continue
@@ -281,3 +281,4 @@ try {
     Info "目标进程最终状态 = $(if (Alive $TargetPid) { '存活' } else { '已死亡' })"
 }
 finally { [void][PBN]::CloseHandle($h) }
+

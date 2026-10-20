@@ -6,7 +6,10 @@
 
 ## 0. 一句话结论
 
-**pinbridge 今天没有可用的"附加到已运行进程"。**
+**（2026-10-17 首轮）pinbridge 当时没有可用的"附加到已运行进程"**；同一天把缺的三段补齐后
+（第 8、9 节），现在**能附加、能连链路、能在目标里跑脚本**，且目标不冻结。
+
+首轮缺的是这三处：
 
 * 对外 API（MCP `pb_session_attach` / `HubService::attach` / C ABI `pb_attach`）都在，
   但 `HubService::attach` 只改会话字段（pid / 命令行 / 状态 / 溯源行），**不注入、不连接**；
@@ -14,11 +17,17 @@
   但仓库里**没有注入器**；
 * 目标侧的回环链路服务端（`LinkServer`）与 Hub 侧的 `AgentClient` **只有测试在用**，
   没有任何生产代码启动它或连它；
-* Pin 自带的 `-pid` 附加在 **Windows 上直接断言失败，并且会把目标进程杀掉**（实测，见第 2 节）。
+* Pin 自带的 `-pid` 附加在 **Windows 上直接断言失败，并且会把目标进程杀掉**（实测，见第 2 节）——
+  **这一条至今仍然成立**，它是"为什么必须走注入"的唯一理由。
 
-唯一现在能跑通的路径是第 3 节的**进程内注入**，已实测：**9 ms、目标不冻结、target 存活**。
+现在能跑通的路径是第 3 节的**进程内注入**：实测 **9–13 ms、目标不冻结、target 存活**，
+并在一个 5.6 GB 的在跑游戏进程上完整验证过（第 9 节）。
 
 ## 1. 四个环节的现状
+
+> **这是 2026-10-17 首轮的快照**（就是"发现问题"的那一刻）。其中
+> 「Hub 侧 attach」「agent 回环链路」「免 Pin 注入通路」三行已在当天修掉，
+> 现状见第 8 节；Pin `-pid` 那一行**仍然成立**。
 
 | 环节 | 现状 | 证据 |
 |------|------|------|
@@ -107,8 +116,8 @@ OpenProcess → VirtualAllocEx + WriteProcessMemory(路径)
 | 编号 | 缺口 | 影响 | 最小修法 |
 |------|------|------|----------|
 | G1 | Pin `-pid` 在 Windows 上断言并杀进程 | 无法用 Pin 附加任何已运行目标（含游戏） | 不走这条路：改用注入（G3）；或在别的 Pin 版本/平台重测后再定 |
-| G2 | `HubService::attach` 只登记 | `pb_session_attach` 成功 ≠ 目标里有东西 | attach 时必须真的注入（或拒绝并说明"只登记"） |
-| G3 | 没有注入器；agent 的 `LinkServer` 没有生产入口，Hub 也没有生产侧的 `AgentClient` | agent 装进去了也只能被"远程调导出"用，Hub 的工具（`pb_memory_read`/`pb_modules`/脚本）拿不到 | ① agent 增加 `pb_link_start(端口文件)` 导出（bind 后把端口写文件）；② MCP 侧 attach 后读端口文件并 `TcpTransport::connect` → `ClientLink` → `attach_link` |
+| G2 | ~~`HubService::attach` 只登记~~ **已修（见第 8.2 节）** | 以前 `pb_session_attach` 成功 ≠ 目标里有东西；现在回话分三种，没连上必说"仅登记" | 已做：attach 后按 `PINBRIDGE_AGENT_PORT_FILE` 去连，连上就 `attach_link` |
+| G3 | ~~没有注入器；agent 的 `LinkServer` 没有生产入口，Hub 也没有生产侧的 `AgentClient`~~ **已修（见第 8.1/8.2/8.3 节）** | 以前 agent 装进去了也只能被"远程调导出"用 | 已做：agent 导出 `pb_link_start(端口文件)`；MCP 侧 attach 后连 `TcpTransport` → `ClientLink` → `attach_link` |
 | G4 | 工具恒调 `PIN_StartProgram()`，无附加/分离分支 | 即使 G1 修好，附加态也会走错路径；且无法优雅分离 | 用 `PIN_IsAttaching()` 分支 + `PIN_AddDetachFunction` + `PIN_Detach()` |
 | G5 | ~~**`dist/` 不自包含**~~ **已修（见第 7 节）**：工具按名 `LoadLibraryA("pinbridge_bridge.dll")`，而 CMake 只把 *agent* 拷进 `dist/` | 目标不在构建目录时**必然加载失败**（实测）；`ctest` 之所以过，只因为靶子 `pb_sample_target.exe` 就在 `native/build-pin`（那儿正好有桥接层） | ~~`dist/` 里同时拷 `pinbridge_bridge.dll`~~ **已做**：`native/CMakeLists.txt` 增加一条 `copy_if_different $<TARGET_FILE:pinbridge_bridge>` |
 | G6 | pin.exe 在工具启动失败时仍返回 **0** | 自动化只能靠解析文本判成败 | 需要一个可机读的失败信号（`-error_file` 或让 Pin 透传退出码） |
@@ -230,9 +239,9 @@ pin.exe -t pinbridge.dll -pb_syscalls 0 -pb_tf off -- $env:TEMP\pbt_outside.exe 
 
 | 编号 | 状态 |
 |------|------|
-| G1 Pin `-pid` | 未修（换注入这条路，见 7.1/7.2） |
-| G2 `attach` 只登记 | 未修 —— 现在**至少能说清**"只登记"，但要么真注入、要么拒绝并说明 |
-| G3 agent 链路进 Hub | **未修，这是让它真正有用的那一步**：① agent 增加 `pb_link_start(端口文件)` 导出；② MCP 侧 attach 后读端口文件并 `TcpTransport::connect` → `ClientLink` → `attach_link` |
+| G1 Pin `-pid` | 未修（换注入这条路，见 7.1/7.2）——**至今仍会杀进程** |
+| G2 `attach` 只登记 | ✅ 已修（第 8.2 节）：三种回话，没连上必说"仅登记" |
+| G3 agent 链路进 Hub | ✅ 已修（第 8.1–8.3 节）：`pb_link_start` + `PINBRIDGE_AGENT_PORT_FILE` + `attach_link` |
 | G4 附加/分离分支 | 未修（`PIN_IsAttaching`/`PIN_Detach` 命中数仍为 0） |
 | G6 pin.exe 失败仍返回 0 | 未修（只能靠解析文本判成败，已在本文档记录） |
 | G7 全量 INS 插装代价 | 未测（长跑目标上的代价未知） |
@@ -300,9 +309,62 @@ $env:PINBRIDGE_AGENT_PORT_FILE = "$env:TEMP\pb-agent-port.txt"
    agent 是 Rust cdylib，必须 `cargo build -p pinbridge-agent --release` 后用新产物替换
    `dist/` 里那份；`build-native.ps1` 不会替你重编 Rust 侧。
 
-### 8.4 还没验的那一步（说清楚）
+### 8.4 一次性端到端：**已验**（2026-10-17，在跑的游戏进程上）
 
-**没有**做过"注入 → 设环境变量 → 起 `pinbridge-mcp` → `pb_session_attach` → 调一个真正
-用到链路的工具"这条**一次性**的端到端。分开验过的是：agent 导出能连能握手（8.1）、
-MCP 的接线与三种回话（8.2）、注入器能把端口文件写出来且端口真的可连（8.3）。
-把这三段拼起来的那一次运行，是下一步最该做的事。
+`crates/pinbridge-mcp/examples/headless_operator.rs` = "人类座位"的命令行版：
+建会话 → 登记附加 → 按端口文件连链路 → 把 `ALL` 授给 AI → **再用 AI 的身份调需要链路的工具**。
+真机输出：
+
+```
+✓ 会话 1 已建（操作员 human:operator）
+✓ 已登记附加 pid=776（epoch=1）
+✓ 链路已连上 127.0.0.1:51564（agent 链路（tcp://127.0.0.1:51564））
+✓ 已授权给 ai:cline：CapabilitySet(4095)
+✓ 模块 151 个（跳过 0 条）
+    0x00007ff613fd0000 +0x04d8f000  D:\Game\Path of Exile\PathOfExile.exe
+✓ 读 0x7ff6176169b8 共 48 字节：
+    00000000  55 6E 61 62 6C 65 20 74 6F 20 64 65 73 65 72 69  Unable to deseri
+    00000010  61 6C 69 73 65 20 70 61 63 6B 65 74 20 77 69 74  alise packet wit
+```
+
+**为什么用示例而不是 `pb_session_attach`**：MCP 的 actor 恒为 AI（只读基线），
+而"建会话 / 附加 / 授权"要 `process_control` —— **AI 不能给自己扩权**，这是设计。
+桌面工作台就是这个座位的图形版；示例是它的 CI / 远程机可用版本。
+换句话说：**`pb_session_attach` 仍然是"人做的那一下"**，8.2 的三段回话守的是"做完之后
+AI 看到的是不是真话"。
+
+## 9. 在跑的游戏进程上的完整链（2026-10-17 11:5x 实测）
+
+目标：一个 5.6 GB / 68 线程 / 已在线玩着的 `PathOfExile.exe`（pid 776，**以管理员运行**）。
+
+| 步骤 | 结果 |
+|------|------|
+| 注入（需提权：`sudo pwsh -File scripts/inject-agent.ps1 …`） | LoadLibrary 态 **13 ms**，目标存活 |
+| `pb_abi_version` / `pb_attach(776)` | `0x1` / `0x0` |
+| `pb_link_start(端口文件)` | `127.0.0.1:51564`，端口文件写入成功 |
+| `pb_set_capabilities(257)` / `(1281)` | `0x0` / `0x0`（只读基线 / 再加 `script_load`） |
+| 链路 `ping` | `pong`，`pinbridge-agent 0.1.0`，`x86_64`，能力集回读一致 |
+| 链路 `modules` | **151 个模块**，主模块基址 `0x7ff613fd0000` |
+| 链路 `read_memory`（3 个静态锚点） | 与 IDA 静态分析逐一吻合（报错串 / 分发器入口 / 读函数入口） |
+| Hub 侧（`headless_operator`） | 会话 + 链路 + 授权 + `pb_modules` + 内存读，见 8.4 |
+| **脚本进目标**（`load_script`） | CPython 在游戏进程内跑起来，`pb.read` 读到真实内存，`pb.mark` 带回数值 |
+
+脚本那一步的事件（`script_output`，`args[1]` 即时 `pb.mark` 的数值）：
+
+```
+seq=1 kind=11 args=['0x2', '0x18']                  ← 读到 24 字节
+seq=2 kind=11 args=['0x2', '0x7420656c62616e55']    ← "Unable t"（小端）
+seq=3 kind=11 args=['0x2', '0x4810508948c48b48']    ← 分发器入口 48 8B C4 48 89 50 10
+```
+
+两条边界（写清楚，别当特性）：
+
+1. **`pb.log` 的文本不过线**：`script_output` 事件只带数字（`args[0]`=类别、`args[1]`=数值），
+   所以脚本要"报东西出来"必须用 `pb.mark(name, value)`；纯文本输出只在目标进程的审计里。
+   （本次就踩了：第一版脚本用 `pb.log` 报结果，线上收到 4 条事件里只有一条 `args=[0x1]`。）
+2. **脚本必须 `import pb`**：宿主注入的是 `_pb`，对外模块名是 `pb`。不 import 会得到
+   `脚本执行失败（解释器返回 -1）`，而 CPython 的详细报错落在目标进程的 stderr（看不见）——
+   这就是"错误信息不够"的典型，值得在 `pb_load_script` 的失败文案里补一句"记得 import pb"。
+
+注入之后目标全程：线程 68→70（多的是 agent 的链路线程）、工作集 5623→5819 MB、
+`Responding=True`、CPU 持续推进 —— **没有冻结、没有掉线**。

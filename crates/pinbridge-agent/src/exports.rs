@@ -485,8 +485,84 @@ fn flush_breakpoint_hits() {
         // args[0] = 1：**命中后已自动解除**。调用方据此知道"想重复命中要再下"，
         // 而不是等一个永远不会来的第二次命中。
         raw.args[0] = 1;
+        // args[1..7]：命中瞬间的 Rip / Rsp / Rcx / Rdx / R8 / R9。
+        // [Rsp] 就是调用者的返回地址——"谁调用了这个函数"靠它。
+        for (index, value) in hit.regs.iter().enumerate() {
+            if 1 + index < raw.args.len() {
+                raw.args[1 + index] = *value;
+            }
+        }
         let _ = AgentHost::with(|state| state.push(&raw).is_ok());
+        // 第二条事件：命中现场抄下来的字节（最多 56 字节，拆成 7 个 u64）。
+        //
+        // 为什么不塞进上一条的 args：`PbEventRaw.args` 只有 8 格，寄存器已经占满，
+        // 而它是 C ABI 的定长结构——改长度会连带改 ABI 版本。用一条**独立的同类型
+        // 事件**（args[0] = 2 作为判别）既不碰 ABI，也不会让老调用方误读。
+        //
+        // 注意：args[0] 要留给判别值，所以字节从 args[1] 开始放，最多 7 个 u64 = 56 字节。
+        // （第一版把字节从 args[0] 开始放，把判别值覆盖掉了——事件看起来像"args 只有 1 个"，
+        //   这里踩过一次，别再踩。）
+        if hit.snap_len > 0 {
+            let mut snap_raw = PbEventRaw::EMPTY;
+            snap_raw.sequence = pb_allocate_sequence();
+            snap_raw.kind = EventKind::BreakpointHit.code();
+            snap_raw.thread_id = hit.thread_id;
+            snap_raw.address = hit.address;
+            snap_raw.args[0] = 2; // 2 = 快照事件（1 = 寄存器事件）
+            for (index, chunk) in hit.snap.as_chunks::<8>().0.iter().take(7).enumerate() {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(chunk);
+                snap_raw.args[1 + index] = u64::from_le_bytes(bytes);
+            }
+            let _ = AgentHost::with(|state| state.push(&snap_raw).is_ok());
+        }
+        // 第三条事件：固定观测地址上的 32 字节（args[0] = 3）。
+        // 和寄存器无关，所以能在函数的**任意**位置下断点观察同一块内存。
+        if hit.snap2_len > 0 {
+            let mut w_raw = PbEventRaw::EMPTY;
+            w_raw.sequence = pb_allocate_sequence();
+            w_raw.kind = EventKind::BreakpointHit.code();
+            w_raw.thread_id = hit.thread_id;
+            w_raw.address = hit.address;
+            w_raw.args[0] = 3; // 3 = 固定观测点事件
+            for (index, chunk) in hit.snap2.as_chunks::<8>().0.iter().enumerate() {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(chunk);
+                w_raw.args[1 + index] = u64::from_le_bytes(bytes);
+            }
+            let _ = AgentHost::with(|state| state.push(&w_raw).is_ok());
+        }
+        // 第四条事件：R8 指向的 32 字节（args[0] = 4）。
+        // 用于 `(this, x, ptr, len)` 形态的接口——例如 `SetKey(this, nvp, key, 32)`。
+        if hit.snap3_len > 0 {
+            let mut k_raw = PbEventRaw::EMPTY;
+            k_raw.sequence = pb_allocate_sequence();
+            k_raw.kind = EventKind::BreakpointHit.code();
+            k_raw.thread_id = hit.thread_id;
+            k_raw.address = hit.address;
+            k_raw.args[0] = 4; // 4 = R8 参数指向的内存
+            for (index, chunk) in hit.snap3.as_chunks::<8>().0.iter().enumerate() {
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(chunk);
+                k_raw.args[1 + index] = u64::from_le_bytes(bytes);
+            }
+            let _ = AgentHost::with(|state| state.push(&k_raw).is_ok());
+        }
     }
+}
+
+/// 设置"固定观测地址"：之后每次断点命中都会额外抄这个地址上的 32 字节。
+///
+/// 为什么需要：在接受缓冲区却**不含指针**的位置（例如 `PoE_Stream_Flush` 中间，
+/// Rcx 早不是流对象了）下断点时，寄存器帮不上忙；而缓冲区地址是稳定的，
+/// 把它当观测点就能二分出"原地改写"发生在哪两条指令之间。
+#[unsafe(no_mangle)]
+pub extern "C" fn pb_set_snapshot(addr: u64) -> c_int {
+    crate::breakpoint::set_snap_addr(addr);
+    AgentHost::with(|state| {
+        state.note_audit(&format!("pb_set_snapshot: 观测地址 = 0x{addr:X}"));
+        Status::Ok.code()
+    })
 }
 
 /// 取回一个统计量：`which` 0=丢弃数 1=积压 2=已取走。/// 保存某个线程的寄存器快照（由 Pin 工具侧在探针命中时捕获后交来）。

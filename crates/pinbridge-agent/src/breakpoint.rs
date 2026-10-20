@@ -44,6 +44,52 @@ pub struct BreakpointHit {
     pub address: u64,
     /// 命中它的线程。
     pub thread_id: u32,
+    /// 命中瞬间的寄存器快照（Rip/Rsp/Rcx/Rdx/R8/R9）。
+    ///
+    /// 为什么必须在这里抓：命中的是**目标线程**，而 `pb_drain_events` 跑在
+    /// agent 的链路线程上；等事件被取走时目标线程早就跑远了。
+    /// 只报 (地址, 线程) 的断点在"谁调用了这个函数"这类问题上毫无用处——
+    /// `[Rsp]` 才是返回地址。
+    pub regs: [u64; 7],
+    /// 命中现场从 `Rdx` 抄下来的原始字节（最多 64 字节）。
+    ///
+    /// 为什么必须在异常处理器里抄：调用方（例如协议序列化函数）把待写数据放在
+    /// **栈上的临时变量**里，异常处理器一返回，那块栈立刻被下一条指令复用。
+    /// 事后再从外面读只会拿到垃圾——本项目在逆 PoE 上行协议时真踩过这个坑。
+    pub snap: [u8; 64],
+    /// 有效快照长度（0 表示没抄）。
+    pub snap_len: u32,
+    /// 命中现场从**固定观测地址**抄下来的 32 字节。
+    ///
+    /// 为什么需要它：在 Flush 这种函数中间下断点时，Rcx 早就不是那个流对象了，
+    /// 而"写缓冲在哪个地址"是稳定的——把它配成固定观测点，就能在**任意**断点处
+    /// 看到那块内存此刻是明文还是密文，从而二分出"就地改写"发生在哪两条指令之间。
+    pub snap2: [u8; 32],
+    /// 有效长度（0 表示没配观测地址或读失败）。
+    pub snap2_len: u32,
+    /// 命中现场从 `R8` 指向的内存抄下来的 32 字节，长度取 `R9`。
+    ///
+    /// 为什么单列一份：x64 下很多接口是 `(this, x, ptr, len)`，第三个/第四个参数
+    /// 分别在 R8/R9。抓密钥（`SetKey(this, nvp, key, 32)`）这类场景，
+    /// `Rdx` 只是个标签指针，真正要的是 R8 —— 而栈上的临时密钥在异常处理器返回后
+    /// 立刻会被复用，只能在这里抄。
+    pub snap3: [u8; 32],
+    /// 有效长度（0 表示 R9 不合理或读失败）。
+    pub snap3_len: u32,
+}
+
+/// 固定观测地址（0 = 不启用）。由 `pb_set_snapshot` 设置。
+static SNAP_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 设置固定观测地址。
+pub fn set_snap_addr(addr: u64) {
+    SNAP_ADDR.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 读当前固定观测地址。
+#[must_use]
+pub fn snap_addr() -> u64 {
+    SNAP_ADDR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// 断点表与待上报队列。
@@ -288,6 +334,10 @@ mod imp {
         // 异常地址就是 `int3` 所在的位置（不是返回地址）。
         let address = exception.address as u64;
         let thread_id = current_thread_id();
+        // 命中瞬间的寄存器：CONTEXT 由系统在异常里给出，指针有效。
+        // 注意 Rip 指向 int3 **之后**那条指令；调用者的返回地址在 [Rsp]。
+        let (regs, snap, snap_len, snap2, snap2_len, snap3, snap3_len) =
+            read_regs((*pointers).context);
         // 命中即**自动解除**：把原字节写回去，并标记"先不要重装"。
         // 这里刻意不做"恢复 → 单步 → 重装"那段舞蹈，原因见模块文档。
         let Ok(mut guard) = table().lock() else {
@@ -299,7 +349,17 @@ mod imp {
             drop(guard);
             return 0;
         };
-        guard.pending.push(BreakpointHit { address, thread_id });
+        guard.pending.push(BreakpointHit {
+            address,
+            thread_id,
+            regs,
+            snap,
+            snap_len,
+            snap2,
+            snap2_len,
+            snap3,
+            snap3_len,
+        });
         drop(guard);
         // 把原字节写回去。这一步在异常上下文里做**写内存**是必要的：
         // 不恢复的话目标会立刻在同一个地址上再次触发 int3，无限循环。
@@ -312,6 +372,121 @@ mod imp {
             return 0;
         }
         EXCEPTION_CONTINUE_EXECUTION
+    }
+
+    /// 从 CONTEXT 里取 6 个寄存器（x64 固定偏移）。
+    ///
+    /// 为什么写死偏移而不是声明 `CONTEXT` 结构体：完整 `CONTEXT` 有 20 多个字段
+    /// （含 XMM 保存区），少写一个字段就会让后面的字段整体错位——而偏移是
+    /// Windows ABI 里**冻结**的。只读 6 个 u64，写错的可能性最小。
+    ///
+    /// # Safety
+    ///
+    /// `context` 必须是异常处理器拿到的那个 `CONTEXT*`（系统保证有效）。
+    unsafe fn read_regs(
+        context: *mut c_void,
+    ) -> ([u64; 7], [u8; 64], u32, [u8; 32], u32, [u8; 32], u32) {
+        if context.is_null() {
+            return ([0; 7], [0; 64], 0, [0; 32], 0, [0; 32], 0);
+        }
+        // AMD64 CONTEXT 偏移：Rcx 0x80、Rdx 0x88、Rsp 0x98、R8 0xB8、R9 0xC0、Rip 0xF8
+        const RSP: usize = 0x98;
+        const RCX: usize = 0x80;
+        const RDX: usize = 0x88;
+        const R8: usize = 0xB8;
+        const R9: usize = 0xC0;
+        const RIP: usize = 0xF8;
+        // SAFETY: 由调用方保证 context 有效；每个偏移都落在 CONTEXT 结构体内。
+        unsafe {
+            let base = context.cast::<u8>();
+            // 快照里的偏移是任意的，**不保证 8 字节对齐** —— 必须用 read_unaligned，
+            // 这不是"绕过 lint"：直接解引用未对齐指针在 x86 上能跑，但在别的架构上是 UB。
+            let read = |off: usize| -> u64 { base.add(off).cast::<u64>().read_unaligned() };
+            let rsp = read(RSP);
+            // [Rsp] 就是调用者的返回地址。在异常上下文里读一次（和下面写回原字节同类操作）。
+            let mut ret: u64 = 0;
+            let mut got: usize = 0;
+            let _ = ReadProcessMemory(
+                GetCurrentProcess(),
+                rsp as *const c_void,
+                std::ptr::addr_of_mut!(ret).cast::<c_void>(),
+                8,
+                &raw mut got,
+            );
+            // 命中现场抄数据：x64 调用约定里 a1=Rcx, a2=Rdx, a3=R8。
+            // 对 `Write(stream, src, len)` 来说 Rdx 就是调用方要写的那段数据，
+            // 而它通常指向调用者的**栈临时量**——异常处理器一返回就会被复用，
+            // 所以必须在这里抄走。
+            let src = read(RDX);
+            let want = read(R8);
+            let mut snap = [0u8; 64];
+            let mut snap_len: u32 = 0;
+            if src != 0 && want > 0 && want <= 64 {
+                let mut n: usize = 0;
+                let _ = ReadProcessMemory(
+                    GetCurrentProcess(),
+                    src as *const c_void,
+                    snap.as_mut_ptr().cast::<c_void>(),
+                    want as usize,
+                    &raw mut n,
+                );
+                if n == want as usize {
+                    snap_len = want as u32;
+                }
+            }
+            // 固定观测点：与寄存器无关，所以在函数的**任何**位置下断点都能看到这块内存。
+            // 第三份快照：从 R8 指向的内存抄，长度取 R9（(this, x, ptr, len) 形态的接口）。
+            let p3 = read(R8);
+            let n3 = read(R9);
+            let mut snap3 = [0u8; 32];
+            let mut snap3_len: u32 = 0;
+            if p3 != 0 && n3 > 0 && n3 <= 32 {
+                let mut got3: usize = 0;
+                let _ = ReadProcessMemory(
+                    GetCurrentProcess(),
+                    p3 as *const c_void,
+                    snap3.as_mut_ptr().cast::<c_void>(),
+                    n3 as usize,
+                    &raw mut got3,
+                );
+                if got3 == n3 as usize {
+                    snap3_len = n3 as u32;
+                }
+            }
+            let watch = crate::breakpoint::SNAP_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+            let mut snap2 = [0u8; 32];
+            let mut snap2_len: u32 = 0;
+            if watch != 0 {
+                let mut n2: usize = 0;
+                let _ = ReadProcessMemory(
+                    GetCurrentProcess(),
+                    watch as *const c_void,
+                    snap2.as_mut_ptr().cast::<c_void>(),
+                    32,
+                    &raw mut n2,
+                );
+                if n2 == 32 {
+                    snap2_len = 32;
+                }
+            }
+            (
+                [
+                    read(RIP),
+                    rsp,
+                    read(RCX),
+                    read(RDX),
+                    read(R8),
+                    read(R9),
+                    if got == 8 { ret } else { 0 },
+                ],
+                snap,
+                snap_len,
+                snap2,
+                snap2_len,
+                snap3,
+                snap3_len,
+            )
+        }
     }
 
     unsafe extern "system" {

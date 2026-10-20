@@ -300,21 +300,46 @@ impl McpServer {
             }
             "pb_session_attach" => {
                 let pid = arg_u64(args, "pid")? as u32;
-                let session = self.session_arg(args)?;
+                // P2-5：schema 里 session 是可选的，但语义上必须先有会话。缺了就给一条
+                // **能照做**的错，而不是"缺少参数 session"。
+                let session = self.session_arg(args).map_err(|_| {
+                    "附加需要已存在的会话：请让人类先 pb_session_create 建会话并授权\
+                     （AI 默认只有只读基线，没有 process_control，不能自己建会话）"
+                        .to_owned()
+                })?;
                 let command_line = args
                     .get("command_line")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                self.hub
-                    .attach(&self.actor.clone(), session, pid, command_line)
-                    .map_err(describe)?;
+                // P0-2：重连。会话已在 Attached/Paused/Running 时，状态迁移会失败 —— 而那恰恰是
+                // "链路断了想接回来"的常见场景。此时不该整体失败，而应跳过登记、直接去重连链路。
+                let attach = self
+                    .hub
+                    .attach(&self.actor.clone(), session, pid, command_line);
+                let reconnecting = match attach {
+                    Ok(()) => false,
+                    Err(error) => {
+                        let text = describe(error);
+                        if text.contains("非法状态迁移") {
+                            true
+                        } else {
+                            return Err(text);
+                        }
+                    }
+                };
                 let epoch = self.hub.epoch_of(session).map_err(describe)?;
                 self.epochs.insert(session.get(), epoch);
 
                 // 登记之后再试一次"真的连上"（G3）。连不上不算失败 ——
                 // 但回话里必须写清"仅登记"，否则"已附加"就是谎话（G2）。
-                let port_file =
-                    std::env::var_os("PINBRIDGE_AGENT_PORT_FILE").map(std::path::PathBuf::from);
+                // P2-6：端口文件不再只能靠 MCP 启动时的环境变量 —— 工具参数优先。
+                let port_file = args
+                    .get("port_file")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("PINBRIDGE_AGENT_PORT_FILE").map(std::path::PathBuf::from)
+                    });
                 let link_note = match connect_agent_link(port_file.as_deref(), self.capabilities) {
                     Ok((link, note)) => {
                         match self.hub.attach_link(&self.actor.clone(), session, link) {
@@ -327,9 +352,12 @@ impl McpServer {
                     }
                     Err(reason) => format!("；**仅登记**：{reason}"),
                 };
-                Ok(format!(
-                    "已附加到 pid={pid}（会话 {session}，epoch={epoch}）{link_note}"
-                ))
+                let head = if reconnecting {
+                    format!("会话 {session} 已在附加态（不重复登记，直接重连链路）；epoch={epoch}")
+                } else {
+                    format!("已附加到 pid={pid}（会话 {session}，epoch={epoch}）")
+                };
+                Ok(format!("{head}{link_note}"))
             }
             "pb_control" => {
                 let session = self.session_arg(args)?;
@@ -390,7 +418,29 @@ impl McpServer {
                         &ControlCommand::BreakpointSet { address, label },
                     )
                     .map_err(describe)?;
-                Ok(format!("已在 0x{address:X} 下断点"))
+                Ok(format!(
+                    "已在 0x{address:X} 下断点。命中时探针会就地抓寄存器与内存快照，事后用 \
+                     pb_registers(thread=<命中线程>) 取；撤销用 pb_breakpoint_clear（address 省略 = 全部）。"
+                ))
+            }
+            "pb_breakpoint_clear" => {
+                let session = self.session_arg(args)?;
+                let epoch = self.cached_epoch(session)?;
+                // address 省略 = 撤销全部；Hub 里 `BreakpointClear { address: 0 }` 表示 all。
+                let address = args.get("address").and_then(Value::as_u64).unwrap_or(0);
+                self.hub
+                    .control(
+                        &self.actor.clone(),
+                        session,
+                        epoch,
+                        &ControlCommand::BreakpointClear { address },
+                    )
+                    .map_err(describe)?;
+                Ok(if address == 0 {
+                    "已撤销该会话的全部断点".to_owned()
+                } else {
+                    format!("已撤销 0x{address:X} 处的断点")
+                })
             }
             "pb_script_load" => {
                 let session = self.session_arg(args)?;

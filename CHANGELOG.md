@@ -41,6 +41,32 @@ M0：**工程骨架**。目标不是功能完备，而是"把规范、边界与�
 - 工具侧把这次拒绝**说出来**（"退出期的收尾被卸载保护拒绝，这是已知取舍"），
   而不是只打一个 `-2`。
 
+### 修复（2026-10-20 AI 会话问题单的前四条：P0-2 / P2-5 / P2-6 / P1-3 / P2-7）
+问题单：`docs/dev/ai-session-issues-2026-10-20.md`（PoE 附加场景，7 条）。
+- **P0-2 链路断了没有重连路径**：`pb_session_attach` 现在**幂等**。会话已在
+  Attached/Paused/Running 时，`hub.attach` 的"非法状态迁移"不再整体失败 ——
+  改为**跳过登记、直接重连链路**，回话明说「会话 N 已在附加态（不重复登记，直接重连链路）」。
+- **P2-5 首次使用卡在"缺少参数 session"**：根因是 `pb_session_attach` 的 **schema 里根本没有
+  `session`**，而代码要求它 ⇒ 一调必报"缺少参数"。schema 补上 `session`/`command_line`/
+  `port_file`，缺 `session` 时给一条**能照做**的错（"请让人类先 pb_session_create 建会话并授权"）。
+- **P2-6 端口文件只能靠 MCP 启动时的环境变量**：`pb_session_attach` 新增 `port_file` 参数，
+  优先级高于 `PINBRIDGE_AGENT_PORT_FILE` —— AI 现在能自救（换文件/换端口不必重启 MCP）。
+- **P1-3 没有撤销断点的接口**：新增工具 **`pb_breakpoint_clear`**（`address` 省略 = 撤销全部；
+  Hub 侧 `ControlCommand::BreakpointClear` 本来就实现了，缺的只是工具面）。
+- **P2-7 寄存器前提没在工具层表达**：`pb_breakpoint_set` 的回话现在直接说明
+  「命中时探针就地抓寄存器与快照，事后用 `pb_registers(thread=<命中线程>)` 取；撤销用
+  `pb_breakpoint_clear`」。
+- **测试状态（如实）**：`pinbridge-mcp` 的 23 条用例全绿（含端到端与 attach 三种回话）；
+  但"重连"与"撤销断点"这两条新路径**还没有专门的用例**（重连需要会话先进入 Running/Paused，
+  撤销需要链路），下一轮补。
+
+### 未能修复（已复现到边界，需要注入/多线程场景才能忠实复现）
+- **P0-1 断点命中后链路报 10053**：进程内复现**不成立** —— 新增用例
+  `crates/pinbridge-client/tests/link_survives_breakpoint.rs` 里"起链路 → 下断点 → 真命中 →
+  再读内存"**通过**（命中瞬间抓到 1 条记录、读回 8 字节）。⇒ 坏的不是"命中处理"，
+  而是**注入 + 多线程**那条路径特有的问题，需要对自写多线程靶子做注入才能忠实复现。
+  这条**没有修**，也没有假装修好。
+- **P1-4 脚本顶层 `pb.log` 不产出事件**：未处理（需要先确认"顶层是否立即执行、输出何时可见"）。
 ### 新增（一次性端到端跑通）+ 修复（链路客户端从不声明能力 —— 安全相关）
 - **一次性端到端**（`crates/pinbridge-mcp/src/server.rs` 的
   `end_to_end_human_grants_then_ai_attaches_and_reads_modules_over_the_real_link`）：
