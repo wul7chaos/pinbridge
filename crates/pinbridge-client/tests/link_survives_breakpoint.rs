@@ -7,6 +7,10 @@
 //! 这里把整条路径在进程内复现：起链路 → 连上 → 下断点 → **真的命中** → 再走一次链路请求。
 //! 命中的是我们自己写的函数（`hit_me`），不依赖外部目标，可重复。
 #![allow(unsafe_code)]
+// 断点靠 **Windows 的向量化异常处理（VEH）** 实现（`breakpoint.rs` 里 `AddVectoredExceptionHandler`），
+// 非 Windows 上 `pb_set_breakpoint` 不会真的生效 —— 所以这条回归只在 Windows 上成立，
+// 而不是"在 Linux 上也假装跑一遍"。
+#![cfg(windows)]
 
 use std::time::{Duration, Instant};
 
