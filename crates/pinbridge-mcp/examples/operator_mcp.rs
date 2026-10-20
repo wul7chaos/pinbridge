@@ -67,10 +67,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let pid: u32 = arg_value(&args, "--pid")
-        .ok_or("缺少 --pid")?
-        .parse()
-        .map_err(|e| format!("--pid 不是合法进程号: {e}"))?;
+    // `--pid` **可选**：人类可以不在启动时给出目标（刚重启过、游戏还没开是常态）。
+    // 不给就只建会话、不登记附加 —— 之后的 `pb_session_attach` 由 AI 带着**真实** pid 调用
+    // （这个示例在 initialize 时已经把 ALL 授给它了，所以它能自己附加）。
+    let pid: Option<u32> = match arg_value(&args, "--pid") {
+        Some(raw) => Some(
+            raw.parse()
+                .map_err(|e| format!("--pid 不是合法进程号: {e}"))?,
+        ),
+        None => None,
+    };
     let image = arg_value(&args, "--image").unwrap_or_else(|| "TARGET.exe".to_owned());
     let trace_dir = arg_value(&args, "--trace-dir")
         .map(std::path::PathBuf::from)
@@ -81,14 +87,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hub = HubService::with_trace_dir(trace_dir);
     let human = Principal::human("operator");
 
+    // 给后面那条"仅登记"的提示用：`--pid` 没给时也要能说出人话。
+    let pid_msg = pid.map_or_else(|| "（未指定）".to_owned(), |v| v.to_string());
+
     // ① 建会话（人做）
     let session = hub.create_session(&human, TargetSpec::launch(image.clone(), "x86_64"))?;
     eprintln!("✓ 会话 {session} 已建（操作员 {human}）");
 
-    // ② 附加登记（人做）
-    hub.attach(&human, session, pid, &image)?;
-    let epoch = hub.epoch_of(session)?;
-    eprintln!("✓ 已登记附加 pid={pid}（epoch={epoch}）");
+    // ② 附加登记（人做；只有给了 --pid 才做）
+    let epoch = match pid {
+        Some(pid) => {
+            hub.attach(&human, session, pid, &image)?;
+            let epoch = hub.epoch_of(session)?;
+            eprintln!("✓ 已登记附加 pid={pid}（epoch={epoch}）");
+            epoch
+        }
+        None => {
+            let epoch = hub.epoch_of(session)?;
+            eprintln!(
+                "· 未给 --pid：只建了会话（epoch={epoch}），尚未附加。\
+                 用 pb_session_attach(pid=<真实 pid>) 指定目标。"
+            );
+            epoch
+        }
+    };
 
     // ③ 连 agent 链路（注入由 scripts/inject-agent.ps1 负责，这里只按端口文件去连）
     match port_file {
@@ -112,7 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => eprintln!(
-                    "⚠ **仅登记**：连不上 {endpoint}（{e}）—— 端口文件是旧的，重跑 inject-agent.ps1"
+                    "⚠ **仅登记**：连不上 {endpoint}（{e}）\n\
+                     \x20  两种可能，按顺序查：\n\
+                     \x20  ① 目标进程已退出（pid={pid_msg}）—— 重启电脑后 pid 必然变了；\n\
+                     \x20  ② 端口文件是上一次注入留下的残留。\n\
+                     \x20  确认目标在跑之后，重跑 scripts/inject-agent.ps1 -TargetPid <新PID> -LinkPortFile <同一个文件>。"
                 ),
             }
         }
